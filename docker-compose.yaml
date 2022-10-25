@@ -1,0 +1,31 @@
+version: "3.8"
+services:
+  web:
+    container_name: python_playwright
+    image: playwright_orchestrator_web
+    build: ./docker/python
+    networks:
+      - playwright
+  example_playwright:
+    #user: "1032:1034" #userid of the playwright user
+    container_name: example_playwright
+    image: playwright_orchestrator_web:latest
+    hostname: playright-example_playwright
+    restart: always
+    networks:
+      - playwright
+    volumes:
+      - ./logs/example_playwright/:/app/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+      - ./queue.db:/app/queue.db
+      - ./full/example/example.py:/app/example.py
+    command: python3 /app/main.py --fil example.py --fol /app/ -i 100
+
+
+networks:
+  playwright:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.50.221.0/24
