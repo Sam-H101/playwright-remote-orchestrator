@@ -1,5 +1,15 @@
 # playwright-remote-orchestrator
 
+## Purpose
+
+* This was built as a method to run multiple tests against any number of servers. It will pick a random server and port and run the checks against them. It was built as playwright currently has a limitation where one can only run checks on the same box as where the code lives. This allows the checks to be put into docker containers and run centeralized while the actual orchestrators are ran in a number of places. 
+
+## Limitations
+
+* Currently it does not know if the remote nodes are up or down. Future state it will use the failure counters + a pinger to mark them up / down.
+* queue.db needs to be shared along with the src files between the different containers. this is because it is using sqlite databaes to determine which ports and hosts are free. 
+
+
 ## Building 
 
 1. Run docker-compose build
