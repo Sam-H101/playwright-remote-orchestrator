@@ -1,11 +1,11 @@
 
 dbfile: "runner.db" # Database File Name
 hosts:
-  - server: "lidp50appmon01" #Server name
+  - server: "" #Server name
     port_start: 3000 # Start Port for db creation
     port_end:   4000 # End Port for db Creation
 
-  - server: "lidp50appmon02" #Server name
+  - server: "" #Server name
     port_start: 3000 # Start Port for db creation
     port_end:   4000 # End Port for db Creation
 
