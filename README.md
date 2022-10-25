@@ -18,8 +18,8 @@
 
 ## Configuration
 
-1. modify `src/database.yaml' with the servername, start port, and end port
-2. append --fr true to the docker-compose file and run it once. afterwords remove the --fr true. This is used to initialize the database the orchestrator uses to determine if ports are open or not.
+1. modify `src/database.yaml` with the servername, start port, and end port
+2. append `--fr true` to the docker-compose file and run it once. afterwords remove the `--fr true`. This is used to initialize the database the orchestrator uses to determine if ports are open or not.
 
 ## Creating a check
 
