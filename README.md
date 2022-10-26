@@ -7,7 +7,7 @@
 ## Limitations
 
 * Currently it does not know if the remote nodes are up or down. Future state it will use the failure counters + a pinger to mark them up / down.
-* queue.db needs to be shared along with the src files between the different containers. this is because it is using sqlite databaes to determine which ports and hosts are free. 
+* queue.db needs to be shared along with the src files between the different containers. this is because it is using sqlite databases to determine which ports and hosts are free. 
 
 
 ## Building 
@@ -15,7 +15,7 @@
 1. Run docker-compose build
 
 
-## Running the checks
+## Running the checks with local server
 
 1. uncomment the CMD line in `docker/python/Dockerfile`
 2. Build the image and it should start if you do docker-compose up
