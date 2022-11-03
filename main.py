@@ -18,7 +18,10 @@ errorlog_formatter = logging.Formatter('%(message)s')
 def datest(testfile):
     print("getting a port")
     db = database.database()
-    db.initial_db_start()
+    try:
+        db.initial_db_start()
+    except Exception:
+        pass
     port = db.get_a_port()
 
     os.environ["port"] = "{}".format(port[0])
