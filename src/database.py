@@ -29,11 +29,33 @@ class database():
             if conn:
                 conn.close()
 
-    def initial_db_start(self):
+        def initial_db_start(self):
         con = sqlite3.connect(self.dbfile)
         cur = con.cursor()
         now = datetime.datetime.now()
         id_ctr = 0
+        cur.execute("""
+           CREATE TABLE portStatus (
+           PortNumber INTEGER,
+           PortStatus INTEGER,
+           PortServer INTEGER,
+           LastUpdateTime BLOB,
+           id INTEGER PRIMARY KEY AUTOINCREMENT
+           )
+
+
+        """)
+        con.commit()
+        cur.execute("""
+           CREATE TABLE portUsage (
+           portNumber INTEGER,
+           inUse INTEGER,
+           LastRunDate BLOB,
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           failCount INTEGER
+           )
+        """)
+        con.commit()
         for server in c.get_hosts_config():
             host = server["server"]
             start_port = server["port_start"]
