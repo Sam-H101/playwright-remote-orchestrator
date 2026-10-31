@@ -11,6 +11,7 @@ RUN find / -type f -name "libnssckbi.so" 2>/dev/null | while read line; do\
 
 RUN apt-get install python3-pip -y
 RUN pip install --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org pip persist-queue pytest PyYAML playwright pytest-playwright
+RUN pip install PyMySQL
 #CMD ["./node_modules/.bin/playwright", "run-server", "--port","3000"]
 USER root
 WORKDIR /app
