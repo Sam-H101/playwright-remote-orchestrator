@@ -1,0 +1,18 @@
+# Build context for the hub, runner and UI images is the repo root. Keep secrets, host
+# node_modules, logs and tests out of it.
+.git
+.github
+.env
+runner.env
+**/node_modules
+logs
+**/logs
+**/__pycache__
+**/*.pyc
+**/*.db
+**/.pytest_cache
+.venv
+venv
+tests
+ui/tests
+gateway/test

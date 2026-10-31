@@ -1,4 +1,3 @@
-
 # MySQL connection settings. Each value can be overridden with an environment
 # variable (DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME), which is how
 # docker-compose.mysql.yaml wires the containers to the MySQL service.
@@ -8,12 +7,14 @@ mysql:
   user: "orchestrator"    # MySQL user
   password: "orchestrator" # MySQL password
   database: "orchestrator" # MySQL database (schema) name
-hosts:
-  - server: "" #Server name
-    port_start: 3000 # Start Port for db creation
-    port_end:   4000 # End Port for db Creation
 
-  - server: "" #Server name
-    port_start: 3000 # Start Port for db creation
-    port_end:   4000 # End Port for db Creation
-
+# Gateway nodes (gateway/agent.js and the runner containers) register themselves with the
+# hub, so they don't belong here. Checks reach them through the hub at GATEWAY_URL
+# (default ws://hub:4500), sending GATEWAY_CLIENT_TOKEN if it is set.
+#
+# hosts: lists legacy static hosts that run `playwright run-server` on ports the
+# checks connect to directly (ws://<server>:<port>). Entries with a blank server are skipped.
+hosts: []
+#  - server: "runner01.example.com" # host name or IP the checks can reach
+#    port_start: 3000               # first run-server port
+#    port_end: 3004                 # one past the last port (3000-3003 here)

@@ -1,8 +1,21 @@
 # MySQL backing store for the orchestrator.
 # Use together with the main compose file:
-#   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml up -d
+#   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml up -d --build --scale runner=2
 # Override the credentials below with a .env file or shell variables
-# (MYSQL_ROOT_PASSWORD, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD).
+# (MYSQL_ROOT_PASSWORD, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD). The DB_* variables below
+# replace the ones docker-compose.yaml reads from .env for an existing MySQL server.
+
+x-mysql-env: &mysql-env
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_NAME: ${MYSQL_DATABASE:-orchestrator}
+  DB_USER: ${MYSQL_USER:-orchestrator}
+  DB_PASSWORD: ${MYSQL_PASSWORD:-orchestrator}
+
+x-needs-mysql: &needs-mysql
+  mysql:
+    condition: service_healthy
+
 services:
   mysql:
     container_name: playwright_mysql
@@ -24,16 +37,17 @@ services:
       retries: 20
       start_period: 20s
 
+  hub:
+    depends_on: *needs-mysql
+    environment: *mysql-env
+
+  grid_ui:
+    depends_on: *needs-mysql
+    environment: *mysql-env
+
   example_playwright:
-    depends_on:
-      mysql:
-        condition: service_healthy
-    environment:
-      DB_HOST: mysql
-      DB_PORT: "3306"
-      DB_NAME: ${MYSQL_DATABASE:-orchestrator}
-      DB_USER: ${MYSQL_USER:-orchestrator}
-      DB_PASSWORD: ${MYSQL_PASSWORD:-orchestrator}
+    depends_on: *needs-mysql
+    environment: *mysql-env
 
 volumes:
   mysql_data:
