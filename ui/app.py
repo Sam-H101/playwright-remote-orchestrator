@@ -2,22 +2,40 @@
 
 Run locally:  python -m ui.app   (from the repo root)
 """
-import hmac
 import ipaddress
+import mimetypes
 import os
 import socket
 import urllib.parse
 
-from flask import Flask, abort, jsonify, make_response, render_template, request
+from flask import Flask, abort, jsonify, render_template, request
 
-from . import store
+from . import auth, store
+
+# The Windows registry can map .js to text/plain; with nosniff the browser would then refuse the modules.
+mimetypes.add_type("text/javascript", ".js")
 
 ADMIN_TOKEN = os.environ.get("GRID_ADMIN_TOKEN", "")
+# The hub address runner hosts and checks outside the compose network use (GATEWAY_URL is often
+# "ws://hub:4500", a name only the containers can resolve). Unset: the page derives one.
+PUBLIC_GATEWAY_URL = (os.environ.get("GATEWAY_PUBLIC_URL") or "").rstrip("/")
+GRID_NAME = os.environ.get("GRID_NAME", "")
 # Extra host names the UI may be managed through (besides IP addresses, localhost and this
 # machine's names), comma separated; "*" allows any. Guards the actions against DNS rebinding.
 ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("GRID_UI_ALLOWED_HOSTS", "").split(",") if h.strip()}
 
 app = Flask(__name__)
+# Read at call time, so the setting can change while the app runs (the tests rely on it).
+auth.configure(lambda: ADMIN_TOKEN)
+
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                               "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; "
+                               "frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 
 
 def _local_names():
@@ -79,24 +97,6 @@ def _same_origin_actions_only():
     return None
 
 
-def _require_admin():
-    if not ADMIN_TOKEN:
-        return
-    supplied = request.headers.get("X-Grid-Token", "")
-    if not hmac.compare_digest(supplied.encode(), ADMIN_TOKEN.encode()):
-        # token_required tells the page to ask for the token, unlike other 403s (proxies, origin checks).
-        abort(make_response(jsonify(error="The admin token is missing or wrong.", token_required=True), 403))
-
-
-def _require_token_admin():
-    """Access tokens are managed with the admin token only. Their metadata is sensitive too, so
-    without GRID_ADMIN_TOKEN even the list is refused."""
-    if not ADMIN_TOKEN:
-        # admin_token_unset: the page explains the setting instead of asking for a token.
-        abort(make_response(jsonify(error="set GRID_ADMIN_TOKEN to manage access tokens", admin_token_unset=True), 403))
-    _require_admin()
-
-
 def _private(response, status=200):
     """A token response: never cached (one of them holds a plaintext token)."""
     response.status_code = status
@@ -109,6 +109,13 @@ def _host_arg():
     if not isinstance(host, str) or not host.strip():
         abort(400)
     return host
+
+
+@app.after_request
+def _security_headers(response):
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
 
 
 @app.errorhandler(store.DatabaseUnavailable)
@@ -129,36 +136,46 @@ def database_permission_denied(error):
 @app.get("/")
 @app.get("/ui")
 def index():
-    return render_template("index.html", token_required=bool(ADMIN_TOKEN))
+    return render_template("index.html")
 
 
 @app.get("/status")
 @app.get("/api/status")
 def status():
-    return jsonify(store.snapshot())
+    data = store.snapshot()
+    data["grid_name"] = GRID_NAME or None
+    data["public_gateway_url"] = PUBLIC_GATEWAY_URL or None
+    return jsonify(data)
+
+
+@app.get("/api/session")
+def session():
+    """Sign-in state for the page: who is signed in (judged from the credentials sent, if any),
+    whether admin sign-in is configured at all, and which providers to offer."""
+    return _private(jsonify(auth.session_info()))
 
 
 @app.post("/api/slots/<int:slot_id>/release")
+@auth.admin_required()
 def release_slot(slot_id):
-    _require_admin()
     return jsonify(updated=store.release_slot(slot_id))
 
 
 @app.post("/api/slots/<int:slot_id>/reset-failures")
+@auth.admin_required()
 def reset_slot(slot_id):
-    _require_admin()
     return jsonify(updated=store.reset_slot_failures(slot_id))
 
 
 @app.post("/api/nodes/reset-failures")
+@auth.admin_required()
 def reset_node():
-    _require_admin()
     return jsonify(updated=store.reset_node_failures(_host_arg()))
 
 
 @app.post("/api/nodes/forget")
+@auth.admin_required()
 def forget_node():
-    _require_admin()
     host = _host_arg()
     result, count = store.forget_node(host)
     if result == "forgotten":
@@ -171,8 +188,8 @@ def forget_node():
 
 
 @app.get("/api/tokens")
+@auth.admin_required(refuse_when_unconfigured=True)
 def list_tokens():
-    _require_token_admin()
     result = store.list_tokens()
     # Whether the env bootstrap tokens are set, if the UI gets the same variables as the hub.
     # Informational only; their values never leave the server.
@@ -182,8 +199,8 @@ def list_tokens():
 
 
 @app.post("/api/tokens")
+@auth.admin_required(refuse_when_unconfigured=True)
 def create_token():
-    _require_token_admin()
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify(error="Send the token's settings as a JSON object."), 400
@@ -195,8 +212,8 @@ def create_token():
 
 
 @app.post("/api/tokens/<int:token_id>/revoke")
+@auth.admin_required(refuse_when_unconfigured=True)
 def revoke_token(token_id):
-    _require_token_admin()
     token = store.revoke_token(token_id)
     if token is None:
         return jsonify(error="There is no access token {}.".format(token_id)), 404
@@ -204,8 +221,8 @@ def revoke_token(token_id):
 
 
 @app.post("/api/tokens/<int:token_id>/delete")
+@auth.admin_required(refuse_when_unconfigured=True)
 def delete_token(token_id):
-    _require_token_admin()
     result = store.delete_token(token_id)
     if result == "not_found":
         return jsonify(error="There is no access token {}.".format(token_id)), 404

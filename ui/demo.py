@@ -3,6 +3,8 @@
     python -m ui.demo demo.db               # sample data (UTC timestamps relative to now)
     python -m ui.demo demo.db --empty       # a database with no tables yet
     python -m ui.demo demo.db --heartbeat   # sample data, then keep the online nodes' lastSeen fresh
+    python -m ui.demo demo.db --heartbeat --activity   # ... and run short bursts of checks
+                                                       # (or GRID_DEMO_ACTIVITY=1)
 
 Then: GRID_DB_ENGINE=sqlite GRID_DB_PATH=demo.db python -m ui.app
 """
@@ -10,6 +12,7 @@ import argparse
 import datetime
 import hashlib
 import os
+import random
 import secrets
 import sqlite3
 import time
@@ -143,11 +146,53 @@ def seed(con, now=None):
     con.commit()
 
 
-def heartbeat(path, interval=5):
+def _selectable(con, fail_threshold=3):
+    """Free slots a check could claim right now: on an online, healthy node, not failing."""
+    return [r[0] for r in con.execute("""
+        SELECT ps.id FROM portStatus ps JOIN portUsage pu ON ps.id = pu.id JOIN nodes n ON n.name = ps.PortServer
+        WHERE pu.inUse = 0 AND ps.PortStatus = 1 AND n.online = 1 AND pu.failCount < ?
+    """, (fail_threshold,))]
+
+
+def burst(con, rng, now=None):
+    """Claim 3 to 7 selectable slots, the way set_in_use_port does. Returns the claimed ids."""
+    ids = _selectable(con)
+    rng.shuffle(ids)
+    claimed = ids[:rng.randint(3, 7)]
+    stamp = _ts(now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), 0)
+    con.executemany("UPDATE portUsage SET inUse = 1, LastRunDate = ? WHERE id = ? AND inUse = 0",
+                    [(stamp, slot_id) for slot_id in claimed])
+    return claimed
+
+
+def finish(con, slot_ids, rng, now=None):
+    """Release them like release_in_use_port; now and then a check couldn't connect first."""
+    stamp = _ts(now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), 0)
+    for slot_id in slot_ids:
+        failed = rng.random() < 0.08
+        con.execute("UPDATE portUsage SET inUse = 0, LastRunDate = ?, failCount = {} WHERE id = ?".format(
+            "failCount + 1" if failed else "0"), (stamp, slot_id))
+
+
+def heartbeat(path, interval=5, activity=False, seed=None):
+    """Keep online nodes online. With activity, every ~8 s run a burst of 2-5 s checks."""
+    rng = random.Random(seed)
+    next_beat = next_burst = time.monotonic()
+    running, release_at = [], None
     while True:
+        now = time.monotonic()
         with sqlite3.connect(path) as con:
-            con.execute("UPDATE nodes SET lastSeen = datetime('now') WHERE online = 1")
-        time.sleep(interval)
+            if now >= next_beat:
+                con.execute("UPDATE nodes SET lastSeen = datetime('now') WHERE online = 1")
+                next_beat = now + interval
+            if activity and running and now >= release_at:
+                finish(con, running, rng)
+                running = []
+            if activity and not running and now >= next_burst:
+                running = burst(con, rng)
+                release_at = now + rng.uniform(2, 5)
+                next_burst = now + rng.uniform(6.5, 9.5)
+        time.sleep(0.25 if activity else interval)
 
 
 def main():
@@ -155,6 +200,8 @@ def main():
     parser.add_argument("path")
     parser.add_argument("--empty", action="store_true", help="create the file but no tables")
     parser.add_argument("--heartbeat", action="store_true", help="keep online nodes online until interrupted")
+    parser.add_argument("--activity", action="store_true",
+                        help="with --heartbeat, also run short bursts of checks (or set GRID_DEMO_ACTIVITY=1)")
     args = parser.parse_args()
     if os.path.exists(args.path):
         os.remove(args.path)
@@ -164,7 +211,7 @@ def main():
     con.close()
     print("wrote", args.path)
     if args.heartbeat:
-        heartbeat(args.path)
+        heartbeat(args.path, activity=args.activity or os.environ.get("GRID_DEMO_ACTIVITY") == "1")
 
 
 if __name__ == "__main__":
