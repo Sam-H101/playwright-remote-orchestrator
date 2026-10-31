@@ -17,11 +17,13 @@
 
 ## Running the checks with local server
 
-1. uncomment the CMD line in `docker/python/Dockerfile`
+1. uncomment the CMD line in `docker/python/Dockerfile` (the image ships the Playwright server, no npm install needed)
 2. Build the image and it should start if you do docker-compose up
 * Note this has not been tested
 
 ## Running a remote server
+
+The orchestrator image uses Playwright **1.64.1**. Playwright only accepts connections between a client and server on the same minor version, so every remote node must run the same version (see [here][l1] for install docs).
 
 ### Windows
 
@@ -32,7 +34,7 @@
 ```
 
 * Installs `playwright-core` and only the browsers you list (`-Browsers chromium` by default) into `C:\PlaywrightBackend`. Re-running skips anything already at the right version, so upgrades only download what changed.
-* `-PlaywrightVersion` must match the major.minor of the Playwright client the checks use.
+* `-PlaywrightVersion` defaults to 1.64.1 and must match the orchestrator's Playwright version.
 * Runs one `run-server` per port under a supervisor (scheduled task `PlaywrightBackend`, runs as SYSTEM at startup) that restarts crashed servers, and opens the ports in Windows Firewall.
 * Health-checks every port before it exits and reports the result: a console summary with the entry to paste into `src/database.yaml`, `C:\PlaywrightBackend\status.json`, an optional JSON POST to `-ReportUrl`, and the exit code (`0` all ports healthy, `2` some ports unhealthy, `1` failed).
 * `C:\PlaywrightBackend\backend-status.ps1 [-Json] [-ReportUrl <url>]` checks the host later with the same exit codes. `uninstall-backend.ps1 [-RemoveFiles]` removes it.
@@ -40,8 +42,13 @@
 
 ### Other platforms
 
-1. Install Playwright on the remote executioner host. Can be found [here][l1]
-2. Start a server per port with `npx playwright run-server --port <port number> --host 0.0.0.0`
+1. Install Node.js, then install the matching Playwright version and its browsers on the remote executioner host: `npm install playwright@1.64.1 && npx playwright install --with-deps`
+2. start the server by running `npx playwright run-server --port <port number> --host 0.0.0.0`
+   * Drop the old `--reuse-browser false` flag; current Playwright releases no longer accept it.
+
+### Upgrading Playwright
+
+Bump the version in all places together: `PLAYWRIGHT_VERSION` in `docker/python/Dockerfile`, `playwright==` in `docker/python/requirements.txt`, the default `$PlaywrightVersion` in `installer/windows/install-backend.ps1`, and the `run-server` install on every remote node (re-run the Windows installer with `-PlaywrightVersion <new>`).
 
 ## Configuration
 
