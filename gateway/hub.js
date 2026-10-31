@@ -1,8 +1,10 @@
 'use strict';
 
 // Gateway hub: the one port everything talks to. Agents dial out to /agent (control) and
-// /agent/data/<id> (one per session); checks connect to /connect/<node>/<slot> and get piped
-// through to that slot's run-server on the agent's host.
+// /agent/data/<id> (one per session). Checks connect to /connect (optionally ?node=<name>): the hub
+// picks a free slot that offers the browser and Playwright version the client asked for, claims it
+// in portUsage, and pipes the client through to that slot's run-server, on the agent's host or on a
+// legacy static host. Clients wait in a queue while every matching slot is busy.
 
 const crypto = require('node:crypto');
 const http = require('node:http');
@@ -13,9 +15,14 @@ const { pipe } = require('./lib/pipe');
 const { createRegistry } = require('./lib/registry');
 const { createTokenAuth } = require('./lib/tokens');
 const P = require('./lib/protocol');
+const R = require('./lib/routing');
 
 const REGISTER_TIMEOUT_MS = 10000;
 const EPHEMERAL_SWEEP_MS = 60000;
+const QUEUE_POLL_MS = 1000; // re-reads the slots while clients wait: other claimers release without telling the hub
+const CLAIM_SYNC_MS = 30000;
+const SLOT_ROUTE_GONE = 'the /connect/<node>/<slot> endpoints were removed: connect to /connect and the hub picks a free slot '
+  + 'for the browser you launch (add ?node=<name> to stay on one node)';
 
 function createHub(config, { log = createLogger('hub'), registry = createRegistry(config, log) } = {}) {
   // Control frames are small; only the session tunnels need Playwright-sized frames.
@@ -24,8 +31,33 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   const server = http.createServer(onRequest);
   const nodes = new Map(); // name -> registered agent connection
   const agents = new Set(); // every control connection, registered or not
-  const pending = new Map(); // open id -> held client upgrade
+  const pending = new Map(); // open id -> session an agent was asked to open
   const sessions = new Set(); // piped [client, data] pairs
+  // /connect clients from the token check to the 101: queued, claiming, opening. `queue` holds the queued
+  // ones in arrival order.
+  const held = new Set();
+  const queue = [];
+  // This hub's claims in portUsage, by claimedBy. A restarted hub frees every 'hub:' claim, so the prefix
+  // only has to tell this instance's claims from those of a hub that ran before it.
+  const claimPrefix = `hub:${crypto.randomBytes(4).toString('hex')}:`;
+  const claims = new Map();
+  const unreleased = new Map(); // claimedBy -> slot id: releases the database refused, retried by the claim sync
+  const lostClaims = new Set(); // claimedBy of claims taken from this hub, which it then never releases
+  const releasing = new Set(); // releases on their way to the database
+  const queuePollMs = config.queuePollMs ?? QUEUE_POLL_MS;
+  const claimSyncMs = config.claimSyncMs ?? CLAIM_SYNC_MS;
+  const queueTimeoutMs = config.queueTimeoutMs ?? 60000;
+  const queueMax = config.queueMax ?? 200;
+  const connectAttempts = config.connectAttempts ?? 3;
+  const failThreshold = config.failThreshold ?? 3;
+  const failCooldownMs = config.failCooldownMs ?? 300000;
+  let claimSeq = 0;
+  let clientSeq = 0;
+  let pumpRun = null; // the pump() pass under way
+  let pumpAgain = false;
+  let pollTimer = null;
+  let syncing = false;
+  let claimSyncer = null;
   const dbQueues = new Map(); // name -> promise chain, so writes for one node stay in order
   const pingInterval = Math.max(1000, Math.min(10000, Math.floor(config.heartbeatTimeoutMs / 3)));
   // A session leg that answers no ping for this long is half-open (tests set it lower).
@@ -115,8 +147,8 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     if (url.pathname === '/agent') return acceptAgent(req, socket, head);
     const data = /^\/agent\/data\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (data) return acceptData(req, socket, head, data[1]);
-    const connect = /^\/connect\/([^/]+)\/(\d+)\/?$/.exec(url.pathname);
-    if (connect) return acceptClient(req, socket, head, url, connect[1], Number(connect[2]), remote);
+    if (url.pathname === '/connect' || url.pathname === '/connect/') return acceptClient(req, socket, head, url, remote);
+    if (url.pathname.startsWith('/connect/')) return reject(socket, 410, SLOT_ROUTE_GONE);
     reject(socket, 404, 'not found');
   }
 
@@ -185,7 +217,8 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     ws.on('close', (code) => {
       clearTimeout(registerTimer);
       agents.delete(agent);
-      for (const id of agent.opens) failOpen(id, 502, `node ${agent.name} disconnected`);
+      // Not the slot's fault, so no failure is counted; the client is tried on another slot.
+      for (const id of [...agent.opens]) failOpen(id, 502, `node ${agent.name} disconnected`, { count: false });
       if (agent.name && nodes.get(agent.name) === agent) {
         nodes.delete(agent.name);
         log.info(`node ${agent.name} disconnected (${code})`);
@@ -267,12 +300,17 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     return dbWrite(agent.name, 'register', async () => {
       await registry.register(info);
       agent.synced = true;
+      pump(); // its slots can be claimed now
     });
   }
 
   function heartbeat(agent, msg) {
     const slots = P.normalizeSlots(msg.slots);
-    if (slots && slots.length === agent.slots.length) agent.slots = slots;
+    if (slots && slots.length === agent.slots.length) {
+      const recovered = slots.some((s, i) => s.healthy && !agent.slots[i].healthy);
+      agent.slots = slots;
+      if (recovered && nodes.get(agent.name) === agent) pump();
+    }
     agent.lastSeen = new Date();
     if (nodes.get(agent.name) !== agent) return;
     // A failed register write (or a wiped table) is repaired on the next heartbeat.
@@ -357,8 +395,8 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     }
   }
 
-  function acceptClient(req, socket, head, url, rawName, slot, remote) {
-    // Catch a broken handshake now rather than after the agent has opened a session for it.
+  function acceptClient(req, socket, head, url, remote) {
+    // Catch a broken handshake now rather than after a slot has been claimed for it.
     if ((req.headers.upgrade || '').toLowerCase() !== 'websocket' || !req.headers['sec-websocket-key']) {
       return reject(socket, 400, 'expected a WebSocket upgrade');
     }
@@ -374,65 +412,306 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
         log.warn(`client ${remote} rejected: ${verdict.message}`);
         return reject(socket, 401, verdict.problem ? `gateway token is ${verdict.problem}` : 'missing or bad gateway token');
       }
-      openSession(req, socket, head, url, rawName, slot, remote);
+      route(req, socket, head, url, remote);
     }).catch((err) => {
       log.error(`client ${remote}: token check failed: ${err.stack || err.message}`);
       reject(socket, 500, 'internal error');
     });
   }
 
-  function openSession(req, socket, head, url, rawName, slot, remote) {
-    let name;
-    try {
-      name = decodeURIComponent(rawName);
-    } catch {
-      return reject(socket, 404, 'unknown node');
+  // A client whose token checked out. Its upgrade is held (no 101 yet) in the queue until pump() finds it
+  // a slot, or it gives up, or it leaves.
+  function route(req, socket, head, url, remote) {
+    const { want, error } = R.clientWants(url.searchParams, req.headers);
+    if (error) return reject(socket, 400, error);
+    const query = P.stripQueryParam(P.stripQueryParam(url.search.replace(/^\?/, ''), 'gateway_token'), 'node');
+    const client = {
+      seq: ++clientSeq, label: `client ${remote}`, req, socket, head, want, query, headers: P.forwardHeaders(req.headers),
+      arrived: Date.now(), state: 'queued', evaluated: false, expired: false, attempts: 0, failed: new Set(), lastError: null,
+      summary: null, claim: null, open: null, timer: null,
+    };
+    // Reading the held socket is what lets a client's FIN show up as 'end'. A client sends nothing
+    // before the 101, so any bytes mean a broken client.
+    client.onSocketClose = () => leave(client);
+    client.onSocketEnd = () => {
+      if (leave(client)) socket.destroy();
+    };
+    client.onSocketData = () => finish(client, 400, 'data sent before the WebSocket handshake finished');
+    socket.on('close', client.onSocketClose);
+    socket.on('end', client.onSocketEnd);
+    socket.on('data', client.onSocketData);
+    held.add(client);
+    if (queueTimeoutMs > 0) {
+      client.timer = setTimeout(() => {
+        client.expired = true;
+        if (client.state === 'queued') giveUp(client);
+      }, queueTimeoutMs);
     }
-    const agent = nodes.get(P.canonicalName(name));
-    if (!agent) return reject(socket, 404, `node ${name} is not connected`);
-    if (slot < 1 || slot > agent.slots.length) return reject(socket, 404, `node ${name} has no slot ${slot} (it has ${agent.slots.length})`);
+    enqueue(client);
+    pump();
+  }
 
+  const slotWanted = ({ want }) => `${want.browser ? `${want.browser} ` : ''}slot${want.node ? ` on node ${want.node}` : ''}`;
+  const waited = (client) => `${((Date.now() - client.arrived) / 1000).toFixed(1)}s`;
+  const slotName = (c) => (c.gateway ? `${c.server}/${c.slot}` : `static host ${c.server}:${c.slot}`);
+
+  function enqueue(client) {
+    client.state = 'queued';
+    let i = queue.length;
+    while (i > 0 && queue[i - 1].seq > client.seq) i--;
+    queue.splice(i, 0, client);
+  }
+
+  function dequeue(client) {
+    const i = queue.indexOf(client);
+    if (i >= 0) queue.splice(i, 1);
+  }
+
+  function unhold(client) {
+    held.delete(client);
+    clearTimeout(client.timer);
+    client.socket.removeListener('close', client.onSocketClose);
+    client.socket.removeListener('end', client.onSocketEnd);
+    client.socket.removeListener('data', client.onSocketData);
+  }
+
+  // Takes a client out of whatever it was in (the queue, a claim on the way, a session being opened) and
+  // gives its slot back. A claim still on its way is given back when it lands. False if it was done already.
+  function abandon(client) {
+    if (client.state === 'done') return false;
+    const { state } = client;
+    client.state = 'done';
+    unhold(client);
+    if (state === 'queued') dequeue(client);
+    if (state === 'opening') {
+      cancelOpen(client);
+      release(client.claim);
+      client.claim = null;
+    }
+    return true;
+  }
+
+  // Ends a held client with a plain HTTP answer.
+  function finish(client, status, message) {
+    if (abandon(client)) reject(client.socket, status, message);
+  }
+
+  function leave(client) {
+    const { state, claim } = client;
+    if (!abandon(client)) return false;
+    const where = state === 'queued' ? `while waiting for a free ${slotWanted(client)}`
+      : state === 'opening' ? `before ${slotName(claim)} opened its session` : 'while its slot was being claimed';
+    log.info(`${client.label} left after ${waited(client)}, ${where}`);
+    return true;
+  }
+
+  function giveUp(client) {
+    const summary = client.summary || 'the hub could not look at the slots in time';
+    const within = queueTimeoutMs ? ` within ${Math.round(queueTimeoutMs / 1000)}s` : '';
+    const last = client.lastError ? `; the last try failed: ${client.lastError.message}` : '';
+    log.warn(`${client.label} gave up after ${waited(client)}: no free ${slotWanted(client)} (${summary})`);
+    finish(client, 503, `no free ${slotWanted(client)}${within}: ${summary}${last}`);
+  }
+
+  // Hands free slots to waiting clients, oldest first. One pass runs at a time; anything that may have
+  // freed a slot (a release, a node registering or recovering, the poll while clients wait) asks for
+  // another one.
+  function pump() {
+    if (pumpRun) {
+      pumpAgain = true;
+      return pumpRun;
+    }
+    pumpRun = runPump().finally(() => {
+      pumpRun = null;
+      if (queue.length && !pollTimer && !stopping) {
+        pollTimer = setTimeout(() => {
+          pollTimer = null;
+          pump();
+        }, queuePollMs);
+      }
+    });
+    return pumpRun;
+  }
+
+  async function runPump() {
+    try {
+      do {
+        pumpAgain = false;
+        if (stopping || !queue.length) return;
+        let rows;
+        try {
+          rows = await registry.slotStates(failThreshold, failCooldownMs);
+        } catch (err) {
+          log.error(`cannot read the slots to route ${queue.length} waiting client(s): ${err.message}`);
+          for (const client of [...queue]) finish(client, 503, 'the hub cannot reach its database to pick a slot right now; try again later');
+          return;
+        }
+        const taken = new Set([...claims.values()].map((c) => c.id));
+        for (const client of [...queue]) {
+          if (stopping) return;
+          if (client.state === 'queued') await serve(client, rows, taken);
+        }
+      } while (pumpAgain);
+    } catch (err) {
+      log.error(`routing failed: ${err.stack || err.message}`);
+    }
+  }
+
+  async function serve(client, rows, taken) {
+    const view = R.evaluate(client.want, rows, nodes, { failed: client.failed, taken, lastError: client.lastError });
+    if (view.fatal) {
+      // Every slot it could have had failed it already: it gets the last error.
+      const tried = view.fatal === client.lastError && client.attempts > 1 ? ` (tried ${client.attempts} slots)` : '';
+      log.warn(`${client.label} refused (${view.fatal.status}): ${view.fatal.message}${tried}`);
+      return finish(client, view.fatal.status, `${view.fatal.message}${tried}`);
+    }
+    client.summary = view.summary;
+    let free = view.free;
+    while (free.length && client.state === 'queued') {
+      const pick = R.choose(free);
+      free = free.filter((f) => f !== pick);
+      taken.add(pick.row.id);
+      if (await claim(client, pick)) return;
+    }
+    if (client.state !== 'queued') return;
+    if (client.expired || queueTimeoutMs === 0) return giveUp(client);
+    if (client.evaluated) return;
+    client.evaluated = true;
+    if (queue.filter((c) => c.evaluated).length > queueMax) {
+      log.warn(`${client.label} refused: the queue is full (${queueMax} clients waiting)`);
+      return finish(client, 503, `the hub's queue is full (${queueMax} clients waiting for a slot); try again later`);
+    }
+    log.info(`${client.label} waits for a free ${slotWanted(client)}: ${view.summary}`);
+  }
+
+  // Claims the slot with the same conditional UPDATE every claimer uses. Resolves true when the client is
+  // dealt with (its session is being opened, or it is gone), false when someone else got the slot first.
+  async function claim(client, { server, row }) {
+    const c = { claimedBy: `${claimPrefix}${++claimSeq}`, id: row.id, server: server.name, slot: row.slot, gateway: server.gateway, pending: true };
+    claims.set(c.claimedBy, c);
+    dequeue(client);
+    client.state = 'claiming';
+    let got;
+    try {
+      got = await registry.claimSlot(c.id, c.claimedBy);
+    } catch (err) {
+      claims.delete(c.claimedBy);
+      log.error(`could not claim ${slotName(c)} for ${client.label}: ${err.message}`);
+      if (client.state === 'claiming') finish(client, 503, 'the hub cannot reach its database to claim a slot right now; try again later');
+      return true;
+    }
+    c.pending = false;
+    if (!got) {
+      claims.delete(c.claimedBy);
+      if (client.state === 'claiming') enqueue(client);
+      return false;
+    }
+    if (client.state !== 'claiming') {
+      release(c); // the client left meanwhile
+      return true;
+    }
+    client.state = 'opening';
+    client.claim = c;
+    client.attempts++;
+    const attempt = client.attempts > 1 ? `, attempt ${client.attempts}` : '';
+    log.info(`${client.label} -> ${slotName(c)} (${client.want.browser || 'browser not named'}, waited ${waited(client)}${attempt})`);
+    if (c.gateway) openOnAgent(client, c);
+    else openOnStatic(client, c);
+    return true;
+  }
+
+  function openOnAgent(client, c) {
+    const agent = nodes.get(c.server);
+    if (!agent) return failAttempt(client, 502, `node ${c.server} disconnected`, false);
     const id = crypto.randomUUID();
     const open = {
-      id, agent, socket, req, head, slot,
-      timer: setTimeout(() => failOpen(id, 504, `node ${name} slot ${slot} did not answer within ${config.openTimeoutMs / 1000}s`), config.openTimeoutMs),
-      onSocketClose: () => dropOpen(id),
-      // Reading the held socket is what lets a client's FIN show up as 'end'. A client sends nothing
-      // before the 101, so any bytes mean a broken client.
-      onSocketEnd: () => {
-        if (!dropOpen(id)) return;
-        log.info(`client ${remote} left before ${name}/${slot} answered (${id})`);
-        socket.destroy();
-      },
-      onSocketData: () => failOpen(id, 400, 'data sent before the WebSocket handshake finished'),
+      id, agent, client, claim: c, slot: c.slot,
+      timer: setTimeout(() => failOpen(id, 504, `node ${c.server} slot ${c.slot} did not answer within ${config.openTimeoutMs / 1000}s`), config.openTimeoutMs),
     };
+    client.open = open;
     pending.set(id, open);
     agent.opens.add(id);
-    socket.on('close', open.onSocketClose);
-    socket.on('end', open.onSocketEnd);
-    socket.on('data', open.onSocketData);
-    const query = P.stripQueryParam(url.search.replace(/^\?/, ''), 'gateway_token');
-    P.safeSend(agent.ws, { type: 'open', id, slot, path: '/', query, headers: P.forwardHeaders(req.headers) });
-    log.info(`client ${remote} -> ${name}/${slot} (${id})`);
+    P.safeSend(agent.ws, { type: 'open', id, slot: c.slot, path: '/', query: client.query, headers: client.headers });
   }
 
-  function dropOpen(id) {
-    const open = pending.get(id);
-    if (!open) return null;
-    pending.delete(id);
-    open.agent.opens.delete(id);
-    clearTimeout(open.timer);
-    open.socket.removeListener('close', open.onSocketClose);
-    open.socket.removeListener('end', open.onSocketEnd);
-    open.socket.removeListener('data', open.onSocketData);
-    return open;
+  // A legacy static host: the hub dials its run-server itself, with the headers an agent slot would get.
+  function openOnStatic(client, c) {
+    const where = `static host ${c.server}:${c.slot}`;
+    const open = { client, claim: c, upstream: null, settled: false, timer: null };
+    const fail = (status, message) => {
+      if (open.settled) return;
+      open.settled = true;
+      failAttempt(client, status, message, true);
+    };
+    const host = c.server.includes(':') ? `[${c.server}]` : c.server;
+    try {
+      open.upstream = new WebSocket(`ws://${host}:${c.slot}/${client.query ? `?${client.query}` : ''}`, {
+        headers: client.headers, perMessageDeflate: false, maxPayload: P.MAX_PAYLOAD,
+      });
+    } catch (err) {
+      return fail(502, `${where}: ${err.message}`);
+    }
+    client.open = open;
+    open.timer = setTimeout(() => fail(504, `${where} did not answer within ${config.openTimeoutMs / 1000}s`), config.openTimeoutMs);
+    // run-server refuses a version mismatch with an HTTP error whose body says why.
+    open.upstream.on('unexpected-response', (req, res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { if (body.length < 2000) body += chunk; });
+      res.on('end', () => fail(502, `${where} answered HTTP ${res.statusCode}${body.trim() ? `: ${body.trim()}` : ''}`));
+      res.on('error', () => {});
+    });
+    open.upstream.on('error', (err) => fail(502, `${where}: ${err.message}`));
+    open.upstream.once('open', () => {
+      if (open.settled) return P.safeClose(open.upstream, 1001, 'client went away');
+      open.settled = true;
+      clearTimeout(open.timer);
+      client.open = null;
+      connected(client, c, open.upstream);
+    });
   }
 
-  function failOpen(id, status, message) {
-    const open = dropOpen(id);
+  function cancelOpen(client) {
+    const open = client.open;
+    client.open = null;
     if (!open) return;
-    log.warn(`open ${id} failed (${status}): ${message}`);
-    reject(open.socket, status, message);
+    clearTimeout(open.timer);
+    if (open.id) {
+      pending.delete(open.id);
+      open.agent.opens.delete(open.id);
+    }
+    if (open.upstream) {
+      open.settled = true;
+      open.upstream.terminate();
+    }
+  }
+
+  function failOpen(id, status, message, { count = true } = {}) {
+    const open = pending.get(id);
+    if (!open) return;
+    log.warn(`open ${id} on ${slotName(open.claim)} failed (${status}): ${message}`);
+    failAttempt(open.client, status, message, count);
+  }
+
+  // The chosen slot couldn't open the session. Unless it wasn't the slot's fault, that is a connect
+  // failure on it (failCount + 1, as main.py counted them); the slot goes back and the client is tried
+  // on another one, up to GATEWAY_CONNECT_ATTEMPTS slots, before it gets this error.
+  function failAttempt(client, status, message, count) {
+    const c = client.claim;
+    cancelOpen(client);
+    client.claim = null;
+    release(c, count ? addFailure(c) : null);
+    client.failed.add(c.id);
+    client.lastError = { status, message };
+    if (client.state !== 'opening') return;
+    if (stopping) return finish(client, 503, 'hub is shutting down');
+    if (client.attempts >= connectAttempts || client.expired) {
+      log.warn(`${client.label} gets ${status} after ${client.attempts} attempt(s): ${message}`);
+      return finish(client, status, client.attempts > 1 ? `${message} (tried ${client.attempts} slots)` : message);
+    }
+    log.info(`${client.label}: ${slotName(c)} failed (${message}); trying another slot`);
+    enqueue(client);
+    pump();
   }
 
   function openFailed(agent, msg) {
@@ -468,28 +747,112 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   }
 
   function attachData(req, socket, head, id, open) {
-    dropOpen(id);
-    if (open.socket.destroyed || !open.socket.writable) return reject(socket, 410, 'client went away');
+    const { client } = open;
+    cancelOpen(client);
+    if (client.socket.destroyed || !client.socket.writable) {
+      reject(socket, 410, 'client went away');
+      return leave(client);
+    }
     // Without verifyClient, handleUpgrade calls back synchronously or not at all (it answered the
     // socket itself because the handshake was invalid or the socket died), so a flag tells which.
     let dataUp = false;
     wss.handleUpgrade(req, socket, head, (data) => {
       dataUp = true;
-      let clientUp = false;
-      wss.handleUpgrade(open.req, open.socket, open.head, (client) => {
-        clientUp = true;
-        const session = { client, data, clientAlive: Date.now(), dataAlive: Date.now(), name: `${open.agent.name}/${open.slot}` };
-        sessions.add(session);
-        // Each leg proves itself: the agent's always-answering leg must not keep a dead client's session up.
-        const clientSeen = () => { session.clientAlive = Date.now(); };
-        const dataSeen = () => { session.dataAlive = Date.now(); };
-        client.on('pong', clientSeen).on('message', clientSeen);
-        data.on('pong', dataSeen).on('message', dataSeen);
-        pipe(client, data, () => sessions.delete(session));
-      });
-      if (!clientUp) P.safeClose(data, 1001, 'client went away');
+      connected(client, open.claim, data);
     });
-    if (!dataUp) reject(open.socket, 502, `node ${open.agent.name} sent a bad data channel handshake`);
+    if (!dataUp) failAttempt(client, 502, `node ${open.agent.name} sent a bad data channel handshake`, true);
+  }
+
+  // The slot's run-server took the session (its 101 is through), which also ends the slot's run of
+  // connect failures. The held client is upgraded and piped to it; the slot is released when either side ends.
+  function connected(client, c, data) {
+    if (client.state !== 'opening') return P.safeClose(data, 1001, 'client went away');
+    resetFailures(c);
+    unhold(client);
+    client.state = 'done';
+    client.claim = null;
+    let clientUp = false;
+    wss.handleUpgrade(client.req, client.socket, client.head, (ws) => {
+      clientUp = true;
+      const session = { client: ws, data, clientAlive: Date.now(), dataAlive: Date.now(), name: slotName(c), claim: c };
+      sessions.add(session);
+      // Each leg proves itself: the agent's always-answering leg must not keep a dead client's session up.
+      const clientSeen = () => { session.clientAlive = Date.now(); };
+      const dataSeen = () => { session.dataAlive = Date.now(); };
+      ws.on('pong', clientSeen).on('message', clientSeen);
+      data.on('pong', dataSeen).on('message', dataSeen);
+      pipe(ws, data, () => {
+        sessions.delete(session);
+        release(c);
+      });
+    });
+    if (!clientUp) {
+      P.safeClose(data, 1001, 'client went away');
+      release(c);
+    }
+  }
+
+  const addFailure = (c) => registry.addFailure(c.id).catch((err) => log.error(`could not count a connect failure on ${slotName(c)}: ${err.message}`));
+  const resetFailures = (c) => registry.resetFailures(c.id).catch((err) => log.error(`could not reset the failures of ${slotName(c)}: ${err.message}`));
+
+  // Gives a claim back (after `after`, such as the failure count, is written). Only this claim is
+  // released: if the slot was released from elsewhere and claimed again since, it is left alone. A
+  // release the database refuses is retried by the claim sync.
+  function release(c, after = null) {
+    if (!c || c.released) return;
+    c.released = true;
+    const done = Promise.resolve(after).then(() => registry.releaseSlot(c.id, c.claimedBy)).then((mine) => {
+      if (!mine) log.warn(`${slotName(c)} was no longer this hub's claim when its session ended; left it alone`);
+    }, (err) => {
+      unreleased.set(c.claimedBy, c.id);
+      log.error(`could not release ${slotName(c)}: ${err.message}; retrying every ${claimSyncMs / 1000}s`);
+    }).finally(() => {
+      claims.delete(c.claimedBy);
+      releasing.delete(done);
+      pump();
+    });
+    releasing.add(done);
+  }
+
+  // Every CLAIM_SYNC_MS: retries releases the database refused, frees claims of this hub that nothing
+  // holds, and checks that the live ones are still this hub's. The stale-claim sweep in src/database.py
+  // frees old claims without clearing claimedBy; a live session's slot it freed is claimed again if
+  // nobody took it meanwhile. A claim released from the Grid UI (claimedBy cleared) or taken over is
+  // let go: its session runs on, and its end releases nothing.
+  async function syncClaims() {
+    if (syncing || stopping) return;
+    syncing = true;
+    try {
+      for (const [claimedBy, id] of [...unreleased]) {
+        await registry.releaseSlot(id, claimedBy);
+        unreleased.delete(claimedBy);
+        log.info(`released slot #${id}, which an earlier release could not`);
+      }
+      const rows = await registry.slotStates(failThreshold, failCooldownMs);
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      for (const row of rows) {
+        const mine = typeof row.claimedBy === 'string' && row.claimedBy.startsWith(claimPrefix);
+        if (!mine || claims.has(row.claimedBy) || unreleased.has(row.claimedBy) || lostClaims.has(row.claimedBy)) continue;
+        if (await registry.releaseSlot(row.id, row.claimedBy)) log.warn(`released ${row.server}/${row.slot}: this hub claimed it, but no session holds it`);
+      }
+      for (const c of [...claims.values()]) {
+        if (c.released || c.pending) continue;
+        const row = byId.get(c.id);
+        if (row && row.claimedBy === c.claimedBy && row.inUse) continue;
+        if (row && row.claimedBy === c.claimedBy && await registry.reassertClaim(c.id, c.claimedBy)) {
+          log.warn(`${slotName(c)} was freed as a stale claim while its session is still open; claimed it again`);
+          continue;
+        }
+        c.released = true;
+        claims.delete(c.claimedBy);
+        lostClaims.add(c.claimedBy);
+        log.warn(`${slotName(c)} is no longer this hub's claim (${row ? 'released or claimed from elsewhere' : 'the slot was removed'}); its session runs on, and its end releases nothing`);
+      }
+    } catch (err) {
+      log.error(`claim sync failed: ${err.message}`);
+    } finally {
+      syncing = false;
+    }
   }
 
   // Pings find half-open TCP connections that would otherwise sit there forever.
@@ -517,6 +880,13 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
 
   async function start() {
     await registry.init();
+    // Sessions don't outlive the hub that piped them, so claims a hub made before this one are leftovers.
+    try {
+      const freed = await registry.releaseClaims('hub:');
+      if (freed) log.warn(`released ${freed} slot(s) a previous hub run still had claimed`);
+    } catch (err) {
+      log.error(`could not release the claims of a previous hub run: ${err.message}`);
+    }
     const managed = {};
     for (const kind of ['agent', 'client']) {
       if (config[`${kind}Token`]) continue;
@@ -553,6 +923,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     });
     keepalive = setInterval(sweep, pingInterval);
     tokenRechecker = setInterval(recheckTokens, tokenRecheckMs);
+    claimSyncer = setInterval(syncClaims, claimSyncMs);
     const { port } = server.address();
     const mode = (kind) => (config[`${kind}Token`] ? 'required' : managed[kind] ? 'required (managed tokens)' : 'not required');
     log.info(`hub listening on ${config.host}:${port} (db: ${registry.kind}, agent token ${mode('agent')}, client token ${mode('client')})`);
@@ -565,10 +936,12 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     clearInterval(keepalive);
     clearInterval(ephemeralSweeper);
     clearInterval(tokenRechecker);
+    clearInterval(claimSyncer);
+    clearTimeout(pollTimer);
     for (const timer of reapTimers.values()) clearTimeout(timer);
     reapTimers.clear();
     server.close();
-    for (const id of [...pending.keys()]) failOpen(id, 503, 'hub is shutting down');
+    for (const client of [...held]) finish(client, 503, 'hub is shutting down');
     for (const session of sessions) {
       P.safeClose(session.client, 1001, 'hub is shutting down');
       P.safeClose(session.data, 1001, 'hub is shutting down');
@@ -586,10 +959,17 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
       session.data.terminate();
     }
     server.closeAllConnections();
+    // Every claim goes back before the database connection does: the sessions are gone, and a claim
+    // still on its way is released when it lands.
+    await pumpRun;
+    for (const c of claims.values()) release(c);
+    await Promise.all([...releasing]);
     await registry.close();
   }
 
-  return { start, stop, server, nodes, pending, sessions, registry, sweepEphemeral, recheckTokens };
+  return {
+    start, stop, server, nodes, pending, sessions, queue, claims, registry, sweepEphemeral, recheckTokens, syncClaims,
+  };
 }
 
 async function main() {

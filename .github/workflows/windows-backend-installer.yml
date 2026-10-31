@@ -135,21 +135,22 @@ jobs:
           & "$env:INSTALL_DIR\backend-status.ps1" -HealthTimeoutSec 90
           if ($LASTEXITCODE -ne 0) { throw 'The previous install did not come back' }
 
-      - name: Connect a client to each slot through the hub
+      - name: Connect clients through the hub
         run: |
+          # The hub picks the slot: two browsers at once take both of the node's slots.
           $client = @'
           const { chromium } = require(process.env.INSTALL_DIR + '\\app\\node_modules\\playwright-core');
+          const url = `ws://127.0.0.1:4500/connect?node=${encodeURIComponent(process.env.CI_NODE)}`;
           (async () => {
-            for (const slot of [1, 2]) {
-              const url = `ws://127.0.0.1:4500/connect/${encodeURIComponent(process.env.CI_NODE)}/${slot}`;
-              const browser = await chromium.connect(url, { timeout: 60000 });
+            const browsers = await Promise.all([1, 2].map(() => chromium.connect(url, { timeout: 60000 })));
+            for (const [i, browser] of browsers.entries()) {
               const page = await browser.newPage();
               await page.setContent('<h1>ok</h1>');
               const text = await page.textContent('h1');
-              await browser.close();
-              if (text !== 'ok') throw new Error(`${url}: got ${text}`);
-              console.log(`${url}: ok`);
+              if (text !== 'ok') throw new Error(`session ${i + 1}: got ${text}`);
+              console.log(`session ${i + 1} through ${url}: ok`);
             }
+            await Promise.all(browsers.map((b) => b.close()));
           })().catch(e => { console.error(e); process.exit(1); });
           '@
           Set-Content -Path "$env:RUNNER_TEMP\client.js" -Value $client

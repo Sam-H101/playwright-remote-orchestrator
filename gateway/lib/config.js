@@ -47,6 +47,15 @@ function hubConfig(env = process.env) {
     // Managed access tokens: how long a lookup is cached, and how often connected agents' tokens are re-checked.
     tokenCacheMs: int(env.TOKEN_CACHE_S, 10, 'TOKEN_CACHE_S', 0, 3600) * 1000,
     tokenRecheckMs: int(env.TOKEN_RECHECK_S, 15, 'TOKEN_RECHECK_S', 1, 86400) * 1000,
+    // Routing /connect: how long and how many clients may wait for a free slot, and how many slots one
+    // client is tried on before it gets the error.
+    queueTimeoutMs: int(env.GATEWAY_QUEUE_TIMEOUT_S, 60, 'GATEWAY_QUEUE_TIMEOUT_S', 0, 86400) * 1000,
+    queueMax: int(env.GATEWAY_QUEUE_MAX, 200, 'GATEWAY_QUEUE_MAX', 0, 100000),
+    connectAttempts: int(env.GATEWAY_CONNECT_ATTEMPTS, 3, 'GATEWAY_CONNECT_ATTEMPTS', 1, 20),
+    // The same names and defaults as src/database.py: a slot with this many consecutive connect failures
+    // is skipped, except for one try per cooldown counted from its last run.
+    failThreshold: int(env.SLOT_FAIL_THRESHOLD || env.GRID_FAIL_THRESHOLD, 3, 'SLOT_FAIL_THRESHOLD', 0, 1000000),
+    failCooldownMs: int(env.SLOT_FAIL_COOLDOWN_S, 300, 'SLOT_FAIL_COOLDOWN_S', 0, 86400 * 365) * 1000,
   };
 }
 
@@ -73,7 +82,8 @@ const AGENT_USAGE = `Usage: node agent.js --hub ws://hub:4500 [options]
   --slots <n>             SLOTS                run-server processes, 1-${MAX_SLOTS} (default 4)
   --base-port <port>      BASE_PORT            slot i listens on 127.0.0.1:<base+i-1> (default 3100)
   --playwright-cli <path> PLAYWRIGHT_CLI       playwright-core cli.js (default: resolved from node_modules)
-  --browsers <list>       BROWSERS             comma list reported to the hub (default chromium)
+  --browsers <list>       BROWSERS             browsers installed here (default chromium); the hub only
+                                               routes clients asking for one of them to this node
   --status-file <path>    STATUS_FILE          JSON status, rewritten every few seconds
   --log-dir <dir>         LOG_DIR              run-server output goes to <dir>/slot-<i>.log
   --ephemeral             EPHEMERAL=1          the hub removes this node once it has been gone for

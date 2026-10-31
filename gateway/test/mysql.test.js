@@ -6,6 +6,7 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { test, before, after, afterEach } = require('node:test');
+const WebSocket = require('ws');
 const h = require('./helpers');
 const { hubConfig } = require('../lib/config');
 const { MySqlRegistry } = require('../lib/registry');
@@ -172,13 +173,13 @@ test('hub on MySQL: managed tokens, node binding, revocation and expiry set with
   await h.waitFor(() => wrong.lastError && /4403/.test(wrong.lastError), { what: '4403 for the wrong name' });
 
   // Client tokens: header and query; an agent token is not a client token.
-  let ws = await h.connect(`${url}/connect/mysql-a/1?gateway_token=${clientToken.token}`);
+  let ws = await h.connect(`${url}/connect?node=mysql-a&gateway_token=${clientToken.token}`);
   ws.send('q');
   assert.equal((await h.nextMessage(ws)).data.toString(), 'q');
-  ws = await h.connect(`${url}/connect/mysql-a/2`, { 'x-gateway-token': clientToken.token });
+  ws = await h.connect(`${url}/connect?node=mysql-a`, { 'x-gateway-token': clientToken.token });
   ws.send('hdr');
   assert.equal((await h.nextMessage(ws)).data.toString(), 'hdr');
-  await assert.rejects(h.connect(`${url}/connect/mysql-a/1?gateway_token=${agentToken.token}`), { status: 401 });
+  await assert.rejects(h.connect(`${url}/connect?node=mysql-a&gateway_token=${agentToken.token}`), { status: 401 });
 
   // Revoked in the database (as the UI does it): the agent is closed with 4401 within the re-check interval.
   const codes = [];
@@ -191,4 +192,122 @@ test('hub on MySQL: managed tokens, node binding, revocation and expiry set with
   await h.waitFor(() => !c.registered && c.lastError && /4401/.test(c.lastError), { timeout: 10000, what: 'lapsed agent kicked' });
   assert.equal(b.registered, true);
   assert.deepEqual([...hub.nodes.keys()], ['mysql-bound']);
+});
+
+test('init adds claimedBy to a portUsage table made before it, and the claim methods behave like src/database.py', { skip }, async () => {
+  await admin.query('SET FOREIGN_KEY_CHECKS = 0');
+  for (const table of ['portUsage', 'portStatus', 'nodes']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
+  await admin.query('SET FOREIGN_KEY_CHECKS = 1');
+  // portStatus and portUsage as they were before the hub routed clients.
+  await admin.query(`CREATE TABLE portStatus (id INT AUTO_INCREMENT PRIMARY KEY, PortNumber INT NOT NULL, PortStatus INT NOT NULL DEFAULT 0,
+    PortServer VARCHAR(255) NOT NULL, LastUpdateTime DATETIME NULL, UNIQUE KEY uq_server_port (PortServer, PortNumber))`);
+  await admin.query(`CREATE TABLE portUsage (id INT PRIMARY KEY, portNumber INT NOT NULL, inUse TINYINT NOT NULL DEFAULT 0, LastRunDate DATETIME NULL,
+    failCount INT NOT NULL DEFAULT 0, KEY idx_in_use (inUse), CONSTRAINT fk_port_usage_status FOREIGN KEY (id) REFERENCES portStatus (id) ON DELETE CASCADE)`);
+  await admin.query("INSERT INTO portStatus (PortNumber, PortStatus, PortServer) VALUES (3000, 0, 'static-a'), (3001, 0, 'static-a')");
+  await admin.query('INSERT INTO portUsage (id, portNumber, inUse, failCount) SELECT id, PortNumber, 0, 0 FROM portStatus');
+
+  const registry = await newRegistry();
+  const [cols] = await admin.query(
+    "SELECT COLUMN_NAME AS name, IS_NULLABLE AS nullable, DATA_TYPE AS type FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'portUsage' ORDER BY ORDINAL_POSITION");
+  assert.deepEqual(cols.at(-1), { name: 'claimedBy', nullable: 'YES', type: 'varchar' });
+  await registry.applySchema(); // idempotent
+  await registry.register({ name: 'gw-node', slots: [{ index: 1, healthy: true }, { index: 2, healthy: false }], browsers: ['chromium', 'firefox'],
+    playwrightVersion: '1.64.1', agentVersion: 'test', platform: 'linux', remoteAddress: null, ephemeral: false, tokenId: null });
+
+  const states = async () => (await registry.slotStates(3, 300000)).sort((a, b) => a.server.localeCompare(b.server) || a.slot - b.slot);
+  let rows = await states();
+  assert.deepEqual(rows.map((r) => [r.server, r.slot, r.healthy, r.inUse, r.failing, r.claimedBy]),
+    [['gw-node', 1, true, false, false, null], ['gw-node', 2, false, false, false, null], ['static-a', 3000, false, false, false, null], ['static-a', 3001, false, false, false, null]]);
+  assert.deepEqual(rows[0].node, { online: true, browsers: ['chromium', 'firefox'], playwrightVersion: '1.64.1' });
+  assert.equal(rows[2].node, null);
+
+  // Claiming is the conditional UPDATE: of two concurrent claims exactly one wins.
+  const id = rows[0].id;
+  const results = await Promise.all([registry.claimSlot(id, 'hub:aaaa0000:1'), registry.claimSlot(id, 'hub:aaaa0000:2')]);
+  assert.deepEqual(results.sort(), [false, true]);
+  const [[claim]] = await admin.query('SELECT inUse, claimedBy, TIMESTAMPDIFF(SECOND, LastRunDate, UTC_TIMESTAMP()) AS age FROM portUsage WHERE id = ?', [id]);
+  assert.equal(claim.inUse, 1);
+  assert.match(claim.claimedBy, /^hub:aaaa0000:[12]$/);
+  assert.ok(claim.age >= 0 && claim.age < 5, `LastRunDate is ${claim.age}s from UTC now`);
+  const other = claim.claimedBy.endsWith('1') ? 'hub:aaaa0000:2' : 'hub:aaaa0000:1';
+  assert.equal(await registry.releaseSlot(id, other), false, 'only the claim that holds it releases it');
+  // The stale-claim sweep of src/database.py frees it without touching claimedBy: the hub may claim it again.
+  await admin.query('UPDATE portUsage SET inUse = 0 WHERE id = ?', [id]);
+  assert.equal(await registry.reassertClaim(id, other), false);
+  assert.equal(await registry.reassertClaim(id, claim.claimedBy), true);
+  assert.equal(await registry.releaseSlot(id, claim.claimedBy), true);
+  rows = await states();
+  assert.deepEqual([rows[0].inUse, rows[0].claimedBy], [false, null]);
+
+  // Failures and the cooldown, on the database clock (this server is not on UTC).
+  for (let i = 0; i < 3; i++) await registry.addFailure(id);
+  await admin.query('UPDATE portUsage SET LastRunDate = UTC_TIMESTAMP() - INTERVAL 100 SECOND WHERE id = ?', [id]);
+  rows = await states();
+  assert.equal(rows[0].failCount, 3);
+  assert.equal(rows[0].failing, true);
+  assert.ok(rows[0].retryInMs > 195000 && rows[0].retryInMs <= 202000, String(rows[0].retryInMs));
+  await admin.query('UPDATE portUsage SET LastRunDate = UTC_TIMESTAMP() - INTERVAL 301 SECOND WHERE id = ?', [id]);
+  assert.equal((await states())[0].failing, false, 'the cooldown is over');
+  await registry.resetFailures(id);
+  assert.equal((await states())[0].failCount, 0);
+
+  // A restarted hub frees every 'hub:' claim, and only those; _ and % in the prefix are literal.
+  const [g2, s1, s2] = [rows[1].id, rows[2].id, rows[3].id];
+  await registry.claimSlot(g2, 'hub:dead0001:1');
+  await registry.claimSlot(s1, 'hubx:1');
+  await admin.query('UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP() WHERE id = ?', [s2]); // main.py's claim
+  assert.equal(await registry.releaseClaims('hub_'), 0);
+  assert.equal(await registry.releaseClaims('hub:'), 1);
+  const [after] = await admin.query('SELECT id, inUse, claimedBy FROM portUsage WHERE id IN (?)', [[g2, s1, s2]]);
+  const byId = new Map(after.map((r) => [r.id, [r.inUse, r.claimedBy]]));
+  assert.deepEqual([g2, s1, s2].map((i) => byId.get(i)), [[0, null], [1, 'hubx:1'], [1, null]]);
+});
+
+test('hub on MySQL: /connect claims the slot in portUsage, releases it, and dials a static host', { skip }, async () => {
+  const registry = await newRegistry({ init: false });
+  await admin.query('SET FOREIGN_KEY_CHECKS = 0');
+  for (const table of ['portUsage', 'portStatus', 'nodes']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
+  await admin.query('SET FOREIGN_KEY_CHECKS = 1');
+  await admin.query('DELETE FROM accessTokens'); // no managed tokens: agents and clients need none
+  const { url, hub } = await h.startHub({ queuePollMs: 100 }, registry);
+  const agent = await h.startAgent(url, { name: 'mysql-route', slots: 1 });
+  await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
+  await h.waitFor(async () => (await admin.query("SELECT COUNT(*) AS n FROM portStatus WHERE PortServer = 'mysql-route' AND PortStatus = 1"))[0][0].n === 1,
+    { what: 'slot healthy in portStatus' });
+
+  const usage = async (server) => (await admin.query(
+    'SELECT pu.inUse, pu.claimedBy, pu.failCount FROM portUsage pu JOIN portStatus ps ON ps.id = pu.id WHERE ps.PortServer = ?', [server]))[0][0];
+  const ws = await h.connect(`${url}/connect`, { 'x-playwright-browser': 'chromium' });
+  ws.send('hello');
+  assert.equal((await h.nextMessage(ws)).data.toString(), 'hello');
+  let row = await usage('mysql-route');
+  assert.equal(row.inUse, 1);
+  assert.match(row.claimedBy, /^hub:[0-9a-f]{8}:\d+$/);
+
+  // The only chromium slot is busy, so a second client waits; it gets the slot once the first one ends.
+  const second = h.connect(`${url}/connect`, { 'x-playwright-browser': 'chromium' });
+  await h.waitFor(() => hub.queue.length === 1, { what: 'second client queued' });
+  ws.close();
+  const ws2 = await second;
+  ws2.send('next');
+  assert.equal((await h.nextMessage(ws2)).data.toString(), 'next');
+  ws2.close();
+  await h.waitFor(async () => (row = await usage('mysql-route')) && row.inUse === 0, { what: 'released in portUsage' });
+  assert.equal(row.claimedBy, null);
+
+  // A legacy static host (a portStatus row with no nodes row): the hub dials it directly.
+  const wss = new WebSocket.WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise((r) => wss.once('listening', r));
+  h.cleanups.push(async () => wss.close());
+  wss.on('connection', (sock, req) => sock.on('message', () => sock.send(`static saw ${req.headers['x-playwright-browser']}`)));
+  const staticPort = wss.address().port;
+  await admin.query("INSERT INTO portStatus (PortNumber, PortStatus, PortServer, LastUpdateTime) VALUES (?, 0, '127.0.0.1', UTC_TIMESTAMP())", [staticPort]);
+  await admin.query("INSERT INTO portUsage (id, portNumber, inUse, failCount) SELECT id, PortNumber, 0, 0 FROM portStatus WHERE PortServer = '127.0.0.1'");
+  const viaStatic = await h.connect(`${url}/connect?node=127.0.0.1`, { 'x-playwright-browser': 'webkit' });
+  viaStatic.send('hi');
+  assert.equal((await h.nextMessage(viaStatic)).data.toString(), 'static saw webkit');
+  assert.equal((await usage('127.0.0.1')).inUse, 1);
+  await hub.stop();
+  row = await usage('127.0.0.1');
+  assert.deepEqual([row.inUse, row.claimedBy], [0, null], 'stopping the hub released it');
 });

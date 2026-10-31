@@ -21,6 +21,20 @@ const { hashToken } = require('./protocol');
 //   nameHolder(name)          the still-valid agent token bound to `name` that the node last registered with,
 //                             as { id, name, prefix }, or null: that token's node name is reserved for it
 //   touchToken(id)            set the token's lastUsedAt to now
+// Routing /connect. A slot is a portStatus row and its portUsage row; `id` is their shared id.
+//   slotStates(threshold, cooldownMs)  every slot as { id, server, slot, healthy, inUse, failCount, failing,
+//                             retryInMs, claimedBy, node }: failing is failCount >= threshold within cooldownMs of
+//                             its last run (src/database.py's rule), retryInMs how long until it may be tried
+//                             again, node its nodes row ({ online, browsers: [], playwrightVersion }) or null for
+//                             a static host
+//   claimSlot(id, claimedBy)  inUse 0 -> 1 with LastRunDate now, atomically; resolves whether this call got it
+//   releaseSlot(id, claimedBy)  inUse = 0 with LastRunDate now, only while the claim is still claimedBy's;
+//                             resolves whether it was
+//   reassertClaim(id, claimedBy)  inUse 0 -> 1 again for a claim the stale-claim sweep freed under a live
+//                             session (that sweep leaves claimedBy alone); resolves whether it got it back
+//   releaseClaims(prefix)     free every claim whose claimedBy starts with prefix (a restarted hub's leftovers);
+//                             resolves how many were in use
+//   addFailure(id), resetFailures(id)  failCount + 1, failCount = 0
 //   close()
 
 function splitSchema(sql) {
@@ -31,11 +45,18 @@ function splitSchema(sql) {
 
 const healthyList = (slots) => slots.filter((s) => s.healthy).map((s) => s.index).join(',');
 
-// Columns added to the nodes table after it first shipped; CREATE TABLE IF NOT EXISTS won't add them.
-const NODE_COLUMNS = [
-  ['ephemeral', 'TINYINT NOT NULL DEFAULT 0'],
-  ['tokenId', 'INT NULL'],
-];
+// Columns added to tables after they first shipped; CREATE TABLE IF NOT EXISTS won't add them.
+const ADDED_COLUMNS = {
+  nodes: [
+    ['ephemeral', 'TINYINT NOT NULL DEFAULT 0'],
+    ['tokenId', 'INT NULL'],
+  ],
+  portUsage: [
+    ['claimedBy', 'VARCHAR(64) NULL'],
+  ],
+};
+
+const splitList = (value) => String(value || '').split(',').map((v) => v.trim()).filter(Boolean);
 
 // mysql2 hands DATETIMEs back as 'YYYY-MM-DD HH:MM:SS' (dateStrings); they hold UTC.
 const isoUtc = (value) => (value ? `${String(value).replace(' ', 'T')}Z` : null);
@@ -209,6 +230,67 @@ class MySqlRegistry {
     await this.query('UPDATE accessTokens SET lastUsedAt = UTC_TIMESTAMP() WHERE id = ?', [id]);
   }
 
+  // The free-slot rule of src/database.py (FREE_SLOTS_SQL), but for every slot, so the hub can also tell
+  // busy from unhealthy from failing. The time arithmetic stays on the database clock, as it does there.
+  async slotStates(threshold, cooldownMs) {
+    const cooldown = Math.ceil(cooldownMs / 1000);
+    const [rows] = await this.query(
+      `SELECT ps.id, ps.PortServer AS server, ps.PortNumber AS slot, ps.PortStatus AS status, pu.inUse, pu.failCount, pu.claimedBy,
+         (pu.failCount >= ? AND pu.LastRunDate IS NOT NULL AND pu.LastRunDate >= UTC_TIMESTAMP() - INTERVAL ? SECOND) AS failing,
+         TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), pu.LastRunDate + INTERVAL ? SECOND) AS retryIn,
+         n.name AS nodeName, n.online, n.browsers, n.playwrightVersion
+       FROM portStatus ps
+       JOIN portUsage pu ON pu.id = ps.id
+       LEFT JOIN nodes n ON n.name = ps.PortServer
+       WHERE ps.PortServer <> ''`,
+      [threshold, cooldown, cooldown]);
+    return rows.map((r) => {
+      const failing = Number(r.failing) === 1;
+      return {
+        id: Number(r.id), server: r.server, slot: Number(r.slot), healthy: Number(r.status) === 1,
+        inUse: Number(r.inUse) === 1, failCount: Number(r.failCount), failing,
+        retryInMs: failing ? (Math.max(0, Number(r.retryIn)) + 1) * 1000 : 0, claimedBy: r.claimedBy ?? null,
+        node: r.nodeName == null ? null : {
+          online: Number(r.online) === 1, browsers: splitList(r.browsers), playwrightVersion: r.playwrightVersion ?? null,
+        },
+      };
+    });
+  }
+
+  // The same conditional UPDATE as set_in_use_port in src/database.py, so two claimers never both win.
+  async claimSlot(id, claimedBy) {
+    const [result] = await this.query(
+      'UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP(), claimedBy = ? WHERE id = ? AND inUse = 0', [claimedBy, id]);
+    return result.affectedRows > 0;
+  }
+
+  async releaseSlot(id, claimedBy) {
+    const [result] = await this.query(
+      'UPDATE portUsage SET inUse = 0, LastRunDate = UTC_TIMESTAMP(), claimedBy = NULL WHERE id = ? AND claimedBy = ?', [id, claimedBy]);
+    return result.affectedRows > 0;
+  }
+
+  async reassertClaim(id, claimedBy) {
+    const [result] = await this.query('UPDATE portUsage SET inUse = 1 WHERE id = ? AND inUse = 0 AND claimedBy = ?', [id, claimedBy]);
+    return result.affectedRows > 0;
+  }
+
+  async releaseClaims(prefix) {
+    const like = `${prefix.replace(/[\\%_]/g, '\\$&')}%`;
+    const [result] = await this.query(
+      'UPDATE portUsage SET inUse = 0, LastRunDate = UTC_TIMESTAMP(), claimedBy = NULL WHERE claimedBy LIKE ? AND inUse = 1', [like]);
+    await this.query('UPDATE portUsage SET claimedBy = NULL WHERE claimedBy LIKE ?', [like]);
+    return result.affectedRows;
+  }
+
+  async addFailure(id) {
+    await this.query('UPDATE portUsage SET failCount = failCount + 1 WHERE id = ?', [id]);
+  }
+
+  async resetFailures(id) {
+    await this.query('UPDATE portUsage SET failCount = 0 WHERE id = ? AND failCount <> 0', [id]);
+  }
+
   // A one-off query that survives the tables being dropped under us (see heartbeat).
   async query(sql, params) {
     try {
@@ -223,16 +305,18 @@ class MySqlRegistry {
 
   async applySchema() {
     for (const stmt of this.statements) await this.pool.query(stmt);
-    const [cols] = await this.pool.query(
-      `SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'nodes'`);
-    const have = new Set(cols.map((c) => String(c.name).toLowerCase()));
-    for (const [column, type] of NODE_COLUMNS) {
-      if (have.has(column.toLowerCase())) continue;
-      try {
-        await this.pool.query(`ALTER TABLE nodes ADD COLUMN ${column} ${type}`);
-        this.log.info(`added the ${column} column to the nodes table`);
-      } catch (err) {
-        if (err.code !== 'ER_DUP_FIELDNAME') throw err; // another process added it first
+    for (const [table, columns] of Object.entries(ADDED_COLUMNS)) {
+      const [cols] = await this.pool.query(
+        'SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?', [table]);
+      const have = new Set(cols.map((c) => String(c.name).toLowerCase()));
+      for (const [column, type] of columns) {
+        if (have.has(column.toLowerCase())) continue;
+        try {
+          await this.pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+          this.log.info(`added the ${column} column to the ${table} table`);
+        } catch (err) {
+          if (err.code !== 'ER_DUP_FIELDNAME') throw err; // another process added it first
+        }
       }
     }
   }
@@ -289,9 +373,29 @@ class MemoryRegistry {
   constructor() {
     this.kind = 'memory';
     this.nodes = new Map();
+    // server -> Map(slot number -> its portStatus and portUsage row); a server with no nodes row is a static host
     this.slots = new Map();
     this.tokens = new Map(); // id -> accessTokens row; tests add them with addToken
     this.nextTokenId = 1;
+    this.nextSlotId = 1;
+  }
+
+  newSlot(status) {
+    return { id: this.nextSlotId++, status, inUse: 0, failCount: 0, lastRun: null, claimedBy: null };
+  }
+
+  // What hosts: in database.yaml seeds for a legacy static host (tests only).
+  addStaticSlot(server, port) {
+    const slots = this.slots.get(server) || new Map();
+    const slot = slots.get(port) || this.newSlot(0);
+    slots.set(port, slot);
+    this.slots.set(server, slots);
+    return slot;
+  }
+
+  slotById(id) {
+    for (const slots of this.slots.values()) for (const slot of slots.values()) if (slot.id === id) return slot;
+    return null;
   }
 
   async init() {
@@ -314,7 +418,7 @@ class MemoryRegistry {
       else slots.delete(index);
     }
     for (const s of info.slots) {
-      const slot = slots.get(s.index) || { inUse: 0 };
+      const slot = slots.get(s.index) || this.newSlot(0);
       slot.status = s.healthy ? 1 : 0;
       slots.set(s.index, slot);
     }
@@ -389,6 +493,69 @@ class MemoryRegistry {
   async touchToken(id) {
     const token = this.tokens.get(id);
     if (token) token.lastUsedAt = new Date().toISOString();
+  }
+
+  async slotStates(threshold, cooldownMs) {
+    const now = Date.now();
+    const out = [];
+    for (const [server, slots] of this.slots) {
+      const node = this.nodes.get(String(server).toLowerCase());
+      for (const [number, s] of slots) {
+        const failing = s.failCount >= threshold && s.lastRun !== null && s.lastRun >= now - cooldownMs;
+        out.push({
+          id: s.id, server, slot: number, healthy: s.status === 1, inUse: !!s.inUse, failCount: s.failCount, failing,
+          retryInMs: failing ? s.lastRun + cooldownMs - now : 0, claimedBy: s.claimedBy,
+          node: node ? { online: !!node.online, browsers: splitList(node.browsers), playwrightVersion: node.playwrightVersion ?? null } : null,
+        });
+      }
+    }
+    return out;
+  }
+
+  async claimSlot(id, claimedBy) {
+    const slot = this.slotById(id);
+    if (!slot || slot.inUse) return false;
+    Object.assign(slot, { inUse: 1, lastRun: Date.now(), claimedBy });
+    return true;
+  }
+
+  async releaseSlot(id, claimedBy) {
+    const slot = this.slotById(id);
+    if (!slot || slot.claimedBy !== claimedBy) return false;
+    Object.assign(slot, { inUse: 0, lastRun: Date.now(), claimedBy: null });
+    return true;
+  }
+
+  async reassertClaim(id, claimedBy) {
+    const slot = this.slotById(id);
+    if (!slot || slot.inUse || slot.claimedBy !== claimedBy) return false;
+    slot.inUse = 1;
+    return true;
+  }
+
+  async releaseClaims(prefix) {
+    let freed = 0;
+    for (const slots of this.slots.values()) {
+      for (const slot of slots.values()) {
+        if (typeof slot.claimedBy !== 'string' || !slot.claimedBy.startsWith(prefix)) continue;
+        if (slot.inUse) {
+          freed++;
+          Object.assign(slot, { inUse: 0, lastRun: Date.now() });
+        }
+        slot.claimedBy = null;
+      }
+    }
+    return freed;
+  }
+
+  async addFailure(id) {
+    const slot = this.slotById(id);
+    if (slot) slot.failCount++;
+  }
+
+  async resetFailures(id) {
+    const slot = this.slotById(id);
+    if (slot) slot.failCount = 0;
   }
 
   async close() {}

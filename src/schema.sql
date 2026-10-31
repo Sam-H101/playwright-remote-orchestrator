@@ -16,12 +16,18 @@ CREATE TABLE IF NOT EXISTS portStatus (
     UNIQUE KEY uq_server_port (PortServer, PortNumber)
 )
 ;
+-- A slot is claimed by setting inUse 0 -> 1 with a conditional UPDATE, which also stamps
+-- LastRunDate; releasing sets inUse = 0 and stamps it again. claimedBy names a claim the gateway
+-- hub made for a /connect session ('hub:<hub instance>:<n>'; NULL for any other claimer): the hub
+-- releases only its own claims, and frees every 'hub:' claim when it starts, since a hub that
+-- stopped took its sessions with it. The hub adds the column to a portUsage table made before it.
 CREATE TABLE IF NOT EXISTS portUsage (
     id INT PRIMARY KEY,
     portNumber INT NOT NULL,
     inUse TINYINT NOT NULL DEFAULT 0,
     LastRunDate DATETIME NULL,
     failCount INT NOT NULL DEFAULT 0,
+    claimedBy VARCHAR(64) NULL,
     KEY idx_in_use (inUse),
     CONSTRAINT fk_port_usage_status FOREIGN KEY (id) REFERENCES portStatus (id) ON DELETE CASCADE
 )

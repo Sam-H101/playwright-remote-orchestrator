@@ -49,15 +49,16 @@ test('agent registers, gets the ack and shows up in /api/nodes, /healthz and the
   assert.deepEqual((await h.getJson(`${http}/api/nodes`)).body, { nodes: [] });
 });
 
-test('pipes text and binary frames, forwards x-playwright-* headers and the query, strips the gateway token', async () => {
+test('pipes text and binary frames, forwards x-playwright-* headers and the query, strips the gateway token and node', async () => {
   const { url } = await h.startHub({ clientToken: 's3cret' });
   const agent = await h.startAgent(url, { name: 'pipe-node' });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
 
-  const ws = await h.connect(`${url}/connect/pipe-node/2?browser=chromium&gateway_token=s3cret&x=a%20b`, {
+  // The fake run-server reports playwright 0.0.0-fake, so a 0.0 client matches it.
+  const ws = await h.connect(`${url}/connect?node=pipe-node&browser=chromium&gateway_token=s3cret&x=a%20b`, {
     'x-playwright-browser': 'chromium',
     'x-playwright-launch-options': '{"headless":true}',
-    'user-agent': 'Playwright/1.64.1 (test)',
+    'user-agent': 'Playwright/0.0.0 (test)',
     authorization: 'Bearer nope',
   });
   ws.send('hello');
@@ -81,36 +82,38 @@ test('pipes text and binary frames, forwards x-playwright-* headers and the quer
   assert.equal(info.url, '/?browser=chromium&x=a%20b');
   assert.equal(info.headers['x-playwright-browser'], 'chromium');
   assert.equal(info.headers['x-playwright-launch-options'], '{"headless":true}');
-  assert.equal(info.headers['user-agent'], 'Playwright/1.64.1 (test)');
+  assert.equal(info.headers['user-agent'], 'Playwright/0.0.0 (test)');
   assert.equal(info.headers.authorization, undefined);
   assert.equal(info.headers['x-gateway-token'], undefined);
-  assert.equal(info.headers.host, `127.0.0.1:${agent.slots[1].port}`);
+  assert.ok(agent.slots.some((s) => info.headers.host === `127.0.0.1:${s.port}`), info.headers.host);
 
-  const ws2 = await h.connect(`${url}/connect/pipe-node/1`, { 'x-gateway-token': 's3cret' });
+  const ws2 = await h.connect(`${url}/connect/`, { 'x-gateway-token': 's3cret' });
   ws2.send('info');
   const info2 = JSON.parse((await h.nextMessage(ws2)).data);
   assert.equal(info2.url, '/');
   assert.equal(info2.headers['x-gateway-token'], undefined);
 });
 
-test('answers 401, 404, 502 and 504 with plain HTTP', async () => {
+test('answers 400, 401, 404, 502 and 504 with plain HTTP', async () => {
   const { url } = await h.startHub({ clientToken: 'tok', openTimeoutMs: 800 });
   const agent = await h.startAgent(url, { name: 'n1', slots: 2 });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
 
-  await assert.rejects(h.connect(`${url}/connect/n1/1`), { status: 401 });
-  await assert.rejects(h.connect(`${url}/connect/n1/1?gateway_token=wrong`), { status: 401 });
-  await assert.rejects(h.connect(`${url}/connect/missing/1?gateway_token=tok`), (err) => err.status === 404 && /not connected/.test(err.body));
-  await assert.rejects(h.connect(`${url}/connect/n1/3?gateway_token=tok`), (err) => err.status === 404 && /no slot 3/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=n1`), { status: 401 });
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=wrong`), { status: 401 });
+  await assert.rejects(h.connect(`${url}/connect?node=missing&gateway_token=tok`), (err) => err.status === 404 && /no node or static host named missing/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=bad%20name&gateway_token=tok`), (err) => err.status === 400 && /node must be/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=tok`, { 'x-playwright-browser': 'fire fox' }), { status: 400 });
   await assert.rejects(h.connect(`${url}/elsewhere`), { status: 404 });
-  await assert.rejects(h.connect(`${url}/connect/n1/1?gateway_token=tok`, { 'x-playwright-browser': 'reject' }),
-    (err) => err.status === 502 && /428/.test(err.body) && /version mismatch/.test(err.body));
+  // Both slots refuse (as run-server does on a version mismatch); each is tried once.
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=tok`, { 'x-fake-reject': '1' }),
+    (err) => err.status === 502 && /428/.test(err.body) && /version mismatch/.test(err.body) && /tried 2 slots/.test(err.body));
 
   // A node that registers but never answers opens.
   const silentAgent = await h.rawAgent(url);
   await h.register(silentAgent, 'mute');
   const started = Date.now();
-  await assert.rejects(h.connect(`${url}/connect/mute/1?gateway_token=tok`), (err) => err.status === 504);
+  await assert.rejects(h.connect(`${url}/connect?node=mute&gateway_token=tok`), (err) => err.status === 504 && /did not answer/.test(err.body));
   assert.ok(Date.now() - started >= 700);
 });
 
@@ -119,7 +122,7 @@ test('pending opens fail with 502 when the agent disconnects, and late data chan
   const raw = await h.rawAgent(url);
   await h.register(raw, 'flaky');
   const opened = h.nextMessage(raw).then(({ data }) => JSON.parse(data));
-  const client = h.connect(`${url}/connect/flaky/1`);
+  const client = h.connect(`${url}/connect?node=flaky`);
   const open = await opened;
   assert.equal(open.type, 'open');
   assert.equal(open.slot, 1);
@@ -161,7 +164,7 @@ test('agent reconnects and re-registers after a hub restart', async () => {
   const { body } = await h.getJson(`${second.http}/api/nodes`);
   assert.deepEqual(body.nodes.map((n) => n.name), ['phoenix']);
 
-  const ws = await h.connect(`${second.url}/connect/phoenix/1`);
+  const ws = await h.connect(`${second.url}/connect`);
   ws.send('ping?');
   assert.equal((await h.nextMessage(ws)).data.toString(), 'ping?');
 });
@@ -229,7 +232,7 @@ test('restarts a crashed run-server and writes the status file', async () => {
   assert.equal(after.slots[0].pid, agent.slots[0].child.pid);
   assert.equal(after.slots[1].restarts, 0);
 
-  const ws = await h.connect(`${url}/connect/crashy/1`);
+  const ws = await h.connect(`${url}/connect`);
   ws.send('back');
   assert.equal((await h.nextMessage(ws)).data.toString(), 'back');
 
@@ -241,26 +244,27 @@ test('restarts a crashed run-server and writes the status file', async () => {
 
 test('propagates close codes in both directions and maps unsendable ones', async () => {
   const { url } = await h.startHub();
-  const agent = await h.startAgent(url, { name: 'closer' });
+  // One slot, so every session lands on the run-server that saw the previous one close.
+  const agent = await h.startAgent(url, { name: 'closer', slots: 1 });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
 
-  let ws = await h.connect(`${url}/connect/closer/1`);
+  let ws = await h.connect(`${url}/connect`);
   const closing = h.closed(ws);
   ws.send('close:4321:server says bye');
   assert.deepEqual(await closing, { code: 4321, reason: 'server says bye' });
 
-  ws = await h.connect(`${url}/connect/closer/1`);
+  ws = await h.connect(`${url}/connect`);
   ws.close(4123, 'client says bye');
   await h.closed(ws);
   await h.sleep(200);
-  ws = await h.connect(`${url}/connect/closer/1`);
+  ws = await h.connect(`${url}/connect`);
   ws.send('lastclose');
   assert.deepEqual(JSON.parse((await h.nextMessage(ws)).data), { code: 4123, reason: 'client says bye' });
 
   // A client that vanishes (1006) reaches run-server as 1011.
   ws.terminate();
   await h.sleep(300);
-  ws = await h.connect(`${url}/connect/closer/1`);
+  ws = await h.connect(`${url}/connect`);
   ws.send('lastclose');
   assert.equal(JSON.parse((await h.nextMessage(ws)).data).code, 1011);
 
@@ -268,7 +272,7 @@ test('propagates close codes in both directions and maps unsendable ones', async
   ws.close();
   await h.closed(ws);
   await h.sleep(200);
-  ws = await h.connect(`${url}/connect/closer/1`);
+  ws = await h.connect(`${url}/connect`);
   ws.send('lastclose');
   assert.equal(JSON.parse((await h.nextMessage(ws)).data).code, 1000);
 });
@@ -277,7 +281,7 @@ test('agent stop closes sessions and the hub marks the node offline', async () =
   const { url, registry } = await h.startHub();
   const agent = await h.startAgent(url, { name: 'leaver' });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
-  const ws = await h.connect(`${url}/connect/leaver/1`);
+  const ws = await h.connect(`${url}/connect`);
   const closing = h.closed(ws);
   await agent.stop();
   assert.equal((await closing).code, 1001);
@@ -331,7 +335,7 @@ test('node names are case-insensitive: stored lower-case, routed and replaced re
 
   // A client using another spelling still reaches the node.
   const opened = h.nextMessage(first).then(({ data }) => JSON.parse(data));
-  h.connect(`${url}/connect/RUNNER-a/1`).catch(() => {});
+  h.connect(`${url}/connect?node=RUNNER-a`).catch(() => {});
   assert.equal((await opened).type, 'open');
 
   // The same node in different case replaces the connection instead of becoming a second node.
@@ -349,7 +353,7 @@ test('a held /connect upgrade is dropped as soon as the client leaves, and stray
   await h.register(raw, 'held', 2);
 
   let opened = h.nextMessage(raw).then(({ data }) => JSON.parse(data));
-  const client = h.rawSocket(port, h.upgradeRequest('/connect/held/1'));
+  const client = h.rawSocket(port, h.upgradeRequest('/connect?node=held'));
   const open = await opened;
   assert.equal(hub.pending.size, 1);
   client.socket.end(); // half-close: only a FIN reaches the hub
@@ -357,7 +361,7 @@ test('a held /connect upgrade is dropped as soon as the client leaves, and stray
   await assert.rejects(h.connect(`${url}/agent/data/${open.id}`), { status: 404 });
 
   opened = h.nextMessage(raw).then(({ data }) => JSON.parse(data));
-  const chatty = h.rawSocket(port, h.upgradeRequest('/connect/held/2'));
+  const chatty = h.rawSocket(port, h.upgradeRequest('/connect?node=held'));
   await opened;
   chatty.socket.write('too early');
   assert.match(await chatty.response, /^HTTP\/1\.1 400 /);
@@ -369,8 +373,8 @@ test('the hub closes a session whose client stops answering pings even though th
   const agent = await h.startAgent(url, { name: 'halfopen' });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
 
-  const dead = await h.connect(`${url}/connect/halfopen/1`);
-  const live = await h.connect(`${url}/connect/halfopen/2`);
+  const dead = await h.connect(`${url}/connect`);
+  const live = await h.connect(`${url}/connect`);
   // A client that stopped answering pings (its host is gone but the TCP connection is not).
   dead._autoPong = false;
   await h.waitFor(() => hub.sessions.size === 2, { what: 'two sessions' });
@@ -386,7 +390,7 @@ test('the agent ends sessions whose data channel goes silent (hub host gone with
   const proxy = await h.freezableProxy(port);
   const agent = await h.startAgent(`ws://127.0.0.1:${proxy.port}`, { name: 'blackhole' }, { heartbeatMs: 200, hubSilenceMs: 1500 });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
-  const client = await h.connect(`${url}/connect/blackhole/1`);
+  const client = await h.connect(`${url}/connect`);
   client.send('hi');
   assert.equal((await h.nextMessage(client)).data.toString(), 'hi');
   assert.equal(agent.sessions.size, 1);
@@ -404,7 +408,7 @@ test('pipe applies backpressure: a client that stops reading does not grow the h
   const { url, hub } = await h.startHub();
   const agent = await h.startAgent(url, { name: 'slowreader' });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
-  const client = await h.connect(`${url}/connect/slowreader/1`);
+  const client = await h.connect(`${url}/connect`);
   await h.waitFor(() => hub.sessions.size === 1, { what: 'session' });
   const [session] = hub.sessions;
 
@@ -466,7 +470,8 @@ test('an ephemeral node keeps slots still in use until a later sweep finds them 
   ws.terminate();
   await h.waitFor(() => registry.slots.get('busy').size === 1, { what: 'free slots removed' });
   assert.equal(registry.nodes.get('busy').online, 0);
-  assert.deepEqual(registry.slots.get('busy').get(2), { inUse: 1, status: 0 });
+  assert.equal(registry.slots.get('busy').get(2).inUse, 1);
+  assert.equal(registry.slots.get('busy').get(2).status, 0);
 
   registry.slots.get('busy').get(2).inUse = 0;
   await hub.sweepEphemeral();

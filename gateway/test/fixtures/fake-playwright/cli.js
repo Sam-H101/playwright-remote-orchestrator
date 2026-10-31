@@ -3,7 +3,7 @@
 // Stand-in for playwright-core's cli.js in tests: `cli.js run-server --port <p> --host <h>` starts a
 // WebSocket echo server. Text commands: "info" returns the upgrade url and headers, "lastclose" the
 // close code/reason of the previous connection, "close:<code>:<reason>" closes from the server side.
-// A client sending x-playwright-browser: reject gets HTTP 428, like run-server on a version mismatch.
+// A client sending x-fake-reject: 1 gets HTTP 428, like run-server on a version mismatch.
 
 const http = require('node:http');
 const WebSocket = require('ws');
@@ -19,7 +19,7 @@ let lastClose = null;
 const server = http.createServer((req, res) => res.writeHead(404).end());
 const wss = new WebSocket.WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  if (req.headers['x-playwright-browser'] === 'reject') {
+  if (req.headers['x-fake-reject']) {
     socket.end('HTTP/1.1 428 Precondition Required\r\nConnection: close\r\nContent-Length: 16\r\n\r\nversion mismatch');
     return;
   }

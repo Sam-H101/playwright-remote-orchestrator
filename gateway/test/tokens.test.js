@@ -35,9 +35,9 @@ function refused(url, token, name = 'refused-node') {
   });
 }
 
-// A client upgrade to a node nobody serves: 404 means the token was accepted, 401/503 that it wasn't.
+// A client pinned to a node nobody serves: 404 means the token was accepted, 401/503 that it wasn't.
 function clientStatus(url, query = '', headers = {}) {
-  return h.connect(`${url}/connect/nobody/1${query}`, headers).then(() => 101, (err) => err.status);
+  return h.connect(`${url}/connect?node=nobody${query.replace(/^\?/, '&')}`, headers).then(() => 101, (err) => err.status);
 }
 
 test('a managed agent token registers the node, is recorded on it, and turns agent auth on', async () => {
@@ -56,7 +56,7 @@ test('a managed agent token registers the node, is recorded on it, and turns age
   assert.match(row.lastUsedAt, /Z$/);
 
   // A session runs over a data channel that carries the same managed token.
-  const ws = await h.connect(`${url}/connect/managed-1/1`);
+  const ws = await h.connect(`${url}/connect?node=managed-1`);
   ws.send('hello');
   assert.equal((await h.nextMessage(ws)).data.toString(), 'hello');
 
@@ -350,7 +350,7 @@ test('the env bootstrap token works with the database down; managed tokens fail 
   const agent = await h.startAgent(url, { name: 'bootstrapped', token: 'boot-agent' });
   await h.waitFor(() => h.allHealthy(agent), { what: 'env-token agent registered' });
   assert.equal(registry.nodes.get('bootstrapped').tokenId, null);
-  const ws = await h.connect(`${url}/connect/bootstrapped/1?gateway_token=boot-client`);
+  const ws = await h.connect(`${url}/connect?node=bootstrapped&gateway_token=boot-client`);
   ws.send('still works');
   assert.equal((await h.nextMessage(ws)).data.toString(), 'still works');
 
@@ -479,7 +479,7 @@ test('lastUsedAt is written at most once per interval per token', async () => {
   touches.length = 0;
 
   for (let i = 0; i < 4; i++) {
-    const ws = await h.connect(`${url}/connect/busy/${(i % 2) + 1}`, { 'x-gateway-token': clientToken });
+    const ws = await h.connect(`${url}/connect?node=busy`, { 'x-gateway-token': clientToken });
     ws.send('x');
     await h.nextMessage(ws);
     ws.close();
@@ -517,24 +517,24 @@ test('managed client tokens work in the header and the query, are stripped, and 
   const agent = await h.startAgent(url, { name: 'client-node', token: agentToken });
   await h.waitFor(() => h.allHealthy(agent), { what: 'ready' });
 
-  const viaQuery = await h.connect(`${url}/connect/client-node/1?a=1&gateway_token=${clientToken}`);
+  const viaQuery = await h.connect(`${url}/connect?node=client-node&a=1&gateway_token=${clientToken}`);
   viaQuery.send('info');
   let info = JSON.parse((await h.nextMessage(viaQuery)).data);
   assert.equal(info.url, '/?a=1');
-  const viaHeader = await h.connect(`${url}/connect/client-node/2`, { 'x-gateway-token': clientToken });
+  const viaHeader = await h.connect(`${url}/connect?node=client-node`, { 'x-gateway-token': clientToken });
   viaHeader.send('info');
   info = JSON.parse((await h.nextMessage(viaHeader)).data);
   assert.equal(info.url, '/');
   assert.equal(info.headers['x-gateway-token'], undefined);
 
-  await assert.rejects(h.connect(`${url}/connect/client-node/1`), (err) => err.status === 401 && /missing or bad/.test(err.body));
-  await assert.rejects(h.connect(`${url}/connect/client-node/1?gateway_token=${agentToken}`), (err) => err.status === 401 && /not a client token/.test(err.body));
-  await assert.rejects(h.connect(`${url}/connect/client-node/1?gateway_token=${expired}`), (err) => err.status === 401 && /is expired/.test(err.body));
-  await assert.rejects(h.connect(`${url}/connect/client-node/1?gateway_token=${mint('client')}`), (err) => err.status === 401 && !err.body.includes('pwgc_'));
+  await assert.rejects(h.connect(`${url}/connect?node=client-node`), (err) => err.status === 401 && /missing or bad/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=client-node&gateway_token=${agentToken}`), (err) => err.status === 401 && /not a client token/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=client-node&gateway_token=${expired}`), (err) => err.status === 401 && /is expired/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=client-node&gateway_token=${mint('client')}`), (err) => err.status === 401 && !err.body.includes('pwgc_'));
 
   clientRow.revokedAt = iso(0);
   await h.sleep(200);
-  await assert.rejects(h.connect(`${url}/connect/client-node/1`, { 'x-gateway-token': clientToken }), (err) => err.status === 401 && /is revoked/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=client-node`, { 'x-gateway-token': clientToken }), (err) => err.status === 401 && /is revoked/.test(err.body));
   viaQuery.send('still open');
   assert.equal((await h.nextMessage(viaQuery)).data.toString(), 'still open');
 });
@@ -601,7 +601,7 @@ test('a data channel must carry the token its control connection used', async ()
   await h.register(raw, 'strict');
 
   const opened = h.nextMessage(raw).then(({ data }) => JSON.parse(data));
-  const client = h.connect(`${url}/connect/strict/1`);
+  const client = h.connect(`${url}/connect?node=strict`);
   const { id } = await opened;
   await assert.rejects(h.connect(`${url}/agent/data/${id}`, { Authorization: `Bearer ${theirs}` }), { status: 401 });
   await assert.rejects(h.connect(`${url}/agent/data/${id}`), { status: 401 });
