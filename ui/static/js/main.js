@@ -81,6 +81,7 @@ function renderViews(msg) {
   views.access.update(msg.data);
   inspector.render();
   renderTop(msg, v);
+  tick(); // fill ages and countdowns in anything just rendered, not a second later
 }
 
 // ---- top bar -----------------------------------------------------------------------
@@ -90,7 +91,7 @@ function renderTop(msg, v) {
   chip.className = "verdict-chip t-" + v.tone;
   setText($("verdict-chip-text"), v.chip);
   chip.setAttribute("aria-label", "Grid status: " + v.h1 + ". Show what needs you.");
-  setText($("capacity"), d && d.totals.slots ? d.totals.available + " free / " + d.totals.slots + " · " + d.totals.busy + " running" : "No slots yet");
+  setText($("capacity"), d && d.totals.slots ? d.totals.available + " free / " + d.totals.slots + " · " + d.totals.busy + " running" : d && !live.error ? "No slots yet" : "");
   setText($("grid-name"), (d && d.grid_name) || location.host);
   const n = d ? d.sessions.length : 0;
   document.querySelectorAll("[data-session-count]").forEach((el) => { setText(el, String(n)); el.hidden = !n; });
@@ -477,6 +478,7 @@ function tick() {
   freshness();
 }
 setInterval(tick, 1000);
+app.tick = tick; // views that render on their own schedule (Access) fill their ages at once
 
 // ---- start -----------------------------------------------------------------------------------
 if (prefs.get("gridDensity", "") === "compact") root.dataset.density = "compact";

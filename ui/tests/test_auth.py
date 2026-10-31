@@ -151,3 +151,12 @@ def test_demo_activity_claims_and_releases_like_the_checks(tmp_path):
         rows = con.execute("SELECT inUse, LastRunDate FROM portUsage WHERE id IN ({})".format(",".join("?" * len(claimed))), claimed).fetchall()
     assert all(in_use == 0 and stamp for in_use, stamp in rows)
     assert len(before) == 22
+
+
+def test_a_soft_status_poll_reports_an_outage_as_data(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(store, "SQLITE_PATH", str(tmp_path))  # a directory: every query fails
+    r = client.get("/api/status")
+    assert r.status_code == 503 and "error" in r.get_json() and "unavailable" not in r.get_json()
+    r = client.get("/api/status?soft=1")
+    assert r.status_code == 200 and r.get_json()["unavailable"] is True and r.get_json()["error"]
+    assert r.headers["Cache-Control"] == "no-store"

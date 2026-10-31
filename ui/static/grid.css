@@ -279,7 +279,11 @@ select { padding-right: 4px; }
 }
 .insp-kind { font-size: 12px; font-weight: 600; color: var(--text-2); }
 .insp-hint { margin-left: auto; font-size: 11px; color: var(--text-3); }
-.insp-body { flex: 1; overflow: auto; padding: 16px; display: grid; gap: 16px; align-content: start; overscroll-behavior: contain; }
+.insp-body {
+  flex: 1; overflow: auto; padding: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-content: start;
+  overscroll-behavior: contain;
+}
+.insp-body > *, .insp-section, .code-panel { min-width: 0; }
 .insp-handle { position: absolute; left: -4px; top: 0; bottom: 0; width: 8px; cursor: col-resize; z-index: 2; }
 .insp-handle::after { content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 2px; background: transparent; transition: background var(--ease); }
 .insp-handle:hover::after, .insp-handle:focus-visible::after, .resizing .insp-handle::after { background: var(--accent); }
@@ -288,7 +292,7 @@ select { padding-right: 4px; }
 .insp-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .insp-head h2 { font-size: 15px; font-weight: 600; word-break: break-all; }
 .insp-head h2:focus { outline: none; }
-.insp-head h2:focus-visible { outline: 2px solid var(--accent); }
+
 .insp-sentence { font-size: 14px; line-height: 1.55; color: var(--text); }
 .insp-section { display: grid; gap: 8px; }
 .insp-stats { color: var(--text-2); }
@@ -320,7 +324,9 @@ select { padding-right: 4px; }
 .k-node .ev-glyph { border-radius: 2px; border: 2px solid var(--text-3); }
 .k-admin .ev-glyph { background: var(--warn); clip-path: polygon(0 0, 100% 0, 100% 60%, 30% 60%, 30% 100%, 0 100%); }
 
-.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tabs-row { display: flex; align-items: flex-end; gap: 8px; border-bottom: 1px solid var(--line); min-width: 0; }
+.copy-btn { position: absolute; top: 5px; right: 5px; background: var(--raised); }
+.tabs { display: flex; gap: 2px; overflow-x: auto; min-width: 0; }
 .tabs [role=tab] {
   height: 30px; padding: 0 10px; border: 0; border-bottom: 2px solid transparent; background: transparent;
   color: var(--text-2); font-size: 12px; font-weight: 500; white-space: nowrap; margin-bottom: -1px;
@@ -328,10 +334,9 @@ select { padding-right: 4px; }
 .tabs [role=tab][aria-selected=true] { color: var(--text); border-bottom-color: var(--accent); }
 .code-panel { position: relative; }
 .code {
-  margin: 0; padding: 36px 12px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--raised);
+  margin: 0; padding: 10px 40px 10px 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--raised);
   color: var(--text); white-space: pre; overflow-x: auto; font-size: 12px; line-height: 1.55;
 }
-.copy-btn { position: absolute; top: 6px; right: 6px; }
 .hub-input { display: flex; gap: 6px; }
 .hub-input input { flex: 1; font-family: var(--mono); font-size: 12px; }
 .hub-field { margin: 0; }
@@ -408,6 +413,7 @@ select { padding-right: 4px; }
 .tl-tick::after { content: ""; position: absolute; left: 50%; top: 15px; width: 1px; height: 5px; background: var(--line-strong); }
 .tl-now { position: absolute; right: 0; bottom: 2px; font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); }
 .tl-lanes { max-height: 236px; overflow-y: auto; overflow-x: hidden; }
+.tl-scale { --rec: 0; }
 .tl-lane { border-bottom: 1px solid var(--line); }
 .tl-lane:last-child { border-bottom: 0; }
 .tl-label { padding: 4px 10px 4px 0; color: var(--text-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; align-self: center; }
@@ -426,7 +432,18 @@ select { padding-right: 4px; }
 .bar.failed { background: var(--bad); }
 .bar.yours { background: color-mix(in srgb, var(--warn) 70%, var(--surface)); }
 .bar.running { box-shadow: 1px 0 0 0 var(--text); }
-.bar.clipped { border-top-left-radius: 0; border-bottom-left-radius: 0; }
+.bar.clipped { border-top-left-radius: 0; border-bottom-left-radius: 0; mask-image: linear-gradient(to right, transparent, #000 28px); }
+/* Before this tab started recording: nothing is known, and the chart says so. */
+.tl-area::after {
+  content: ""; position: absolute; left: 0; top: -6px; bottom: -6px; width: calc(var(--rec, 0) * 1%); pointer-events: none;
+  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--text-3) 14%, transparent) 0 1px, transparent 1px 6px);
+}
+.tl-norec {
+  position: absolute; left: 0; top: 2px; width: calc(var(--rec, 0) * 1%); overflow: hidden; white-space: nowrap; text-align: center;
+  font-size: 11px; color: var(--text-3);
+}
+.tl-lane.off .tl-label { color: var(--text-3); }
+.tl-lane.off .tl-label::after { content: " · offline"; font-family: var(--sans); font-size: 11px; }
 .bar.approx { width: 2px; background: var(--text-2); margin-left: -1px; }
 .bar.approx::after {
   content: ""; position: absolute; left: -2px; top: -1px; width: 6px; height: 6px; background: var(--text-2); transform: rotate(45deg); border-radius: 1px;
@@ -670,6 +687,7 @@ dialog::backdrop { background: var(--backdrop); }
 .signin-sheet.anchored::backdrop { background: transparent; }
 .form-sheet { width: min(500px, calc(100vw - 32px)); }
 .form-sheet input[type=text] { width: 100%; }
+.form-sheet .sheet-sub { margin-bottom: 18px; }
 .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .choice { display: flex; gap: 8px; align-items: flex-start; padding: 10px; border: 1px solid var(--line-strong); border-radius: 4px; cursor: pointer; }
 .choice:has(input:checked) { border-color: var(--accent); background: var(--accent-tint); }
@@ -816,6 +834,7 @@ dialog::backdrop { background: var(--backdrop); }
   .table td[data-label] { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; align-items: center; }
   .table td[data-label]::before { content: attr(data-label); color: var(--text-3); font-size: 12px; }
   .table td.na { display: none; }
+  .table td[data-label] > * { justify-self: start; }
   .sessions .cell-endpoint code { max-width: 100%; }
   .sessions .cell-endpoint { max-width: none; }
   .sessions .cell-endpoint .copyable { min-width: 0; }

@@ -142,7 +142,14 @@ def index():
 @app.get("/status")
 @app.get("/api/status")
 def status():
-    data = store.snapshot()
+    try:
+        data = store.snapshot()
+    except store.DatabaseUnavailable as e:
+        # ?soft=1 (the page's own polls): the outage as data, not an HTTP error the browser logs every
+        # few seconds. Without it the answer is the 503 (or 403) it has always been.
+        if request.args.get("soft") != "1":
+            raise
+        return _private(jsonify(error=str(e), unavailable=True))
     data["grid_name"] = GRID_NAME or None
     data["public_gateway_url"] = PUBLIC_GATEWAY_URL or None
     return jsonify(data)

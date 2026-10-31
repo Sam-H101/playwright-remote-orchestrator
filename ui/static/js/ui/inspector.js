@@ -172,13 +172,15 @@ export function createInspector({ onClose }) {
     return html`<section class="insp-section repro" aria-labelledby="repro-title">
       <h3 class="section-label" id="repro-title">Reproduce</h3>
       ${gateway ? hubField("Your checks' hub address. The client token is read from GATEWAY_CLIENT_TOKEN, never copied.") : html`<p class="hint">Static hosts take a plain run-server address; no token.</p>`}
-      <div class="tabs" role="tablist" aria-label="Snippet language">
-        ${LANGS.map(([id, label]) => html`<button type="button" role="tab" id="repro-tab-${id}" data-lang="${id}" aria-controls="repro-panel"
-          aria-selected="${id === lang}" tabindex="${id === lang ? 0 : -1}">${label}</button>`)}
+      <div class="tabs-row">
+        <div class="tabs" role="tablist" aria-label="Snippet language">
+          ${LANGS.map(([id, label]) => html`<button type="button" role="tab" id="repro-tab-${id}" data-lang="${id}" aria-controls="repro-panel"
+            aria-selected="${id === lang}" tabindex="${id === lang ? 0 : -1}">${label}</button>`)}
+        </div>
       </div>
       <div class="code-panel" role="tabpanel" id="repro-panel" aria-labelledby="repro-tab-${lang}">
-        <pre class="code"><code id="repro-code" class="mono"></code></pre>
-        <button type="button" class="btn small copy-btn" id="repro-copy" data-copy="" data-copy-label="the snippet">${icon("i-copy")}Copy</button>
+        <pre class="code" tabindex="0"><code id="repro-code" class="mono"></code></pre>
+        <button type="button" class="icon-btn tiny copy-btn" id="repro-copy" data-copy="" data-copy-label="the snippet" aria-label="Copy the snippet" title="Copy">${icon("i-copy")}</button>
       </div>
     </section>`;
   }

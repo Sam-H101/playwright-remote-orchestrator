@@ -47,6 +47,10 @@ export async function post(url, body) {
   return r.body;
 }
 
-export function status() {
-  return get("api/status");
+// The page polls with ?soft=1, so a database outage comes back as data rather than as an HTTP
+// error the browser would log on every poll.
+export async function status() {
+  const body = await get("api/status?soft=1");
+  if (body.unavailable) throw new ApiError(body.error || "The database is unavailable.", 503, body);
+  return body;
 }

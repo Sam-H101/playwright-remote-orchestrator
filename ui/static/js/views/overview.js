@@ -62,7 +62,7 @@ export function verdict(data, error, items) {
   }
   const t = data.totals;
   if (error) return { h1: "Can't reach the database", chip: "No data", tone: "bad" };
-  if (!data.db.initialised || !t.slots) return { h1: "No nodes yet", chip: "No data", tone: "off" };
+  if (!data.db.initialised || !t.slots) return { h1: "No nodes yet", chip: "No nodes", tone: "off" };
   if (!t.available && !t.busy) return { h1: "Grid down", chip: "Down", tone: "bad" };
   if (!t.available) return { h1: "No free slots", chip: "Full · 0 free", tone: "warn" };
   if (items.length) return { h1: items.length === 1 ? "1 problem needs you" : items.length + " problems need you", chip: "Degraded · " + items.length, tone: "warn" };

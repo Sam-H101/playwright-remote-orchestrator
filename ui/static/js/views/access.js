@@ -211,6 +211,7 @@ export function createAccess(section) {
     if (!banner.hidden) {
       setHTML(banner, html`<div><strong>Can't refresh the access tokens.</strong> Showing the last list. Retrying.<code class="mono">${access.error}</code></div>`);
     }
+    if (app.tick) app.tick();
   }
 
   // ---- reveal -----------------------------------------------------------------

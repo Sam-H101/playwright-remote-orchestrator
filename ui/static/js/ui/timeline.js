@@ -59,6 +59,7 @@ export function createTimeline(root, { onOpen }) {
         <div class="tl-scale">
           <div class="tl-bursts" id="tl-bursts"></div>
           <div class="tl-ticks" id="tl-ticks"></div>
+          <span class="tl-norec" id="tl-norec" hidden>not recorded: this tab opened at <span id="tl-norec-at"></span></span>
           <span class="tl-now">now</span>
         </div>
       </div>
@@ -78,7 +79,7 @@ export function createTimeline(root, { onOpen }) {
   const burstsEl = root.querySelector("#tl-bursts"), sparkEl = root.querySelector("#tl-spark");
   const lanes = new Map();
   const runById = new Map();
-  let runs = [], focusId = null, data = null, events = [], samples = [], lastNow = Date.now();
+  let runs = [], focusId = null, data = null, events = [], samples = [], lastNow = Date.now(), since = null;
 
   // Capacity sparkline: busy as an area, capacity as a line, red where nothing was free.
   const W = 1000, H = 28;
@@ -148,6 +149,7 @@ export function createTimeline(root, { onOpen }) {
     data = nextData;
     events = recorder.events;
     samples = recorder.samples;
+    since = recorder.since + (now - Date.now()); // the recording's start, on the server's clock
     const nodes = ((data && data.nodes) || []).slice().sort((a, b) =>
       (a.kind === b.kind ? 0 : a.kind === "gateway" ? -1 : 1) || a.host.localeCompare(b.host));
     root.querySelector("#tl-empty").hidden = nodes.length > 0;
@@ -216,7 +218,15 @@ export function createTimeline(root, { onOpen }) {
   function tick(now) {
     const from = now - SPAN;
     const x = (t) => clamp((t - from) / SPAN, 0, 1);
+    const rec = since == null ? 0 : clamp((since - from) / SPAN, 0, 1);
+    const recPct = pct(rec);
+    root.querySelector(".tl-scale").style.setProperty("--rec", recPct);
+    lanesEl.style.setProperty("--rec", recPct);
+    const norec = root.querySelector("#tl-norec");
+    norec.hidden = rec < 0.22;
+    if (!norec.hidden) setText(root.querySelector("#tl-norec-at"), clock(since, false));
     lanes.forEach((l) => {
+      l.el.classList.toggle("off", l.node.kind === "gateway" && !l.node.online);
       if (l.agg) {
         const total = Math.max(1, l.node.slots.length);
         const first = Math.floor(from / BUCKET) * BUCKET;
