@@ -9,12 +9,17 @@ mysql:
   database: "orchestrator" # MySQL database (schema) name
 
 # Gateway nodes (gateway/agent.js and the runner containers) register themselves with the
-# hub, so they don't belong here. Checks reach them through the hub at GATEWAY_URL
-# (default ws://hub:4500), sending GATEWAY_CLIENT_TOKEN if it is set.
+# hub, so they don't belong here. Every check connects to <GATEWAY_URL>/connect (default
+# ws://hub:4500/connect), sending GATEWAY_CLIENT_TOKEN if it is set, and the hub picks a free
+# slot for the browser the check launches. The environment variables win over this section.
+# gateway:
+#   url: "ws://hub:4500"       # GATEWAY_URL
+#   client_token: "pwgc_..."   # GATEWAY_CLIENT_TOKEN
+#   node: "runner-a"           # GATEWAY_NODE: keep the checks on this node (optional)
 #
-# hosts: lists legacy static hosts that run `playwright run-server` on ports the
-# checks connect to directly (ws://<server>:<port>). Entries with a blank server are skipped.
+# hosts: lists legacy static hosts that run `playwright run-server` on ports the hub
+# dials itself (ws://<server>:<port>) for /connect clients. Entries with a blank server are skipped.
 hosts: []
-#  - server: "runner01.example.com" # host name or IP the checks can reach
+#  - server: "runner01.example.com" # host name or IP the hub can reach
 #    port_start: 3000               # first run-server port
 #    port_end: 3004                 # one past the last port (3000-3003 here)

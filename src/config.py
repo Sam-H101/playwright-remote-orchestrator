@@ -1,7 +1,31 @@
 import os
+import re
+from urllib.parse import quote, urlencode, urlsplit
+
 import yaml
 
 DEFAULT_GATEWAY_URL = "ws://hub:4500"
+# The hub's node-name rule (case-insensitive).
+NODE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def client_endpoint(url, client_token=None, node=None):
+    """ the hub's /connect URL. The hub picks a free slot for the browser the check launches, on
+    `node` if one is given; there is no way to name a slot. """
+    if node and not NODE_NAME.match(node):
+        raise ValueError("GATEWAY_NODE must be a node name ([A-Za-z0-9._-], up to 128 characters), got {!r}"
+                         .format(node))
+    base = url.rstrip("/")
+    path = urlsplit(base).path
+    if "/connect/" in path:
+        # The hub answers the removed /connect/<node>/<slot> endpoints with 410.
+        raise ValueError("GATEWAY_URL must be the hub's address (e.g. ws://hub:4500), not a /connect/<node>/<slot> "
+                         "endpoint like {!r}; set GATEWAY_NODE to stay on one node".format(path))
+    # A GATEWAY_URL copied from a client snippet may already end in /connect.
+    if base.endswith("/connect"):
+        base = base[:-len("/connect")]
+    query = [(key, value) for key, value in (("gateway_token", client_token), ("node", node)) if value]
+    return base + "/connect" + ("?" + urlencode(query, quote_via=quote, safe="") if query else "")
 
 
 class config:
@@ -46,4 +70,5 @@ class config:
         settings = dict(self.__config.get("gateway") or {})
         url = os.environ.get("GATEWAY_URL") or settings.get("url") or DEFAULT_GATEWAY_URL
         token = os.environ.get("GATEWAY_CLIENT_TOKEN") or settings.get("client_token") or None
-        return {"url": url.rstrip("/"), "client_token": token}
+        node = os.environ.get("GATEWAY_NODE") or settings.get("node") or None
+        return {"url": url.rstrip("/"), "client_token": token, "node": str(node).strip() if node else None}

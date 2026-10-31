@@ -2,6 +2,7 @@ import contextlib
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import Error, Playwright, expect
 
@@ -13,11 +14,15 @@ MONITORED_ENVIRONMENTS = ("NA1", "NA2", "NA3", "NA4")
 COMPONENTS_FEED = re.compile(r"/components\.json(\?|$)")
 OPERATIONAL = "available"
 TIMEOUT_MS = 30 * 1000
+# The hub holds a connect while every slot that fits is busy (GATEWAY_QUEUE_TIMEOUT_S, 60 s by default)
+# and then tries up to GATEWAY_CONNECT_ATTEMPTS slots, so wait longer than that for its answer.
+CONNECT_TIMEOUT_MS = int(os.environ.get("PW_CONNECT_TIMEOUT_S", "180")) * 1000
 CONNECT_FAILURE = "connect_Failure"
 HUB_FAILURE = "hub_Failure"
-# Through the hub (ws://hub/connect/<node>/<slot>), these errors mean the hub refused the check or
-# could not be reached at all, so the slot is not to blame. 404/502/504 come from the node's side.
-HUB_ERRORS = re.compile(r" (401|403|503) [A-Z]|\b(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH)\b")
+# Through the hub (ws://hub:4500/connect), an HTTP answer means the hub refused the check, found no slot
+# for it in time or tried slots that all failed, and a network error means it could not be reached.
+# Playwright puts the status right after the URL, without the URL's query.
+HUB_ERRORS = re.compile(r"WebSocket error: \S+ \d{3} [A-Z]|\b(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH)\b")
 
 
 def log_dir():
@@ -26,14 +31,12 @@ def log_dir():
 
 
 def endpoint():
-    if os.environ.get("PW_WS_ENDPOINT"):
-        return os.environ["PW_WS_ENDPOINT"]
-    host, port = os.environ.get("host"), os.environ.get("port")
-    return "ws://{}:{}".format(host, port) if host and port else None
+    # main.py sets it to <GATEWAY_URL>/connect?gateway_token=...; the hub picks the slot.
+    return os.environ.get("PW_WS_ENDPOINT")
 
 
 def is_hub_error(ws, error):
-    return "/connect/" in ws and HUB_ERRORS.search(str(error)) is not None
+    return urlsplit(ws).path.rstrip("/") == "/connect" and HUB_ERRORS.search(str(error)) is not None
 
 
 def open_browser(playwright: Playwright):
@@ -41,10 +44,10 @@ def open_browser(playwright: Playwright):
     if not ws:
         return playwright.chromium.launch()
     try:
-        return playwright.chromium.connect(ws, timeout=TIMEOUT_MS)
+        return playwright.chromium.connect(ws, timeout=CONNECT_TIMEOUT_MS)
     except Exception as ex:
-        # main.py counts CONNECT_FAILURE against the slot, but not HUB_FAILURE. The markers are
-        # constants because pytest prints this function's source, which must not hold both.
+        # main.py logs why the check got no browser. The markers are constants because pytest
+        # prints this function's source, which must not hold both.
         raise Exception(HUB_FAILURE if is_hub_error(ws, ex) else CONNECT_FAILURE) from ex
 
 

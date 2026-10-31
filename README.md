@@ -56,14 +56,21 @@ const browser = await chromium.connect(`${HUB}/connect?gateway_token=${process.e
 ```
 
 ```python
-browser = p.firefox.connect(f"{HUB}/connect?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}")
+import os
+from playwright.sync_api import sync_playwright
+
+HUB = "ws://<orchestrator-host>:4500"
+with sync_playwright() as p:
+    browser = p.firefox.connect(f"{HUB}/connect?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}")
 ```
+
+The same URL works for `chromium`, `firefox` and `webkit`: launch the browser you want and the hub sends you to a node that has it. The token can go in an `x-gateway-token` header instead (`connect(url, headers={"x-gateway-token": token})`). The checks `main.py` runs get this URL, token included, in `PW_WS_ENDPOINT` (see [Writing a check](#writing-a-check)).
 
 * **Browser.** `browserType.connect` sends the browser type in the `x-playwright-browser` header (from JS and Python alike); a `?browser=` query parameter wins over it, as it does in `run-server`. The hub only picks slots on nodes that list that browser (`BROWSERS`, `--browsers` or `-Browsers` on the node; the runner image lists `chromium,firefox,webkit`). A node that lists a Chromium channel (`chrome`, `msedge`, ...) serves `chromium` too. A client that names no browser can get any node.
 * **Version.** Playwright's `User-Agent` carries its version (`Playwright/1.64.1 (...)`). The hub only picks nodes on the same major.minor version, the same check `run-server` would fail with HTTP 428. A node whose version can't be read takes any client.
 * **Which slot.** Among the free slots that fit, the hub takes the node with the largest share of its slots free (random among equals), then a random free slot on it. [Static hosts](#migrating-from-the-per-port-setup) list no browsers and take any client, but only when no node has a free slot.
-* **One node.** `?node=<name>` (any case) keeps the client on that node or static host. The slot is always the hub's choice; there is no way to ask for one.
-* **Waiting.** While every slot that fits is busy, the client waits: the hub holds its WebSocket handshake and hands the next slot that fits to the oldest waiting client. After `GATEWAY_QUEUE_TIMEOUT_S` (60 s) it gets a 503 that says what those slots are doing, e.g. `no free firefox slot within 60s: 4 matching slots, all busy`. At most `GATEWAY_QUEUE_MAX` (200) clients wait at once. A client that disconnects leaves the queue. A request that nothing connected or known to the hub could ever serve is refused at once instead: an unknown node (404), a browser no node lists (503), a Playwright version no node runs (428). A known node that is offline is waited for.
+* **One node.** `?node=<name>` (any case) keeps the client on that node or static host (`GATEWAY_NODE` for the checks `main.py` runs). The slot is always the hub's choice; there is no way to ask for one.
+* **Waiting.** While every slot that fits is busy, the client waits: the hub holds its WebSocket handshake and hands the next slot that fits to the oldest waiting client. After `GATEWAY_QUEUE_TIMEOUT_S` (60 s) it gets a 503 that says what those slots are doing, e.g. `no free firefox slot within 60s: 4 matching slots, all busy`. At most `GATEWAY_QUEUE_MAX` (200) clients wait at once. A client that disconnects leaves the queue. A request that nothing connected or known to the hub could ever serve is refused at once instead: an unknown node (404), a browser no node lists (503), a Playwright version no node runs (428). A known node that is offline is waited for. Playwright's `connect` waits as long as it takes by default; if you pass a `timeout`, make it longer than `GATEWAY_QUEUE_TIMEOUT_S` plus `GATEWAY_CONNECT_ATTEMPTS` x `OPEN_TIMEOUT_S` (the example check uses 180 s), or the client gives up before the hub answers.
 * **Failover.** When the chosen slot can't open the session (its run-server refuses, the agent reports a failure, no answer within `OPEN_TIMEOUT_S`, a static host refuses or can't be reached), that counts as a connect failure on the slot ([Slot failures](#slot-failures)), the slot is released, and the client is tried on another slot, up to `GATEWAY_CONNECT_ATTEMPTS` (3) slots. Then it gets the last error.
 * **Claims.** The hub claims the slot in `portUsage` the way every claimer does (`inUse` 0 to 1 with a conditional update, and `LastRunDate`), so nothing double-books it, and marks the row `claimedBy = hub:<hub>:<n>`. It releases the slot when either side closes, when the open fails, when the client leaves early and when the hub stops; a restarted hub frees every claim the previous run left. Every 30 s it also retries releases MySQL refused, and takes back a live session's slot that the stale-claim sweep freed. If it can't reach MySQL to pick or claim a slot, the client gets a 503.
 * The hub logs one line per routing decision (`client 10.0.0.7 -> runner-7f3a9c/3 (firefox, waited 2.1s)`) and per client that gave up waiting; never a token.
@@ -211,8 +218,8 @@ A management console lives in `ui/` (Flask, plain ES modules, no build step). It
 
 * When the hub can't open a session on the slot it picked (see [Failover](#connecting-tests)), that adds one to the slot's `failCount`. Any session that reaches the Playwright server resets it to 0, so `failCount` counts consecutive connect failures.
 * At `SLOT_FAIL_THRESHOLD` (3) the slot is **failing**: the hub skips it, except for one try every `SLOT_FAIL_COOLDOWN_S` (300 s) after its last run. It heals by itself once a session gets through, or right away with **Reset** in the Grid UI.
-* A check that the hub itself refused (missing, bad, revoked or expired client token, hub unreachable, shutting down or unable to check the token) raises `hub_Failure` instead; that is logged as a configuration problem and not counted against the slot.
-* Compose passes the same `SLOT_FAIL_*` values to the hub, the checks and the UI, so what the UI shows as failing is what selection skips.
+* Only the hub counts: a client never names a slot, so a refusal it gets (bad token, no free slot in time, unknown node, ...) says nothing about one slot, and a check whose site fails got its browser, so the slot worked.
+* Compose passes the same `SLOT_FAIL_*` values to the hub and the UI, so what the UI shows as failing is what the hub skips.
 
 ## Configuration
 
@@ -224,11 +231,12 @@ A management console lives in `ui/` (Flask, plain ES modules, no build step). It
 | `GATEWAY_CLIENT_TOKEN` | required | Bootstrap token the example check sends to open a session |
 | `TOKEN_CACHE_S`, `TOKEN_RECHECK_S` | `10`, `15` | [Access token](#access-tokens) timing, see [Hub](#hub) |
 | `GATEWAY_PORT` | `4500` | Host port the hub publishes |
-| `GATEWAY_URL` | `ws://hub:4500` | Hub URL the checks use and the UI shows |
+| `GATEWAY_URL` | `ws://hub:4500` | Hub URL the UI shows; the checks connect to `<GATEWAY_URL>/connect` |
+| `GATEWAY_NODE` | unset | Keep the example check on this node (`?node=`) |
 | `RUNNER_SLOTS` | `4` | Slots per runner container |
 | `EPHEMERAL_GRACE_S` | `120` | Seconds before the hub removes a gone runner container |
 | `GATEWAY_QUEUE_TIMEOUT_S`, `GATEWAY_QUEUE_MAX`, `GATEWAY_CONNECT_ATTEMPTS` | `60`, `200`, `3` | [Waiting and failover](#connecting-tests), see [Hub](#hub) |
-| `SLOT_FAIL_THRESHOLD`, `SLOT_FAIL_COOLDOWN_S` | `3`, `300` | [Slot failures](#slot-failures), for the hub, the checks and the UI |
+| `SLOT_FAIL_THRESHOLD`, `SLOT_FAIL_COOLDOWN_S` | `3`, `300` | [Slot failures](#slot-failures), for the hub and the UI |
 | `GRID_ADMIN_TOKEN` | unset | Token for the UI's management actions. The Access page needs it |
 | `GRID_UI_ALLOWED_HOSTS` | unset | Extra host names the UI accepts actions through |
 | `MYSQL_ROOT_PASSWORD`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD` | see `.env.example` | MySQL service credentials (`docker-compose.mysql.yaml`) |
@@ -253,7 +261,7 @@ A management console lives in `ui/` (Flask, plain ES modules, no build step). It
 | `GATEWAY_QUEUE_TIMEOUT_S` | `60` | How long a `/connect` client waits for a free slot that fits it before a 503 (`0`: no waiting) |
 | `GATEWAY_QUEUE_MAX` | `200` | How many clients may wait at once; one more gets a 503 |
 | `GATEWAY_CONNECT_ATTEMPTS` | `3` | How many slots one client is tried on before it gets the error |
-| `SLOT_FAIL_THRESHOLD` (or `GRID_FAIL_THRESHOLD`), `SLOT_FAIL_COOLDOWN_S` | `3`, `300` | [Slot failures](#slot-failures): the same names and defaults as the checks |
+| `SLOT_FAIL_THRESHOLD` (or `GRID_FAIL_THRESHOLD`), `SLOT_FAIL_COOLDOWN_S` | `3`, `300` | [Slot failures](#slot-failures): the same names and defaults as the Grid UI |
 | `EPHEMERAL_GRACE_S` | `120` | Remove an ephemeral node and its free slots once it has been gone this long (checked at startup and every 60 s; in-use slots go when released) |
 
 HTTP on the same port: `GET /healthz`, `GET /api/nodes`, and the WebSocket paths `/connect` (clients, see [Connecting tests](#connecting-tests)), `/agent` and `/agent/data/<id>` (agents). A failed connect gets a plain HTTP answer the Playwright client shows: 400 bad request (a bad `node` or browser name), 401 missing, bad, revoked or expired client token, 404 unknown node, 410 the removed `/connect/<node>/<slot>`, 428 no node runs the client's Playwright version, 502 every slot tried refused the session, 503 no node offers the browser, no free slot in time, queue full, MySQL unreachable, hub shutting down or can't check a managed token, 504 the last slot tried did not answer.
@@ -283,17 +291,16 @@ When the hub turns the agent away, it logs why and keeps retrying (1 s doubling 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `mysql:` section of `src/database.yaml` | MySQL connection |
-| `GATEWAY_URL` | `ws://hub:4500` | Hub the checks connect through |
-| `GATEWAY_CLIENT_TOKEN` | unset | Client token (bootstrap or managed), appended to the endpoint as `?gateway_token=` |
-| `ORCHESTRATOR_CONFIG` | `src/database.yaml` | Config file (`mysql:`, optional `gateway:` and `hosts:`) |
-| `CHECK_TIMEOUT_S` | `1800` | Kill a check that runs longer and release its slot |
-| `SLOT_FAIL_THRESHOLD` | `3` (or `GRID_FAIL_THRESHOLD`) | Consecutive connect failures at which a slot is skipped |
-| `SLOT_FAIL_COOLDOWN_S` | `300` | How often a failing slot is retried |
-| `SLOT_STALE_AFTER_S` | `max(CHECK_TIMEOUT_S, 1800) + 300` | Free a claim this old (its orchestrator died mid-check). Keep it above every orchestrator's `CHECK_TIMEOUT_S` |
-| `NO_SLOT_TIMEOUT_S` | `300` | A single run (no `-i`) gives up after waiting this long for a free slot |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `mysql:` section of `src/database.yaml` | MySQL connection, only to create the tables, sync `hosts:` and free stale claims |
+| `GATEWAY_URL` | `ws://hub:4500` | The hub. The check gets `<GATEWAY_URL>/connect` as `PW_WS_ENDPOINT`; a `/connect/<node>/<slot>` address is refused |
+| `GATEWAY_CLIENT_TOKEN` | unset | Client token (bootstrap or managed), appended as `?gateway_token=` |
+| `GATEWAY_NODE` | unset | Keep the check on this node or static host, appended as `?node=`. The hub still picks the slot |
+| `ORCHESTRATOR_CONFIG` | `src/database.yaml` | Config file (`mysql:`, optional `gateway:` with `url`, `client_token` and `node`, and `hosts:`) |
+| `CHECK_TIMEOUT_S` | `1800` | Kill a check that runs longer; its browser connection closes and the hub frees the slot |
+| `PW_CONNECT_TIMEOUT_S` | `180` | How long the example check waits for the hub to hand it a browser |
+| `SLOT_STALE_AFTER_S` | `max(CHECK_TIMEOUT_S, 1800) + 300` | Free a claim this old (its claimer died without releasing it). Keep it above the longest session |
 
-`python3 /app/main.py --fil <check.py> --fol /app/ -i <seconds>` runs the check every interval; without `-i` it runs once and exits 0 (passed) or 1 (failed or no slot). `--fr true` creates the tables and syncs `hosts:`, then exits. When no slot is free it waits and retries (1 s doubling to 60 s). Logs go to `<fol>/logs/` (`check_info.log`, `error_info.log`).
+`python3 /app/main.py --fil <check.py> --fol /app/ -i <seconds>` runs the check every interval; without `-i` it runs once and exits 0 (passed) or 1 (failed, or it got no browser). `--fr true` creates the tables and syncs `hosts:`, then exits. `main.py` claims no slot and counts no failures: the hub does both, and holds the check's connect while every slot that fits is busy. Logs go to `<fol>/logs/` (`check_info.log`, `error_info.log`). `check_info.log` has a line per run with the check, its result and how long it took, and says why a check got no browser, from the hub's answer: for example `example.py got no browser after 60.4s, so the site was not checked: the hub answered 503: no free chromium slot within 60s: 4 matching slots, all busy (every slot that fits stayed busy or failing for the hub's GATEWAY_QUEUE_TIMEOUT_S; add slots or spread the checks out)`. The client token never appears in the logs.
 
 ### Grid UI
 
@@ -304,7 +311,7 @@ When the hub turns the agent away, it logs why and keeps retrying (1 s doubling 
 | `GATEWAY_URL` | `ws://hub:4500` | Base of the endpoints shown for gateway slots |
 | `GATEWAY_PUBLIC_URL` | unset | Hub address for the commands the UI offers, as runner hosts and checks outside compose reach it (e.g. `ws://grid.lab:4500`). Unset: `GATEWAY_URL`'s scheme and port on the page's own host |
 | `GRID_NAME` | unset | Name shown in the header (default: the page's host) |
-| `SLOT_FAIL_THRESHOLD`, `SLOT_FAIL_COOLDOWN_S` | `3` (or `GRID_FAIL_THRESHOLD`), `300` | Must match the checks' values |
+| `SLOT_FAIL_THRESHOLD`, `SLOT_FAIL_COOLDOWN_S` | `3` (or `GRID_FAIL_THRESHOLD`), `300` | Must match the hub's values |
 | `GRID_STALE_AFTER` | `3600` | Seconds after which a running session is flagged as stale |
 | `GRID_ADMIN_TOKEN` | unset | If set, management actions need this token. Unset, the Access page is locked |
 | `GATEWAY_AGENT_TOKEN`, `GATEWAY_CLIENT_TOKEN` | unset | Only whether they are set is read: the Access page then knows the hub has a bootstrap token and doesn't warn that creating or revoking a token changes who gets in. Compose passes `set`, not the value |
@@ -316,8 +323,8 @@ When the hub turns the agent away, it logs why and keeps retrying (1 s doubling 
 ## Writing a check
 
 * A check is a pytest file. Look at `full/example/example.py`: it opens status.docusign.com (now redirected to health.docusign.com) and fails if any of the eSignature environments NA1-NA4 isn't `available`. Change `PRODUCT` / `MONITORED_ENVIRONMENTS` at the top to watch other sites.
-* Connect with `playwright.chromium.connect(os.environ["PW_WS_ENDPOINT"])`. `main.py` sets it to the claimed slot's full URL, token included. It also still sets `host` and `port`, but those can't reach a gateway slot.
-* If the connect itself fails, raise `Exception("connect_Failure")`, or `Exception("hub_Failure")` when the hub refused it (see [Slot failures](#slot-failures)). Any other failure is the site under test.
+* Connect with `playwright.chromium.connect(os.environ["PW_WS_ENDPOINT"])` (or `firefox`, `webkit`). `main.py` sets it to `<GATEWAY_URL>/connect?gateway_token=<GATEWAY_CLIENT_TOKEN>`, plus `&node=<GATEWAY_NODE>` if that is set, and the hub picks a free slot for that browser. Never build a slot address: `/connect/<node>/<slot>` answers 410. `host` and `port` are no longer set.
+* If the connect itself fails, raise `Exception("hub_Failure")` when the hub answered or could not be reached, else `Exception("connect_Failure")`. Either way `main.py` logs that the check got no browser, and why. Any other failure is the site under test.
 * Without `PW_WS_ENDPOINT` the example launches a local Chromium, so `pytest full/example/example.py` works on a dev machine.
 * To run another check, copy the `example_playwright` service, mount the check file and change `--fil`. The `./logs/<check>/:/app/logs/` mount keeps its logs and failure screenshots.
 
@@ -338,7 +345,7 @@ The hub itself needs no upgrade: it passes frames through without reading them. 
 * **Windows hosts**: delete the host from `hosts:` in `src/database.yaml`, then re-run the new installer with `-HubUrl` and `-AgentToken`. It stops the old run-servers on ports 3000+ and removes the old `Playwright Backend (<TaskName>)` inbound firewall rule.
 * `main.py` removes idle static slots that are no longer listed under `hosts:` when it starts. If the node registers under the old entry's name it takes over those rows instead (see [Node names](#node-names)).
 * **Static hosts** still work: list them under `hosts:` in `src/database.yaml` (`server`, `port_start`, `port_end`; `port_end` is exclusive) and run `npx playwright run-server --port <port> --host 0.0.0.0` on each port. `/connect` clients reach them through the hub, which dials `ws://<server>:<port>` itself (with the client's headers, minus the gateway token), so those ports must be open to the hub. A static host lists no browsers or version, so it takes any client, but nodes come first; the hub can't tell whether it is up until a connect fails. Prefer the agent.
-* `full/example/example.py` reads `PW_WS_ENDPOINT`. Older checks that build `ws://$host:$port` themselves must be changed to use it.
+* `full/example/example.py` reads `PW_WS_ENDPOINT`. Older checks that build `ws://$host:$port` or `/connect/<node>/<slot>` themselves must be changed to use it, and a `GATEWAY_URL` that holds a slot address must go back to the hub's address (`main.py` refuses to run with one).
 
 ## Tests
 

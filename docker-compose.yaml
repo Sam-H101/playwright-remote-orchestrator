@@ -11,8 +11,8 @@ x-db-env: &db-env
   DB_USER: ${DB_USER:-orchestrator}
   DB_PASSWORD: ${DB_PASSWORD:-orchestrator}
 
-# Slot selection (the hub's /connect routing, the checks) and the Grid UI's 'failing' state read the
-# same values: a slot with this many consecutive connect failures is skipped and retried once per cooldown.
+# The hub's /connect routing and the Grid UI's 'failing' state read the same values: a slot with this
+# many consecutive connect failures is skipped and retried once per cooldown.
 x-slot-env: &slot-env
   SLOT_FAIL_THRESHOLD: ${SLOT_FAIL_THRESHOLD:-3}
   SLOT_FAIL_COOLDOWN_S: ${SLOT_FAIL_COOLDOWN_S:-300}
@@ -90,10 +90,13 @@ services:
     init: true
     networks:
       - playwright
+    # The check connects to <GATEWAY_URL>/connect; the hub picks the slot (on GATEWAY_NODE if it is set).
+    # MySQL is only used to create the tables, sync hosts: and free stale claims.
     environment:
-      <<: [*db-env, *slot-env]
+      <<: *db-env
       GATEWAY_URL: ${GATEWAY_URL:-ws://hub:4500}
       GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:?set GATEWAY_CLIENT_TOKEN in .env (see .env.example)}
+      GATEWAY_NODE: ${GATEWAY_NODE:-}
     volumes:
       - ./logs/example_playwright/:/app/logs/
       - ./src/:/app/src

@@ -1,26 +1,48 @@
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 import logging
 from logging.handlers import RotatingFileHandler
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from argparse import ArgumentParser
 
-from src import database
+from src import config, database
 
-# Checks raise Exception(CONNECT_FAILURE_MARKER) when they cannot reach the Playwright server.
-# Only those failures count against the slot; any other failure is the site under test.
-# failCount holds consecutive connect failures: any run that reached the server resets it.
+# Every check connects to the hub's /connect (PW_WS_ENDPOINT). The hub picks a free slot for the browser
+# the check launches, holds the check while every such slot is busy, fails over to another slot and counts
+# slot failures. So this only runs the check, and says why one that got no browser didn't.
+# Checks raise Exception(HUB_FAILURE_MARKER) when the hub refused the connect or could not be reached,
+# and Exception(CONNECT_FAILURE_MARKER) when it failed otherwise; either way the site wasn't checked.
 CONNECT_FAILURE_MARKER = "connect_Failure"
-# Checks raise Exception(HUB_FAILURE_MARKER) when the hub itself refused them (bad token) or
-# could not be reached. That is not the slot's fault, so its failCount is left alone.
 HUB_FAILURE_MARKER = "hub_Failure"
-NO_SLOT_MAX_WAIT = 60
-# A single run (no -i) gives up after waiting this long for a free slot.
-NO_SLOT_TIMEOUT = int(os.environ.get("NO_SLOT_TIMEOUT_S", "300"))
 CHECK_TIMEOUT = int(os.environ.get("CHECK_TIMEOUT_S", "1800"))
+
+# Playwright reports a refused handshake as "BrowserType.connect: WebSocket error: <url without its query>
+# <status> <reason>", with the hub's own message on the next line (which pytest starts with "E").
+HUB_ANSWER = re.compile(r"browserType\.connect: WebSocket error: \S+ (\d{3}) [^\n]*\n(?:E +)?([^\n]*)", re.I)
+UNREACHABLE = re.compile(r"browserType\.connect: WebSocket error: [^\n]*?\b(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|"
+                         r"EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ECONNRESET)\b", re.I)
+CONNECT_TIMEOUT = re.compile(r"browserType\.connect: Timeout (\d+)ms exceeded", re.I)
+# What to do about the hub's answer: (status, pattern in its message or None, hint). The first match wins.
+HINTS = [
+    (400, re.compile(r"^node "), "check GATEWAY_NODE"),
+    (401, None, "check GATEWAY_CLIENT_TOKEN: it is missing, wrong, revoked or expired"),
+    (404, None, "check GATEWAY_NODE: the hub knows no node or static host of that name"),
+    (410, None, "the check builds a /connect/<node>/<slot> address; make it connect to PW_WS_ENDPOINT"),
+    (428, None, "the check's Playwright differs from the nodes' (see Upgrading Playwright in the README)"),
+    (503, re.compile(r"^no free "), "every slot that fits stayed busy or failing for the hub's "
+                                    "GATEWAY_QUEUE_TIMEOUT_S; add slots or spread the checks out"),
+    (503, re.compile(r"queue is full"), "more checks are waiting than the hub's GATEWAY_QUEUE_MAX"),
+    (503, re.compile(r"does not offer|no node offers"), "install the browser on a node and add it to "
+                                                        "that node's BROWSERS (--browsers, -Browsers)"),
+    (503, re.compile(r"database"), "the hub can't reach MySQL"),
+    (502, None, "no slot the hub tried could open a browser; see the hub's log and the Grid UI"),
+    (504, None, "the slots the hub tried did not answer in time; see the hub's log and the Grid UI"),
+]
 
 checklog = logging.getLogger('checklog')
 checklog.setLevel(logging.DEBUG)
@@ -38,31 +60,37 @@ def is_hub_failure(output):
     return HUB_FAILURE_MARKER in output
 
 
+def explain(output):
+    """ why the check's connect failed, from the Playwright error in its output, or None """
+    answer = HUB_ANSWER.search(output)
+    if answer:
+        status, message = int(answer.group(1)), answer.group(2).strip()
+        text = "the hub answered {}{}".format(status, ": " + message if message else "")
+        for code, pattern, hint in HINTS:
+            if code == status and (pattern is None or pattern.search(message)):
+                return "{} ({})".format(text, hint)
+        return text
+    unreachable = UNREACHABLE.search(output)
+    if unreachable:
+        return "the hub could not be reached ({}); check GATEWAY_URL and that the hub is running".format(
+            unreachable.group(1).upper())
+    timeout = CONNECT_TIMEOUT.search(output)
+    if timeout:
+        return "no browser within the check's {} s connect timeout".format(int(timeout.group(1)) // 1000)
+    return None
+
+
 def redact(endpoint):
-    return endpoint.split("?", 1)[0]
+    """ the endpoint without its client token """
+    parts = urlsplit(endpoint)
+    query = [(key, value) for key, value in parse_qsl(parts.query) if key != "gateway_token"]
+    return urlunsplit(parts._replace(query=urlencode(query, quote_via=quote, safe="")))
 
 
-def check_env(slot, base=None):
+def check_env(endpoint, base=None):
     env = dict(os.environ if base is None else base)
-    env.update(PW_WS_ENDPOINT=slot.endpoint, host=str(slot[2]), port=str(slot[0]))
+    env["PW_WS_ENDPOINT"] = endpoint
     return env
-
-
-def acquire_slot(db, sleep=time.sleep, max_wait=NO_SLOT_MAX_WAIT, timeout=None):
-    """ claim a free slot, waiting with backoff; give up after `timeout` seconds if it is set """
-    delay, waited = 1, 0
-    while True:
-        try:
-            return db.get_a_port()
-        except database.NoFreeSlot as e:
-            if timeout is not None:
-                if waited >= timeout:
-                    raise database.NoFreeSlot('{}, gave up after {} seconds'.format(e, waited)) from e
-                delay = min(delay, timeout - waited)
-            checklog.warning('%s, retrying in %s seconds', e, delay)
-            sleep(delay)
-            waited += delay
-            delay = min(delay * 2, max_wait)
 
 
 def run_check(testfile, env):
@@ -76,57 +104,49 @@ def run_check(testfile, env):
         return -1, output + '\ncheck timed out after {} seconds'.format(CHECK_TIMEOUT)
 
 
-def record_result(db, slot, return_code, output):
+def record_result(testfile, return_code, output, duration):
+    name = os.path.basename(testfile)
     if return_code == 0:
+        checklog.info('%s passed in %.1fs', name, duration)
         checklog.info(output)
-    elif is_hub_failure(output):
-        checklog.error('the hub refused the check or could not be reached; check GATEWAY_URL and '
-                       'GATEWAY_CLIENT_TOKEN. Not counted against %s slot %s', slot[2], slot[0])
-        errorlog.error(output)
         return
-    elif is_connect_failure(output):
-        checklog.error('could not connect to %s slot %s, failure counted against the slot', slot[2], slot[0])
-        errorlog.error(output)
-        return db.increment_failure(slot)
+    reason = explain(output)
+    if reason or is_hub_failure(output) or is_connect_failure(output):
+        checklog.error('%s got no browser after %.1fs, so the site was not checked: %s', name, duration,
+                       reason or 'the connect failed, see error_info.log')
     else:
-        checklog.error('check failed with exit code %s', return_code)
-        errorlog.error(output)
-    # The check reached the Playwright server, so the slot works.
-    db.reset_failure(slot)
+        checklog.error('%s failed in %.1fs with exit code %s', name, duration, return_code)
+    errorlog.error(output)
 
 
-def datest(db, testfile, slot_timeout=None):
-    slot = acquire_slot(db, timeout=slot_timeout)
+def datest(testfile, endpoint):
+    checklog.info('running %s through %s', os.path.basename(testfile), redact(endpoint))
+    start = time.monotonic()
+    return_code, output = run_check(testfile, check_env(endpoint))
+    record_result(testfile, return_code, output, time.monotonic() - start)
+    return return_code
+
+
+def prepare_db(db, initialised):
+    """ create the tables and sync hosts: once, then free stale claims. Returns whether the tables are
+    done. The hub routes the checks, so a database problem here is logged and the check runs anyway. """
     try:
-        checklog.info('running %s on %s slot %s (%s)', testfile, slot[2], slot[0], redact(slot.endpoint))
-        return_code, output = run_check(testfile, check_env(slot))
-        try:
-            record_result(db, slot, return_code, output)
-        except Exception:
-            checklog.exception('could not update the failure count of %s slot %s', slot[2], slot[0])
-        return return_code
-    finally:
-        # An error here must not replace the check's result (or its exception).
-        try:
-            db.release_port(slot)
-        except Exception:
-            checklog.exception('could not release %s slot %s; it is freed after %s seconds',
-                               slot[2], slot[0], database.STALE_CLAIM_AFTER)
+        if not initialised:
+            db.initial_db_start()
+            initialised = True
+        db.reclaim_stale_claims()
+    except Exception:
+        checklog.exception('could not create or seed the tables or free stale claims, retrying next run')
+    return initialised
 
 
-def run_test(testfile, interval=None, db=None, sleep=time.sleep):
+def run_test(testfile, endpoint, interval=None, db=None, sleep=time.sleep):
     db = db or database.database()
     initialised = False
     while True:
         try:
-            if not initialised:
-                # The tables may already exist, so a failure here shouldn't stop the check.
-                try:
-                    db.initial_db_start()
-                    initialised = True
-                except Exception:
-                    checklog.exception('could not create or seed the tables, retrying next run')
-            return_code = datest(db, testfile, slot_timeout=None if interval else NO_SLOT_TIMEOUT)
+            initialised = prepare_db(db, initialised)
+            return_code = datest(testfile, endpoint)
             if not interval:
                 return return_code
         except Exception:
@@ -182,28 +202,36 @@ def parse_args(argv=None):
 
 
 def exit_on_sigterm(signum, frame):
-    # SystemExit unwinds the stack: subprocess.run kills the running check and datest frees its slot.
-    # Without a handler, python as PID 1 in a container ignores SIGTERM and is SIGKILLed.
+    # SystemExit unwinds the stack: subprocess.run kills the running check, its browser connection closes
+    # and the hub frees the slot. Without a handler, python as PID 1 in a container ignores SIGTERM and
+    # is SIGKILLed.
     raise SystemExit(128 + signum)
 
 
 def main(argv=None):
     args = parse_args(argv)
     signal.signal(signal.SIGTERM, exit_on_sigterm)
+    cfg = config.config()
 
     if args.first_run:
-        database.database().initial_db_start()
+        database.database(cfg).initial_db_start()
         return 0
 
     setup_logging(os.path.join(args.check_folder, 'logs'))
     checklog.debug({'args': vars(args)})
 
-    testfile = os.path.join(args.check_folder, args.testfile)
+    gateway = cfg.get_gateway_config()
     try:
-        return 0 if run_test(testfile, args.interval) == 0 else 1
-    except database.NoFreeSlot as e:
+        endpoint = config.client_endpoint(**gateway)
+    except ValueError as e:
         checklog.error('check not run: %s', e)
         return 1
+    if not gateway["client_token"]:
+        checklog.warning('GATEWAY_CLIENT_TOKEN is not set: the hub refuses the check unless it accepts '
+                         'clients without a token')
+
+    testfile = os.path.join(args.check_folder, args.testfile)
+    return 0 if run_test(testfile, endpoint, args.interval, db=database.database(cfg)) == 0 else 1
 
 
 if __name__ == '__main__':
