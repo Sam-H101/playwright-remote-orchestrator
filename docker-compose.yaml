@@ -21,6 +21,23 @@ services:
       - ./queue.db:/app/queue.db
       - ./full/example/example.py:/app/example.py
     command: python3 /app/main.py --fil example.py --fol /app/ -i 100
+  grid_ui:
+    container_name: playwright_grid_ui
+    build:
+      context: .
+      dockerfile: docker/ui/Dockerfile
+    restart: always
+    networks:
+      - playwright
+    ports:
+      - "127.0.0.1:4444:4444"
+    environment:
+      GRID_DB_PATH: /app/src/runner.db
+      GRID_QUEUE_PATH: /app/queue.db
+      # GRID_ADMIN_TOKEN: change-me  # require this token for management actions
+    volumes:
+      - ./src/:/app/src
+      - ./queue.db:/app/queue.db
 
 
 networks:

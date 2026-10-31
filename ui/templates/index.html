@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Playwright Grid</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='grid.css') }}">
+</head>
+<body data-token-required="{{ 'true' if token_required else 'false' }}">
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="2" width="9" height="9" rx="2"/><rect x="13" y="2" width="9" height="9" rx="2" opacity=".6"/><rect x="2" y="13" width="9" height="9" rx="2" opacity=".6"/><rect x="13" y="13" width="9" height="9" rx="2"/></svg>
+      <span>Playwright Grid</span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-view="overview" aria-selected="true">Overview</button>
+      <button role="tab" data-view="sessions" aria-selected="false">Sessions <span class="badge" id="session-badge">0</span></button>
+    </nav>
+    <div class="topbar-stats">
+      <div class="stat-inline" title="Items waiting in the port queue">Queue <strong id="queue-size">–</strong></div>
+      <div class="capacity" title="Slots in use / total slots">
+        <div class="capacity-label"><span id="cap-text">–</span></div>
+        <div class="meter"><div class="meter-fill" id="cap-fill"></div></div>
+      </div>
+      <button class="icon-btn" id="pause-btn" title="Pause auto-refresh" aria-pressed="false">
+        <span class="live-dot" id="live-dot"></span><span id="pause-label">Live</span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <div class="banner" id="error-banner" hidden></div>
+
+    <section id="view-overview" class="view">
+      <div class="tiles" id="tiles"></div>
+      <div class="toolbar">
+        <input type="search" id="node-filter" placeholder="Filter nodes by host">
+        <label class="check"><input type="checkbox" id="only-problems"> Only nodes with failing slots</label>
+      </div>
+      <div class="legend">
+        <span><i class="sq free"></i>Free</span>
+        <span><i class="sq busy"></i>In use</span>
+        <span><i class="sq warn"></i>Has failures</span>
+        <span><i class="sq bad"></i>Failing (≥ <span id="threshold">3</span>)</span>
+      </div>
+      <div class="nodes" id="nodes"></div>
+    </section>
+
+    <section id="view-sessions" class="view" hidden>
+      <div class="toolbar">
+        <input type="search" id="session-filter" placeholder="Filter by host, port or endpoint">
+      </div>
+      <div class="table-wrap">
+        <table class="sessions">
+          <thead>
+            <tr>
+              <th data-sort="slot_id">Slot</th>
+              <th data-sort="host">Node</th>
+              <th data-sort="port">Port</th>
+              <th data-sort="endpoint">Endpoint</th>
+              <th data-sort="started">Started</th>
+              <th data-sort="duration_s">Duration</th>
+              <th data-sort="fails">Fails</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="session-rows"></tbody>
+        </table>
+        <p class="empty" id="sessions-empty" hidden>No sessions are running right now.</p>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="slot-dialog">
+    <form method="dialog">
+      <h2 id="slot-title">Slot</h2>
+      <dl id="slot-details"></dl>
+      <div class="dialog-actions">
+        <button type="button" class="btn" data-action="reset">Reset failures</button>
+        <button type="button" class="btn danger" data-action="release">Force release</button>
+        <button class="btn ghost" value="close">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="token-dialog">
+    <form method="dialog">
+      <h2>Admin token</h2>
+      <p>This grid requires a token for management actions.</p>
+      <input type="password" id="token-input" autocomplete="off">
+      <div class="dialog-actions">
+        <button class="btn" value="ok">Save</button>
+        <button class="btn ghost" value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="{{ url_for('static', filename='grid.js') }}"></script>
+</body>
+</html>
