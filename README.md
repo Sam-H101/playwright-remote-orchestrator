@@ -29,14 +29,21 @@ To use an existing MySQL server instead, skip `docker-compose.mysql.yaml` and se
 
 ## Running the checks with local server
 
-1. uncomment the CMD line in `docker/python/Dockerfile`
+1. uncomment the CMD line in `docker/python/Dockerfile` (the image ships the Playwright server, no npm install needed)
 2. Build the image and it should start if you do docker-compose up
 * Note this has not been tested
 
 ## Running a remote server
 
-1. Install playwright server on the remote executioner host. Can be found [here][l1]
-2. once installed, start the server by running `node_modules/.bin/playwright.cmd run-server --port <port number> --reuse-browser false`
+The orchestrator image uses Playwright **1.64.1**. Playwright only accepts connections between a client and server on the same minor version, so every remote node must run the same version (see [here][l1] for install docs).
+
+1. Install Node.js, then install the matching Playwright version and its browsers on the remote executioner host: `npm install playwright@1.64.1 && npx playwright install --with-deps`
+2. start the server by running `npx playwright run-server --port <port number> --host 0.0.0.0`
+   * Drop the old `--reuse-browser false` flag; current Playwright releases no longer accept it.
+
+### Upgrading Playwright
+
+Bump the version in all three places together: `PLAYWRIGHT_VERSION` in `docker/python/Dockerfile`, `playwright==` in `docker/python/requirements.txt`, and the `run-server` install on every remote node.
 
 ## Configuration
 
