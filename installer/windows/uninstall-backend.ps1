@@ -1,19 +1,23 @@
 <#
 .SYNOPSIS
-    Stops and removes the Playwright Windows backend.
+    Stops and removes the Playwright runner node.
 
 .DESCRIPTION
-    Stops the supervisor and every server, unregisters the scheduled task and removes the firewall rule.
+    Stops the supervisor, the agent and every run-server and browser it started, unregisters the scheduled
+    task and removes the inbound firewall rule an older (pre-agent) install created. The hub marks the node
+    offline when the agent disconnects; forget it in the Grid UI to drop it from the list.
     Files (including downloaded browsers) are kept unless -RemoveFiles is passed, so a reinstall is fast.
 #>
 [CmdletBinding()]
 param(
     # Defaults to the folder this script is in when run from an install, otherwise the installer's default.
-    [string]$InstallDir = $(if (Test-Path (Join-Path $PSScriptRoot 'backend.json')) { $PSScriptRoot } else { 'C:\PlaywrightBackend' }),
+    [string]$InstallDir,
     [switch]$RemoveFiles
 )
 
 $ErrorActionPreference = 'Stop'
+# Not a param default: Windows PowerShell 5.1 leaves $PSScriptRoot empty there when run with -File.
+if (-not $InstallDir) { $InstallDir = if (Test-Path (Join-Path $PSScriptRoot 'backend.json')) { $PSScriptRoot } else { 'C:\PlaywrightBackend' } }
 # Load the module from memory: with -RemoveFiles this script deletes the folder it may be running from.
 $moduleText = Get-Content (Join-Path $PSScriptRoot 'PlaywrightBackend.psm1') -Raw
 New-Module -Name PlaywrightBackend -ScriptBlock ([scriptblock]::Create($moduleText)) | Import-Module -Force
@@ -29,14 +33,15 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Write-BackendLog "Removed scheduled task '$taskName'"
 }
 
-Get-NetFirewallRule -DisplayName "Playwright Backend ($taskName)" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-Write-BackendLog 'Removed firewall rule'
+Remove-LegacyFirewallRule -TaskName $taskName
 
-if ($RemoveFiles) {
+if ($RemoveFiles -and (Test-Path $InstallDir)) {
     # Give Windows a moment to release handles held by the processes we just stopped.
     Start-Sleep -Seconds 2
     Set-Location $env:TEMP
-    Remove-Item -Path $InstallDir -Recurse -Force
+    # Remove-Item on 5.1 fails on paths over 260 characters (playwright-core nests deep); rd does not.
+    try { Remove-Item -Path $InstallDir -Recurse -Force } catch { cmd /c rd /s /q $InstallDir }
+    if (Test-Path $InstallDir) { throw "Could not delete $InstallDir; a process may still hold files in it." }
     Write-BackendLog "Deleted $InstallDir"
 }
 
