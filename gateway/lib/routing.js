@@ -172,16 +172,28 @@ function describeState(state, retryInMs) {
   return state;
 }
 
-// Gateway nodes before static hosts, then the server with the largest share of its slots free (random
-// among equals), then a random free slot on it.
-function choose(free, random = Math.random) {
+// How many browsers other than `browser` a server's slots could serve (Chromium channels count as
+// chromium); Infinity for one that takes any.
+function breadth(browsers, browser) {
+  if (!browsers.length) return Infinity;
+  const family = (b) => (CHROMIUM_FAMILY.test(String(b).toLowerCase()) ? 'chromium' : String(b).toLowerCase());
+  return new Set(browsers.map(family).filter((b) => b !== browser)).size;
+}
+
+// Gateway nodes before static hosts; then the servers that offer the fewest other browsers, so a
+// chromium session doesn't take a slot a firefox or webkit client could have used while a
+// chromium-only slot sits idle; then the server with the largest share of its slots free (random
+// among equals); then a random free slot on it.
+function choose(free, random = Math.random, browser = null) {
   if (!free.length) return null;
   const byServer = new Map();
   for (const entry of free) {
     if (!byServer.has(entry.server)) byServer.set(entry.server, []);
     byServer.get(entry.server).push(entry);
   }
-  const pool = [...byServer.keys()].some((s) => s.gateway) ? [...byServer.keys()].filter((s) => s.gateway) : [...byServer.keys()];
+  let pool = [...byServer.keys()].some((s) => s.gateway) ? [...byServer.keys()].filter((s) => s.gateway) : [...byServer.keys()];
+  const narrowest = Math.min(...pool.map((s) => breadth(s.browsers || [], browser)));
+  pool = pool.filter((s) => breadth(s.browsers || [], browser) === narrowest);
   const size = (s) => (s.connected ? Math.max(s.agent.slots.length, 1) : Math.max(s.slots.length, 1));
   const share = (s) => byServer.get(s).length / size(s);
   const best = Math.max(...pool.map(share));
@@ -191,4 +203,4 @@ function choose(free, random = Math.random) {
   return entries[Math.floor(random() * entries.length)];
 }
 
-module.exports = { clientWants, clientVersion, majorMinor, offers, evaluate, choose, summarize };
+module.exports = { clientWants, clientVersion, majorMinor, offers, breadth, evaluate, choose, summarize };

@@ -3,7 +3,8 @@
 // Stand-in for playwright-core's cli.js in tests: `cli.js run-server --port <p> --host <h>` starts a
 // WebSocket echo server. Text commands: "info" returns the upgrade url and headers, "lastclose" the
 // close code/reason of the previous connection, "close:<code>:<reason>" closes from the server side.
-// A client sending x-fake-reject: 1 gets HTTP 428, like run-server on a version mismatch.
+// A client sending x-fake-reject: <status> gets that HTTP status (428 when it names none), like run-server
+// refusing a client of another Playwright version (428), or a path or host it doesn't serve (400, 403).
 
 const http = require('node:http');
 const WebSocket = require('ws');
@@ -20,7 +21,9 @@ const server = http.createServer((req, res) => res.writeHead(404).end());
 const wss = new WebSocket.WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   if (req.headers['x-fake-reject']) {
-    socket.end('HTTP/1.1 428 Precondition Required\r\nConnection: close\r\nContent-Length: 16\r\n\r\nversion mismatch');
+    const status = /^[1-5]\d\d$/.test(req.headers['x-fake-reject']) ? Number(req.headers['x-fake-reject']) : 428;
+    const body = status === 428 ? 'Playwright version mismatch:\n  - server version: v0.0\n  - client version: v1.50\n' : 'refused';
+    socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => {

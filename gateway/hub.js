@@ -8,6 +8,7 @@
 
 const crypto = require('node:crypto');
 const http = require('node:http');
+const os = require('node:os');
 const WebSocket = require('ws');
 const { hubConfig } = require('./lib/config');
 const { createLogger } = require('./lib/log');
@@ -21,8 +22,18 @@ const REGISTER_TIMEOUT_MS = 10000;
 const EPHEMERAL_SWEEP_MS = 60000;
 const QUEUE_POLL_MS = 1000; // re-reads the slots while clients wait: other claimers release without telling the hub
 const CLAIM_SYNC_MS = 30000;
+const HUB_LEASE_MS = 90000;
 const SLOT_ROUTE_GONE = 'the /connect/<node>/<slot> endpoints were removed: connect to /connect and the hub picks a free slot '
   + 'for the browser you launch (add ?node=<name> to stay on one node)';
+
+// run-server answers a client of another Playwright major.minor with 428 and a boxed message naming both
+// versions; the hub passes that on in the words of its own version check.
+function versionRefusal(where, text) {
+  const server = /server version: v?(\d+\.\d+)/.exec(text);
+  const client = /client version: v?(\d+\.\d+)/.exec(text);
+  const versions = server && client ? `the client is ${client[1]}, ${where} runs ${server[1]}` : `${where} refused the client's version`;
+  return `Playwright version mismatch: ${versions}. Keep the client on the grid's Playwright version`;
+}
 
 function createHub(config, { log = createLogger('hub'), registry = createRegistry(config, log) } = {}) {
   // Control frames are small; only the session tunnels need Playwright-sized frames.
@@ -37,12 +48,14 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   // ones in arrival order.
   const held = new Set();
   const queue = [];
-  // This hub's claims in portUsage, by claimedBy. A restarted hub frees every 'hub:' claim, so the prefix
-  // only has to tell this instance's claims from those of a hub that ran before it.
-  const claimPrefix = `hub:${crypto.randomBytes(4).toString('hex')}:`;
+  // This hub's claims in portUsage, by claimedBy ('hub:<instance>:<n>'). They live as long as this hub's
+  // lease (its row in hubs, renewed every hubLeaseMs / 3): a hub frees the claims of any hub whose lease
+  // ran out, so several hubs can share one database. A claim stays here until its session ends, even
+  // one taken from this hub (c.lost): the pump never routes a second client to a slot it still pipes.
+  const instance = crypto.randomBytes(4).toString('hex');
+  const claimPrefix = `hub:${instance}:`;
   const claims = new Map();
-  const unreleased = new Map(); // claimedBy -> slot id: releases the database refused, retried by the claim sync
-  const lostClaims = new Set(); // claimedBy of claims taken from this hub, which it then never releases
+  const unreleased = new Map(); // claimedBy -> claim: releases the database refused, retried by the claim sync
   const releasing = new Set(); // releases on their way to the database
   const queuePollMs = config.queuePollMs ?? QUEUE_POLL_MS;
   const claimSyncMs = config.claimSyncMs ?? CLAIM_SYNC_MS;
@@ -51,6 +64,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   const connectAttempts = config.connectAttempts ?? 3;
   const failThreshold = config.failThreshold ?? 3;
   const failCooldownMs = config.failCooldownMs ?? 300000;
+  const hubLeaseMs = config.hubLeaseMs ?? HUB_LEASE_MS;
   let claimSeq = 0;
   let clientSeq = 0;
   let pumpRun = null; // the pump() pass under way
@@ -58,6 +72,8 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   let pollTimer = null;
   let syncing = false;
   let claimSyncer = null;
+  let leaseRenewer = null;
+  let listening = null; // the port, once the hub listens
   const dbQueues = new Map(); // name -> promise chain, so writes for one node stay in order
   const pingInterval = Math.max(1000, Math.min(10000, Math.floor(config.heartbeatTimeoutMs / 3)));
   // A session leg that answers no ping for this long is half-open (tests set it lower).
@@ -148,7 +164,10 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     const data = /^\/agent\/data\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (data) return acceptData(req, socket, head, data[1]);
     if (url.pathname === '/connect' || url.pathname === '/connect/') return acceptClient(req, socket, head, url, remote);
-    if (url.pathname.startsWith('/connect/')) return reject(socket, 410, SLOT_ROUTE_GONE);
+    // 503, not 410: checks of the previous release take only 401, 403 and 503 for the hub's refusal and
+    // count anything else as a connect failure on the slot they claimed, so while they are being
+    // replaced they would fail healthy slots.
+    if (url.pathname.startsWith('/connect/')) return reject(socket, 503, SLOT_ROUTE_GONE);
     reject(socket, 404, 'not found');
   }
 
@@ -360,7 +379,8 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   // Every TOKEN_RECHECK_S the tokens of the connected agents are looked up again, past the cache, and an
   // agent whose token was revoked or expired is closed with 4401; so is one that came in without a token
   // before enforcement was switched on. Its reconnect is then refused. A database error closes nothing.
-  // Client sessions already open are left alone: a revoked client token only stops new ones.
+  // Client sessions already open are left alone: a revoked client token only stops new ones, and the
+  // clients it still has waiting in the queue.
   async function recheckTokens() {
     if (rechecking || stopping) return;
     rechecking = true;
@@ -388,6 +408,8 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
         }
       }));
       if (unavailable) log.warn(`could not re-check the token of ${unavailable} agent(s): the database is unavailable; keeping them connected`);
+      // Clients still waiting for a slot: one whose token was revoked or expired meanwhile gets none.
+      await Promise.all([...held].filter((client) => client.tokenHash && client.state === 'queued').map(tokenRevoked));
     } catch (err) {
       log.error(`agent token re-check failed: ${err.stack || err.message}`);
     } finally {
@@ -412,7 +434,8 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
         log.warn(`client ${remote} rejected: ${verdict.message}`);
         return reject(socket, 401, verdict.problem ? `gateway token is ${verdict.problem}` : 'missing or bad gateway token');
       }
-      route(req, socket, head, url, remote);
+      // A managed token's hash is kept (never the token) so it can be checked again while the client waits.
+      route(req, socket, head, url, remote, verdict.via === 'managed' ? P.hashToken(token) : null);
     }).catch((err) => {
       log.error(`client ${remote}: token check failed: ${err.stack || err.message}`);
       reject(socket, 500, 'internal error');
@@ -420,13 +443,15 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   }
 
   // A client whose token checked out. Its upgrade is held (no 101 yet) in the queue until pump() finds it
-  // a slot, or it gives up, or it leaves.
-  function route(req, socket, head, url, remote) {
+  // a slot, or it gives up, or it leaves. Its number tells its log lines from those of other clients at
+  // the same address.
+  function route(req, socket, head, url, remote, tokenHash) {
     const { want, error } = R.clientWants(url.searchParams, req.headers);
     if (error) return reject(socket, 400, error);
     const query = P.stripQueryParam(P.stripQueryParam(url.search.replace(/^\?/, ''), 'gateway_token'), 'node');
+    const seq = ++clientSeq;
     const client = {
-      seq: ++clientSeq, label: `client ${remote}`, req, socket, head, want, query, headers: P.forwardHeaders(req.headers),
+      seq, label: `client #${seq} ${remote}`, tokenHash, req, socket, head, want, query, headers: P.forwardHeaders(req.headers),
       arrived: Date.now(), state: 'queued', evaluated: false, expired: false, attempts: 0, failed: new Set(), lastError: null,
       summary: null, claim: null, open: null, timer: null,
     };
@@ -567,8 +592,9 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     }
     client.summary = view.summary;
     let free = view.free;
+    if (free.length && await tokenRevoked(client)) return;
     while (free.length && client.state === 'queued') {
-      const pick = R.choose(free);
+      const pick = R.choose(free, Math.random, client.want.browser);
       free = free.filter((f) => f !== pick);
       taken.add(pick.row.id);
       if (await claim(client, pick)) return;
@@ -584,6 +610,18 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     log.info(`${client.label} waits for a free ${slotWanted(client)}: ${view.summary}`);
   }
 
+  // A managed client token is looked up again (through the same cache as the first check) before a slot
+  // is claimed for its client: one revoked or expired while the client waited gets it no session.
+  // True when the client is gone.
+  async function tokenRevoked(client) {
+    if (!client.tokenHash) return false;
+    const verdict = await tokens.checkHash('client', client.tokenHash);
+    if (verdict.ok || verdict.unavailable) return client.state !== 'queued';
+    log.warn(`${client.label} dropped after ${waited(client)}: ${verdict.message}`);
+    finish(client, 401, verdict.problem ? `gateway token is ${verdict.problem}` : 'missing or bad gateway token');
+    return true;
+  }
+
   // Claims the slot with the same conditional UPDATE every claimer uses. Resolves true when the client is
   // dealt with (its session is being opened, or it is gone), false when someone else got the slot first.
   async function claim(client, { server, row }) {
@@ -594,6 +632,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     let got;
     try {
       got = await registry.claimSlot(c.id, c.claimedBy);
+      c.run = got;
     } catch (err) {
       claims.delete(c.claimedBy);
       log.error(`could not claim ${slotName(c)} for ${client.label}: ${err.message}`);
@@ -622,7 +661,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
 
   function openOnAgent(client, c) {
     const agent = nodes.get(c.server);
-    if (!agent) return failAttempt(client, 502, `node ${c.server} disconnected`, false);
+    if (!agent) return failAttempt(client, 502, `node ${c.server} disconnected`, { count: false });
     const id = crypto.randomUUID();
     const open = {
       id, agent, client, claim: c, slot: c.slot,
@@ -638,10 +677,10 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   function openOnStatic(client, c) {
     const where = `static host ${c.server}:${c.slot}`;
     const open = { client, claim: c, upstream: null, settled: false, timer: null };
-    const fail = (status, message) => {
+    const fail = (status, message, opts) => {
       if (open.settled) return;
       open.settled = true;
-      failAttempt(client, status, message, true);
+      failAttempt(client, status, message, opts);
     };
     const host = c.server.includes(':') ? `[${c.server}]` : c.server;
     try {
@@ -653,12 +692,16 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     }
     client.open = open;
     open.timer = setTimeout(() => fail(504, `${where} did not answer within ${config.openTimeoutMs / 1000}s`), config.openTimeoutMs);
-    // run-server refuses a version mismatch with an HTTP error whose body says why.
+    // run-server refuses with an HTTP error whose body says why: 428 for the client's Playwright version,
+    // 400 or 403 for its own path or allowed hosts.
     open.upstream.on('unexpected-response', (req, res) => {
       let body = '';
       res.setEncoding('utf8');
-      res.on('data', (chunk) => { if (body.length < 2000) body += chunk; });
-      res.on('end', () => fail(502, `${where} answered HTTP ${res.statusCode}${body.trim() ? `: ${body.trim()}` : ''}`));
+      res.on('data', (chunk) => { if (body.length < 4000) body += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 428) return fail(428, versionRefusal(where, body), { count: false, final: true });
+        fail(502, `${where} answered HTTP ${res.statusCode}${body.trim() ? `: ${body.trim().slice(0, 500)}` : ''}`);
+      });
       res.on('error', () => {});
     });
     open.upstream.on('error', (err) => fail(502, `${where}: ${err.message}`));
@@ -686,17 +729,19 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     }
   }
 
-  function failOpen(id, status, message, { count = true } = {}) {
+  function failOpen(id, status, message, opts) {
     const open = pending.get(id);
     if (!open) return;
     log.warn(`open ${id} on ${slotName(open.claim)} failed (${status}): ${message}`);
-    failAttempt(open.client, status, message, count);
+    failAttempt(open.client, status, message, opts);
   }
 
   // The chosen slot couldn't open the session. Unless it wasn't the slot's fault, that is a connect
-  // failure on it (failCount + 1, as main.py counted them); the slot goes back and the client is tried
-  // on another one, up to GATEWAY_CONNECT_ATTEMPTS slots, before it gets this error.
-  function failAttempt(client, status, message, count) {
+  // failure on it (failCount + 1); the slot goes back and the client is tried on another one, up to
+  // GATEWAY_CONNECT_ATTEMPTS slots, before it gets this error. A refusal the client caused (`final`:
+  // run-server's 428 for its Playwright version) counts against no slot and is the client's answer at
+  // once, since every other slot would refuse it the same way.
+  function failAttempt(client, status, message, { count = true, final = false } = {}) {
     const c = client.claim;
     cancelOpen(client);
     client.claim = null;
@@ -705,6 +750,10 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     client.lastError = { status, message };
     if (client.state !== 'opening') return;
     if (stopping) return finish(client, 503, 'hub is shutting down');
+    if (final) {
+      log.warn(`${client.label} refused by ${slotName(c)} (${status}): ${message}`);
+      return finish(client, status, message);
+    }
     if (client.attempts >= connectAttempts || client.expired) {
       log.warn(`${client.label} gets ${status} after ${client.attempts} attempt(s): ${message}`);
       return finish(client, status, client.attempts > 1 ? `${message} (tried ${client.attempts} slots)` : message);
@@ -717,7 +766,12 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   function openFailed(agent, msg) {
     const open = pending.get(msg.id);
     if (!open || open.agent !== agent) return;
-    failOpen(msg.id, 502, `node ${agent.name} slot ${open.slot}: ${String(msg.message || 'open failed').slice(0, 500)}`);
+    const message = String(msg.message || 'open failed').slice(0, 4000);
+    // Agents older than the status field only say it in the message.
+    const status = Number.isInteger(msg.status) ? msg.status : Number((/answered HTTP (\d{3})\b/.exec(message) || [])[1]) || null;
+    const where = `node ${agent.name} slot ${open.slot}`;
+    if (status === 428) return failOpen(msg.id, 428, versionRefusal(where, message), { count: false, final: true });
+    failOpen(msg.id, 502, `${where}: ${message.slice(0, 500)}`);
   }
 
   // A data channel must carry the token its control connection authenticated with.
@@ -760,7 +814,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
       dataUp = true;
       connected(client, open.claim, data);
     });
-    if (!dataUp) failAttempt(client, 502, `node ${open.agent.name} sent a bad data channel handshake`, true);
+    if (!dataUp) failAttempt(client, 502, `node ${open.agent.name} sent a bad data channel handshake`);
   }
 
   // The slot's run-server took the session (its 101 is through), which also ends the slot's run of
@@ -796,15 +850,15 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
   const resetFailures = (c) => registry.resetFailures(c.id).catch((err) => log.error(`could not reset the failures of ${slotName(c)}: ${err.message}`));
 
   // Gives a claim back (after `after`, such as the failure count, is written). Only this claim is
-  // released: if the slot was released from elsewhere and claimed again since, it is left alone. A
-  // release the database refuses is retried by the claim sync.
+  // released: the row must still carry its claimedBy and stamp, so a slot released from elsewhere and
+  // claimed again since is left alone. A release the database refuses is retried by the claim sync.
   function release(c, after = null) {
     if (!c || c.released) return;
     c.released = true;
-    const done = Promise.resolve(after).then(() => registry.releaseSlot(c.id, c.claimedBy)).then((mine) => {
-      if (!mine) log.warn(`${slotName(c)} was no longer this hub's claim when its session ended; left it alone`);
+    const done = Promise.resolve(after).then(() => registry.releaseSlot(c.id, c.claimedBy, c.run)).then((mine) => {
+      if (!mine && !c.lost) log.warn(`${slotName(c)} was no longer this hub's claim when its session ended; left it alone`);
     }, (err) => {
-      unreleased.set(c.claimedBy, c.id);
+      unreleased.set(c.claimedBy, c);
       log.error(`could not release ${slotName(c)}: ${err.message}; retrying every ${claimSyncMs / 1000}s`);
     }).finally(() => {
       claims.delete(c.claimedBy);
@@ -814,39 +868,65 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     releasing.add(done);
   }
 
-  // Every CLAIM_SYNC_MS: retries releases the database refused, frees claims of this hub that nothing
-  // holds, and checks that the live ones are still this hub's. The stale-claim sweep in src/database.py
-  // frees old claims without clearing claimedBy; a live session's slot it freed is claimed again if
-  // nobody took it meanwhile. A claim released from the Grid UI (claimedBy cleared) or taken over is
-  // let go: its session runs on, and its end releases nothing.
+  // A row still holds claim c when it carries c's claimedBy and c's stamp (true: the stamp wasn't read).
+  const holds = (row, c) => !!row && row.claimedBy === c.claimedBy && (c.run === true || c.run == null || row.lastRun === c.run);
+
+  async function renewLease() {
+    try {
+      await registry.renewLease(instance, { host: os.hostname().slice(0, 255), port: listening || config.port || null });
+    } catch (err) {
+      log.error(`could not renew this hub's lease in the hubs table: ${err.message}`);
+    }
+  }
+
+  // Every CLAIM_SYNC_MS: retries releases the database refused, frees the claims of hubs whose lease ran
+  // out and claims of this hub that nothing holds, and checks that the live ones are still this hub's.
+  // A live session's slot that was freed under it (by an older stale-claim sweep that leaves claimedBy
+  // alone, from the Grid UI, or by a hub that took this one for dead while the database was away) is
+  // claimed again if nobody took it meanwhile; one another claimer took is marked lost, and the hub
+  // routes nobody else to it until its session ends.
   async function syncClaims() {
     if (syncing || stopping) return;
     syncing = true;
     try {
-      for (const [claimedBy, id] of [...unreleased]) {
-        await registry.releaseSlot(id, claimedBy);
+      for (const [claimedBy, c] of [...unreleased]) {
+        await registry.releaseSlot(c.id, claimedBy, c.run);
         unreleased.delete(claimedBy);
-        log.info(`released slot #${id}, which an earlier release could not`);
+        log.info(`released ${slotName(c)}, which an earlier release could not`);
       }
+      const dead = await registry.releaseDeadHubClaims(instance, hubLeaseMs);
+      if (dead) log.warn(`released ${dead} slot(s) claimed by a hub that stopped renewing its lease`);
+      // Only claims that had landed before the rows were read can be judged by them: one made while they
+      // were read would look as if it had been taken from this hub.
+      const settled = [...claims.values()].filter((c) => !c.pending && !c.released && !c.lost);
       const rows = await registry.slotStates(failThreshold, failCooldownMs);
       const byId = new Map(rows.map((r) => [r.id, r]));
       for (const row of rows) {
         const mine = typeof row.claimedBy === 'string' && row.claimedBy.startsWith(claimPrefix);
-        if (!mine || claims.has(row.claimedBy) || unreleased.has(row.claimedBy) || lostClaims.has(row.claimedBy)) continue;
-        if (await registry.releaseSlot(row.id, row.claimedBy)) log.warn(`released ${row.server}/${row.slot}: this hub claimed it, but no session holds it`);
+        if (!mine || claims.has(row.claimedBy) || unreleased.has(row.claimedBy)) continue;
+        if (await registry.releaseSlot(row.id, row.claimedBy, row.lastRun)) log.warn(`released ${row.server}/${row.slot}: this hub claimed it, but no session holds it`);
       }
-      for (const c of [...claims.values()]) {
-        if (c.released || c.pending) continue;
+      for (const c of settled) {
+        if (c.released || stopping) continue;
         const row = byId.get(c.id);
-        if (row && row.claimedBy === c.claimedBy && row.inUse) continue;
-        if (row && row.claimedBy === c.claimedBy && await registry.reassertClaim(c.id, c.claimedBy)) {
-          log.warn(`${slotName(c)} was freed as a stale claim while its session is still open; claimed it again`);
+        if (holds(row, c)) {
+          if (!row.inUse && await registry.reassertClaim(c.id, c.claimedBy, c.run)) {
+            log.warn(`${slotName(c)} was freed as a stale claim while its session is still open; claimed it again`);
+          }
           continue;
         }
-        c.released = true;
-        claims.delete(c.claimedBy);
-        lostClaims.add(c.claimedBy);
-        log.warn(`${slotName(c)} is no longer this hub's claim (${row ? 'released or claimed from elsewhere' : 'the slot was removed'}); its session runs on, and its end releases nothing`);
+        if (row && !row.inUse) {
+          const run = await registry.claimSlot(c.id, c.claimedBy);
+          if (!run) continue; // someone else got it first: the next sync sees whose it is
+          c.run = run;
+          // The session may have ended while the claim was on its way; its release may have missed it.
+          if (c.released) await registry.releaseSlot(c.id, c.claimedBy, run);
+          else log.warn(`${slotName(c)} was released from elsewhere while its session is still open; claimed it again`);
+          continue;
+        }
+        c.lost = true;
+        log.warn(`${slotName(c)} is no longer this hub's claim (${row ? 'another claimer holds it' : 'the slot was removed'}); `
+          + 'its session runs on, and the hub routes nobody else to it until the session ends');
       }
     } catch (err) {
       log.error(`claim sync failed: ${err.message}`);
@@ -880,12 +960,20 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
 
   async function start() {
     await registry.init();
-    // Sessions don't outlive the hub that piped them, so claims a hub made before this one are leftovers.
+    // The lease first: from now on no other hub takes this one's claims for leftovers. Sessions don't
+    // outlive the hub that piped them, so the claims of a hub whose lease ran out (one that crashed, or
+    // ran before this one) are leftovers; the claim sync keeps freeing them if this fails.
+    await renewLease();
     try {
-      const freed = await registry.releaseClaims('hub:');
-      if (freed) log.warn(`released ${freed} slot(s) a previous hub run still had claimed`);
+      const others = (await registry.liveHubs(hubLeaseMs)).filter((hub) => hub.instance !== instance);
+      for (const hub of others) {
+        log.warn(`another hub uses this database: instance ${hub.instance} on ${hub.host || '?'}:${hub.port ?? '?'}, `
+          + `heard from ${Math.round(hub.lastSeenMs / 1000)}s ago. Hubs share it safely, but each routes only to the nodes connected to it`);
+      }
+      const freed = await registry.releaseDeadHubClaims(instance, hubLeaseMs);
+      if (freed) log.warn(`released ${freed} slot(s) claimed by a hub that is no longer running`);
     } catch (err) {
-      log.error(`could not release the claims of a previous hub run: ${err.message}`);
+      log.error(`could not release the claims of hubs that are no longer running: ${err.message}; retrying every ${claimSyncMs / 1000}s`);
     }
     const managed = {};
     for (const kind of ['agent', 'client']) {
@@ -925,6 +1013,9 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     tokenRechecker = setInterval(recheckTokens, tokenRecheckMs);
     claimSyncer = setInterval(syncClaims, claimSyncMs);
     const { port } = server.address();
+    listening = port;
+    leaseRenewer = setInterval(renewLease, Math.max(1000, Math.floor(hubLeaseMs / 3)));
+    renewLease();
     const mode = (kind) => (config[`${kind}Token`] ? 'required' : managed[kind] ? 'required (managed tokens)' : 'not required');
     log.info(`hub listening on ${config.host}:${port} (db: ${registry.kind}, agent token ${mode('agent')}, client token ${mode('client')})`);
     return port;
@@ -937,6 +1028,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     clearInterval(ephemeralSweeper);
     clearInterval(tokenRechecker);
     clearInterval(claimSyncer);
+    clearInterval(leaseRenewer);
     clearTimeout(pollTimer);
     for (const timer of reapTimers.values()) clearTimeout(timer);
     reapTimers.clear();
@@ -964,11 +1056,13 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     await pumpRun;
     for (const c of claims.values()) release(c);
     await Promise.all([...releasing]);
+    // Without its row, any other hub frees whatever this one could not release.
+    await registry.leaveHub(instance).catch((err) => log.error(`could not remove this hub's lease: ${err.message}`));
     await registry.close();
   }
 
   return {
-    start, stop, server, nodes, pending, sessions, queue, claims, registry, sweepEphemeral, recheckTokens, syncClaims,
+    start, stop, server, nodes, pending, sessions, queue, claims, registry, sweepEphemeral, recheckTokens, syncClaims, instance,
   };
 }
 

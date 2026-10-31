@@ -52,7 +52,7 @@ afterEach(h.cleanup);
 
 test('init adds tokenId (and ephemeral) to a nodes table made before them, keeps its rows, and is idempotent', { skip }, async () => {
   await admin.query('SET FOREIGN_KEY_CHECKS = 0');
-  for (const table of ['portUsage', 'portStatus', 'nodes', 'accessTokens']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
+  for (const table of ['portUsage', 'portStatus', 'nodes', 'accessTokens', 'hubs']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
   await admin.query('SET FOREIGN_KEY_CHECKS = 1');
   // nodes as the first gateway build made it.
   await admin.query(`CREATE TABLE nodes (
@@ -194,9 +194,9 @@ test('hub on MySQL: managed tokens, node binding, revocation and expiry set with
   assert.deepEqual([...hub.nodes.keys()], ['mysql-bound']);
 });
 
-test('init adds claimedBy to a portUsage table made before it, and the claim methods behave like src/database.py', { skip }, async () => {
+test('init adds claimedBy to a portUsage table made before it; the claim, stamp and lease methods', { skip }, async () => {
   await admin.query('SET FOREIGN_KEY_CHECKS = 0');
-  for (const table of ['portUsage', 'portStatus', 'nodes']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
+  for (const table of ['portUsage', 'portStatus', 'nodes', 'hubs']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
   await admin.query('SET FOREIGN_KEY_CHECKS = 1');
   // portStatus and portUsage as they were before the hub routed clients.
   await admin.query(`CREATE TABLE portStatus (id INT AUTO_INCREMENT PRIMARY KEY, PortNumber INT NOT NULL, PortStatus INT NOT NULL DEFAULT 0,
@@ -224,18 +224,23 @@ test('init adds claimedBy to a portUsage table made before it, and the claim met
   // Claiming is the conditional UPDATE: of two concurrent claims exactly one wins.
   const id = rows[0].id;
   const results = await Promise.all([registry.claimSlot(id, 'hub:aaaa0000:1'), registry.claimSlot(id, 'hub:aaaa0000:2')]);
-  assert.deepEqual(results.sort(), [false, true]);
-  const [[claim]] = await admin.query('SELECT inUse, claimedBy, TIMESTAMPDIFF(SECOND, LastRunDate, UTC_TIMESTAMP()) AS age FROM portUsage WHERE id = ?', [id]);
+  assert.equal(results.filter((r) => r === null).length, 1);
+  const stamp = results.find((r) => r !== null);
+  const [[claim]] = await admin.query('SELECT inUse, claimedBy, LastRunDate, TIMESTAMPDIFF(SECOND, LastRunDate, UTC_TIMESTAMP()) AS age FROM portUsage WHERE id = ?', [id]);
   assert.equal(claim.inUse, 1);
   assert.match(claim.claimedBy, /^hub:aaaa0000:[12]$/);
+  assert.equal(stamp, claim.LastRunDate, 'the claim resolves its LastRunDate');
+  assert.equal((await states())[0].lastRun, stamp, 'and slotStates reports the same stamp');
   assert.ok(claim.age >= 0 && claim.age < 5, `LastRunDate is ${claim.age}s from UTC now`);
   const other = claim.claimedBy.endsWith('1') ? 'hub:aaaa0000:2' : 'hub:aaaa0000:1';
   assert.equal(await registry.releaseSlot(id, other), false, 'only the claim that holds it releases it');
-  // The stale-claim sweep of src/database.py frees it without touching claimedBy: the hub may claim it again.
+  assert.equal(await registry.releaseSlot(id, claim.claimedBy, '2000-01-01 00:00:00'), false, 'nor one whose stamp is not the claim\'s');
+  // An older stale-claim sweep freed it without touching claimedBy: the hub may claim it again.
   await admin.query('UPDATE portUsage SET inUse = 0 WHERE id = ?', [id]);
   assert.equal(await registry.reassertClaim(id, other), false);
-  assert.equal(await registry.reassertClaim(id, claim.claimedBy), true);
-  assert.equal(await registry.releaseSlot(id, claim.claimedBy), true);
+  assert.equal(await registry.reassertClaim(id, claim.claimedBy, '2000-01-01 00:00:00'), false);
+  assert.equal(await registry.reassertClaim(id, claim.claimedBy, stamp), true);
+  assert.equal(await registry.releaseSlot(id, claim.claimedBy, stamp), true);
   rows = await states();
   assert.deepEqual([rows[0].inUse, rows[0].claimedBy], [false, null]);
 
@@ -251,22 +256,35 @@ test('init adds claimedBy to a portUsage table made before it, and the claim met
   await registry.resetFailures(id);
   assert.equal((await states())[0].failCount, 0);
 
-  // A restarted hub frees every 'hub:' claim, and only those; _ and % in the prefix are literal.
-  const [g2, s1, s2] = [rows[1].id, rows[2].id, rows[3].id];
+  // Leases: a hub frees the claims of a hub whose lease ran out, never those of a live hub, its own, or
+  // anyone else's; _ and % in the instance are literal.
+  const [g1, g2, s1, s2] = [rows[0].id, rows[1].id, rows[2].id, rows[3].id];
+  await registry.renewLease('live0001', { host: 'a', port: 4500 });
+  await registry.renewLease('me000001', { host: 'b', port: 4501 });
+  await admin.query("INSERT INTO hubs (instance, host, port, startedAt, lastSeen) VALUES ('dead0001', 'c', 4502, UTC_TIMESTAMP(), UTC_TIMESTAMP() - INTERVAL 200 SECOND)");
+  assert.deepEqual((await registry.liveHubs(90000)).map((hub) => hub.instance).sort(), ['live0001', 'me000001']);
+  await registry.claimSlot(g1, 'hub:live0001:1');
   await registry.claimSlot(g2, 'hub:dead0001:1');
   await registry.claimSlot(s1, 'hubx:1');
-  await admin.query('UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP() WHERE id = ?', [s2]); // main.py's claim
-  assert.equal(await registry.releaseClaims('hub_'), 0);
-  assert.equal(await registry.releaseClaims('hub:'), 1);
-  const [after] = await admin.query('SELECT id, inUse, claimedBy FROM portUsage WHERE id IN (?)', [[g2, s1, s2]]);
+  await admin.query('UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP(), claimedBy = NULL WHERE id = ?', [s2]); // another claimer
+  assert.equal(await registry.releaseDeadHubClaims('me_00001', 90000), 1);
+  const [after] = await admin.query('SELECT id, inUse, claimedBy FROM portUsage WHERE id IN (?)', [[g1, g2, s1, s2]]);
   const byId = new Map(after.map((r) => [r.id, [r.inUse, r.claimedBy]]));
-  assert.deepEqual([g2, s1, s2].map((i) => byId.get(i)), [[0, null], [1, 'hubx:1'], [1, null]]);
+  assert.deepEqual([g1, g2, s1, s2].map((i) => byId.get(i)), [[1, 'hub:live0001:1'], [0, null], [1, 'hubx:1'], [1, null]]);
+  const [hubs] = await admin.query('SELECT instance FROM hubs ORDER BY instance');
+  assert.deepEqual(hubs.map((r) => r.instance), ['live0001', 'me000001'], 'the dead hub\'s row is gone');
+  // A hub never takes itself for dead, even with a lapsed lease.
+  await registry.claimSlot(g2, 'hub:me000001:2');
+  await admin.query("UPDATE hubs SET lastSeen = UTC_TIMESTAMP() - INTERVAL 500 SECOND WHERE instance = 'me000001'");
+  assert.equal(await registry.releaseDeadHubClaims('me000001', 90000), 0);
+  await registry.leaveHub('me000001');
+  assert.equal(await registry.releaseDeadHubClaims('live0001', 90000), 1, 'a hub that left is dead to the others');
 });
 
 test('hub on MySQL: /connect claims the slot in portUsage, releases it, and dials a static host', { skip }, async () => {
   const registry = await newRegistry({ init: false });
   await admin.query('SET FOREIGN_KEY_CHECKS = 0');
-  for (const table of ['portUsage', 'portStatus', 'nodes']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
+  for (const table of ['portUsage', 'portStatus', 'nodes', 'hubs']) await admin.query(`DROP TABLE IF EXISTS ${table}`);
   await admin.query('SET FOREIGN_KEY_CHECKS = 1');
   await admin.query('DELETE FROM accessTokens'); // no managed tokens: agents and clients need none
   const { url, hub } = await h.startHub({ queuePollMs: 100 }, registry);
@@ -307,7 +325,10 @@ test('hub on MySQL: /connect claims the slot in portUsage, releases it, and dial
   viaStatic.send('hi');
   assert.equal((await h.nextMessage(viaStatic)).data.toString(), 'static saw webkit');
   assert.equal((await usage('127.0.0.1')).inUse, 1);
+  const [[lease]] = await admin.query('SELECT host, TIMESTAMPDIFF(SECOND, lastSeen, UTC_TIMESTAMP()) AS age FROM hubs WHERE instance = ?', [hub.instance]);
+  assert.ok(lease && lease.age >= 0 && lease.age < 5, 'the hub holds a lease while it runs');
   await hub.stop();
   row = await usage('127.0.0.1');
   assert.deepEqual([row.inUse, row.claimedBy], [0, null], 'stopping the hub released it');
+  assert.equal((await admin.query('SELECT COUNT(*) AS n FROM hubs WHERE instance = ?', [hub.instance]))[0][0].n, 0, 'and gave up its lease');
 });

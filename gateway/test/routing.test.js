@@ -14,19 +14,27 @@ const R = require('../lib/routing');
 
 afterEach(h.cleanup);
 
+// What run-server 1.64 answers a 1.50 client with (userAgentVersionMatchesErrorMessage), box and all.
+const VERSION_BOX = ['╔═══════════════════════════════════════╗', '║ Playwright version mismatch:          ║',
+  '║   - server version: v1.64             ║', '║   - client version: v1.50             ║', '╚═══════════════════════════════════════╝'].join('\n');
+
 const UA = (version) => ({ 'user-agent': `Playwright/${version} (x64; linux 6.8) node/20.17` });
 const browserHeaders = (browser, version = '1.64.1') => ({ 'x-playwright-browser': browser, ...UA(version) });
 
 // An in-process agent: registers like agent.js and answers each open frame as told. 'echo' opens the
-// data channel and echoes frames back, 'fail' answers open-failed, 'mute' never answers.
-async function fakeNode(url, name, { slots = 1, browsers = ['chromium'], playwrightVersion = '1.64.1', mode = 'echo', healthy = true } = {}) {
+// data channel and echoes frames back, 'fail' answers open-failed, 'mute' never answers. failStatus is
+// the HTTP status the open-failed frame says run-server answered.
+async function fakeNode(url, name, { slots = 1, browsers = ['chromium'], playwrightVersion = '1.64.1', mode = 'echo', healthy = true, failStatus, oldAgent = false } = {}) {
   const ws = await h.rawAgent(url);
-  const node = { ws, name, opens: [], channels: [], mode };
+  const node = { ws, name, opens: [], channels: [], mode, failStatus };
   ws.on('message', (data) => {
     const msg = JSON.parse(data);
     if (msg.type !== 'open') return;
     node.opens.push(msg);
-    if (node.mode === 'fail') return ws.send(JSON.stringify({ type: 'open-failed', id: msg.id, message: 'run-server refused' }));
+    if (node.mode === 'fail') {
+      const message = node.failStatus === 428 ? `run-server on port 3100 answered HTTP 428: ${VERSION_BOX}` : 'run-server refused';
+      return ws.send(JSON.stringify({ type: 'open-failed', id: msg.id, message, status: oldAgent ? undefined : node.failStatus }));
+    }
     if (node.mode === 'mute') return;
     const channel = new WebSocket(`${url}/agent/data/${msg.id}`);
     h.cleanups.push(async () => channel.terminate());
@@ -68,13 +76,16 @@ const slotRow = (registry, server, slot) => registry.slots.get(server).get(slot)
 const claimed = (registry) => [...registry.slots.values()].flatMap((m) => [...m.values()]).filter((s) => s.inUse);
 
 // A stand-in for a legacy static host: a bare run-server-like WebSocket server on 127.0.0.1.
-async function staticHost({ refuse = false } = {}) {
+async function staticHost({ refuse = null } = {}) {
   const server = http.createServer((req, res) => res.writeHead(404).end());
   const wss = new WebSocket.WebSocketServer({ noServer: true });
   const seen = [];
   server.on('upgrade', (req, socket, head) => {
     seen.push({ url: req.url, headers: req.headers });
-    if (refuse) return socket.end('HTTP/1.1 428 Precondition Required\r\nConnection: close\r\nContent-Length: 16\r\n\r\nversion mismatch');
+    if (refuse) {
+      const body = refuse === 428 ? VERSION_BOX : 'Forbidden';
+      return socket.end(`HTTP/1.1 ${refuse} ${http.STATUS_CODES[refuse]}\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.on('message', (d, isBinary) => {
         if (!isBinary && d.toString() === 'whoami') return ws.send(JSON.stringify({ node: 'static', url: req.url, headers: req.headers }));
@@ -149,11 +160,12 @@ test('routing helpers: what the client asks for, versions, browser families, cho
   assert.equal(R.summarize({ busy: 2, failing: 1 }, 3, 42500), '3 matching slots: 2 busy, 1 failing (next retry in 43s)');
 });
 
-test('the slot route is gone: /connect/<node>/<slot> gets 410 saying to use /connect', async () => {
+// 503 rather than 410: checks of the previous release count any other answer against the slot they claimed.
+test('the slot route is gone: /connect/<node>/<slot> gets 503 saying to use /connect', async () => {
   const { url } = await startHub({ clientToken: 'tok' });
   await fakeNode(url, 'n1');
   for (const path of ['/connect/n1/1', '/connect/n1/1?gateway_token=tok', '/connect/n1']) {
-    await assert.rejects(h.connect(`${url}${path}`), (err) => err.status === 410 && /use|connect to \/connect/.test(err.body) && /\?node=/.test(err.body));
+    await assert.rejects(h.connect(`${url}${path}`), (err) => err.status === 503 && /endpoints were removed: connect to \/connect/.test(err.body) && /\?node=/.test(err.body));
   }
 });
 
@@ -497,7 +509,7 @@ test('stopping the hub releases every claim; a restarted hub frees what a crashe
   assert.equal(slotRow(registry, 'keep', 2).inUse, 1);
 });
 
-test('the claim sync: retries failed releases, frees orphaned claims, re-claims a live session\'s slot freed as stale', async () => {
+test('the claim sync: retries failed releases, frees orphaned claims, re-claims a live session\'s slot freed under it', async () => {
   const registry = new MemoryRegistry();
   const { url, hub } = await startHub({ claimSyncMs: 60000 }, registry);
   await fakeNode(url, 'sync', { slots: 3 });
@@ -505,7 +517,7 @@ test('the claim sync: retries failed releases, frees orphaned claims, re-claims 
   const [mine] = [...hub.claims.values()];
   const row = registry.slotById(mine.id);
 
-  // The stale-claim sweep of src/database.py frees it (inUse = 0, claimedBy untouched): claimed again.
+  // An older stale-claim sweep frees it (inUse = 0, claimedBy and LastRunDate untouched): claimed again.
   row.inUse = 0;
   await hub.syncClaims();
   assert.equal(row.inUse, 1);
@@ -514,22 +526,21 @@ test('the claim sync: retries failed releases, frees orphaned claims, re-claims 
   // A claim with this hub's prefix that no session holds (say a lost release) is freed.
   const prefix = mine.claimedBy.replace(/\d+$/, '');
   const orphan = [...registry.slots.get('sync').values()].find((s) => s !== row);
-  Object.assign(orphan, { inUse: 1, claimedBy: `${prefix}999` });
+  Object.assign(orphan, { inUse: 1, claimedBy: `${prefix}999`, lastRun: Date.now() });
   await hub.syncClaims();
   assert.equal(orphan.inUse, 0);
   assert.equal(orphan.claimedBy, null);
 
-  // The Grid UI force-releases the live session's slot (claimedBy cleared) and main.py claims it: the
-  // hub lets go, and the session's end leaves main.py's claim alone.
-  Object.assign(row, { inUse: 1, claimedBy: null });
+  // The Grid UI force-releases the live session's slot (claimedBy cleared): the session is still open,
+  // so the hub claims the slot again rather than let it be handed out twice.
+  Object.assign(row, { inUse: 0, claimedBy: null, lastRun: Date.now() + 5 });
   await hub.syncClaims();
-  assert.equal(hub.claims.size, 0);
+  assert.equal(row.inUse, 1);
+  assert.equal(row.claimedBy, mine.claimedBy);
   ws.close();
-  await h.sleep(300);
-  assert.equal(row.inUse, 1, 'main.py still holds it');
+  await h.waitFor(() => !row.inUse && row.claimedBy === null && hub.claims.size === 0, { what: 'released when the session ended' });
 
   // A release the database refused is retried.
-  row.inUse = 0;
   const releaseSlot = registry.releaseSlot.bind(registry);
   registry.releaseSlot = async () => { throw new Error('ECONNRESET'); };
   const second = await h.connect(`${url}/connect?node=sync`);
@@ -541,6 +552,190 @@ test('the claim sync: retries failed releases, frees orphaned claims, re-claims 
   await hub.syncClaims();
   assert.equal(registry.slotById(claim2.id).inUse, 0);
   assert.equal(registry.slotById(claim2.id).claimedBy, null);
+});
+
+test('the claim sync never takes a claim that landed while it read the slots for a lost one', async () => {
+  // The read takes a while (a SELECT on a busy MySQL); a client is claimed and connected meanwhile.
+  class SlowRegistry extends MemoryRegistry {
+    async slotStates(...args) {
+      const rows = await super.slotStates(...args);
+      if (!this.slow) return rows;
+      this.slow = false;
+      await h.sleep(300);
+      return rows;
+    }
+  }
+  const registry = new SlowRegistry();
+  const { url, hub } = await startHub({ claimSyncMs: 60000, queueTimeoutMs: 1000, openTimeoutMs: 400 }, registry);
+  const node = await fakeNode(url, 'one');
+  const row = slotRow(registry, 'one', 1);
+
+  registry.slow = true;
+  const sync = hub.syncClaims();
+  await h.sleep(50);
+  const ws = await h.connect(`${url}/connect?node=one`);
+  await sync;
+  assert.equal(hub.claims.size, 1, 'still this hub\'s claim');
+  ws.close();
+  await h.waitFor(() => !row.inUse && row.claimedBy === null, { what: 'released when the session ended' });
+  const next = await h.connect(`${url}/connect?node=one`);
+  assert.equal((await whoami(next)).node, 'one');
+  next.close();
+  await h.waitFor(() => !row.inUse, { what: 'released again' });
+
+  // The same while a session is being opened and never answers: the open timeout releases it.
+  node.mode = 'mute';
+  registry.slow = true;
+  const sync2 = hub.syncClaims();
+  await h.sleep(50);
+  const timedOut = assert.rejects(h.connect(`${url}/connect?node=one`), { status: 504 });
+  await sync2;
+  await timedOut;
+  await h.waitFor(() => !row.inUse && row.claimedBy === null && hub.claims.size === 0, { what: 'released after the open timeout' });
+});
+
+test('a slot taken from a live session is never routed to again while that session runs', async () => {
+  const registry = new MemoryRegistry();
+  const { url, hub } = await startHub({ claimSyncMs: 60000, queueTimeoutMs: 800 }, registry);
+  await fakeNode(url, 'taken', { slots: 1 });
+  const ws = await h.connect(`${url}/connect`);
+  const row = slotRow(registry, 'taken', 1);
+
+  // Released from the Grid UI, and another claimer (writing claimedBy NULL) gets the slot before the sync.
+  Object.assign(row, { inUse: 1, claimedBy: null, lastRun: Date.now() + 5 });
+  await hub.syncClaims();
+  assert.equal(hub.claims.size, 1, 'kept until its session ends');
+  // The other claimer is done meanwhile; the hub still pipes the first session there, so a new client waits.
+  row.inUse = 0;
+  await assert.rejects(h.connect(`${url}/connect`), (err) => err.status === 503 && /1 matching slot, busy/.test(err.body));
+  ws.close();
+  await h.waitFor(() => hub.claims.size === 0, { what: 'the lost claim goes when its session ends' });
+  const next = await h.connect(`${url}/connect`);
+  assert.equal((await whoami(next)).node, 'taken');
+  next.close();
+  await h.waitFor(() => !row.inUse, { what: 'released' });
+
+  // An older sweep frees a live session's slot, and a claimer that leaves claimedBy alone (an old main.py)
+  // claims it before the sync: the row still says this hub, but its stamp is another claim's.
+  const third = await h.connect(`${url}/connect`);
+  Object.assign(row, { inUse: 1, lastRun: row.lastRun + 1000 });
+  await hub.syncClaims();
+  third.close();
+  await h.sleep(300);
+  assert.equal(row.inUse, 1, 'the end of the hub\'s session left the other claim alone');
+  assert.match(row.claimedBy, /^hub:/);
+});
+
+test('hubs sharing a database: each frees only the claims of a hub whose lease ran out', async () => {
+  const registry = new MemoryRegistry();
+  const a = await startHub({ claimSyncMs: 60000, hubLeaseMs: 3000 }, registry);
+  await fakeNode(a.url, 'n1', { slots: 2 });
+  const ws = await h.connect(`${a.url}/connect`);
+  const [claim] = [...a.hub.claims.values()];
+  const row = registry.slotById(claim.id);
+  const other = [...registry.slots.get('n1').values()].find((s) => s !== row);
+  assert.ok(registry.hubs.has(a.hub.instance));
+
+  // A second hub starts on the same database: hub a's live claim is left alone, and b says a is there.
+  const { lines, log } = recorder();
+  const b = await startHub({ claimSyncMs: 60000, hubLeaseMs: 3000 }, registry, log);
+  assert.equal(row.inUse, 1);
+  assert.equal(row.claimedBy, claim.claimedBy);
+  assert.ok(lines.some((l) => l.startsWith(`warn another hub uses this database: instance ${a.hub.instance}`)), lines.join('\n'));
+  await b.hub.syncClaims();
+  assert.equal(row.inUse, 1);
+  assert.equal(a.hub.claims.size, 1);
+
+  // A hub that crashed with a session open: once its lease runs out, hub b frees its claim.
+  Object.assign(other, { inUse: 1, claimedBy: 'hub:0badcafe:3', lastRun: Date.now() });
+  registry.hubs.set('0badcafe', { host: 'gone', port: 1, startedAt: Date.now() - 5000, lastSeen: Date.now() - 1000 });
+  await b.hub.syncClaims();
+  assert.equal(other.inUse, 1, 'its lease has not run out yet');
+  registry.hubs.get('0badcafe').lastSeen = Date.now() - 3500;
+  await b.hub.syncClaims();
+  assert.deepEqual([other.inUse, other.claimedBy], [0, null]);
+  assert.equal(registry.hubs.has('0badcafe'), false);
+  assert.deepEqual([row.inUse, row.claimedBy], [1, claim.claimedBy], 'hub a renews its lease, so its claim stays');
+
+  // A hub that stops cleanly gives its claims back and removes its row.
+  ws.close();
+  await a.hub.stop();
+  assert.equal(registry.hubs.has(a.hub.instance), false);
+  assert.ok(registry.hubs.has(b.hub.instance));
+  assert.equal(claimed(registry).length, 0);
+});
+
+test('a failed start-up release of a dead hub\'s claims is retried by the claim sync', async () => {
+  const registry = new MemoryRegistry();
+  await registry.register({ name: 'left', slots: [{ index: 1, healthy: true }], browsers: ['chromium'], playwrightVersion: '1.64.1', ephemeral: false });
+  Object.assign(slotRow(registry, 'left', 1), { inUse: 1, claimedBy: 'hub:deadbeef:1', lastRun: Date.now() });
+  const release = registry.releaseDeadHubClaims.bind(registry);
+  registry.releaseDeadHubClaims = async () => { throw new Error('ECONNRESET'); };
+  const { hub } = await startHub({ claimSyncMs: 60000 }, registry);
+  assert.equal(slotRow(registry, 'left', 1).inUse, 1);
+  registry.releaseDeadHubClaims = release;
+  await hub.syncClaims();
+  assert.deepEqual([slotRow(registry, 'left', 1).inUse, slotRow(registry, 'left', 1).claimedBy], [0, null]);
+});
+
+test('a queued client whose managed token is revoked or expires while it waits gets no session', async () => {
+  const crypto = require('node:crypto');
+  const mint = () => `pwgc_${crypto.randomBytes(32).toString('base64url')}`;
+  const registry = new MemoryRegistry();
+  const token = mint();
+  const row = registry.addToken(token, { kind: 'client', name: 'ci' });
+  const other = mint();
+  registry.addToken(other, { kind: 'client', name: 'other' });
+  const { lines, log } = recorder();
+  const { url, hub } = await startHub({ tokenCacheMs: 0, tokenRecheckMs: 60000 }, registry, log);
+  await fakeNode(url, 'solo');
+  const first = await h.connect(`${url}/connect?gateway_token=${token}`);
+  const queued = h.connect(`${url}/connect?gateway_token=${token}`);
+  const unaffected = h.connect(`${url}/connect`, { 'x-gateway-token': other });
+  await h.waitFor(() => hub.queue.length === 2, { what: 'both queued' });
+
+  row.revokedAt = new Date().toISOString();
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=${token}`), { status: 401 });
+  first.close(); // frees the slot: the revoked client is refused, the next one in line gets it
+  await assert.rejects(queued, (err) => err.status === 401 && /gateway token is revoked/.test(err.body));
+  assert.equal((await whoami(await unaffected)).node, 'solo');
+  assert.ok(lines.some((l) => /^warn client #2 127\.0\.0\.1 dropped after \d+\.\ds: client token pwgc_/.test(l)), lines.join('\n'));
+  assert.ok(lines.every((l) => !l.includes(token)));
+
+  // The periodic token re-check drops a queued client too, without waiting for a slot to free.
+  row.revokedAt = null;
+  row.expiresAt = new Date(Date.now() + 600).toISOString();
+  const waiting = h.connect(`${url}/connect?gateway_token=${token}`);
+  await h.waitFor(() => hub.queue.length === 1, { what: 'queued again' });
+  await h.sleep(700);
+  await hub.recheckTokens();
+  await assert.rejects(waiting, (err) => err.status === 401 && /gateway token is expired/.test(err.body));
+  assert.equal(hub.queue.length, 0);
+});
+
+test('chromium goes to the narrowest node first, keeping slots that serve other browsers for them', async () => {
+  const gw = (name, browsers, total) => ({ name, gateway: true, connected: true, browsers, agent: { slots: Array(total).fill({ healthy: true }) }, slots: [] });
+  assert.equal(R.breadth(['chromium'], 'chromium'), 0);
+  assert.equal(R.breadth(['chromium', 'chrome', 'msedge'], 'chromium'), 0, 'channels are chromium');
+  assert.equal(R.breadth(['chromium', 'firefox'], 'chromium'), 1);
+  assert.equal(R.breadth(['chromium', 'firefox'], null), 2);
+  assert.equal(R.breadth([], 'chromium'), Infinity);
+  const chrome = gw('chrome', ['chromium'], 4);
+  const fox = gw('fox', ['chromium', 'firefox'], 4);
+  // fox has all 4 free, chrome 1 of 4: chromium still goes to chrome.
+  const free = [{ server: chrome, row: { id: 1 } }, ...[2, 3, 4, 5].map((id) => ({ server: fox, row: { id } }))];
+  for (const random of [() => 0, () => 0.99]) assert.equal(R.choose(free, random, 'chromium').server, chrome);
+  assert.equal(R.choose(free.slice(1), () => 0, 'chromium').server, fox, 'and to fox once chrome is full');
+
+  // End to end: 4 chromium sessions, then 4 firefox ones, on 4 + 4 slots: nobody waits.
+  const { url, hub } = await startHub({ queueTimeoutMs: 500 });
+  await fakeNode(url, 'chrome-only', { slots: 4, browsers: ['chromium'] });
+  await fakeNode(url, 'fox-too', { slots: 4, browsers: ['chromium', 'firefox'] });
+  const chromium = [];
+  for (let i = 0; i < 4; i++) chromium.push((await whoami(await h.connect(`${url}/connect`, browserHeaders('chromium')))).node);
+  assert.deepEqual(chromium, ['chrome-only', 'chrome-only', 'chrome-only', 'chrome-only']);
+  for (let i = 0; i < 4; i++) assert.equal((await whoami(await h.connect(`${url}/connect`, browserHeaders('firefox')))).node, 'fox-too');
+  assert.equal(hub.queue.length, 0);
 });
 
 test('the database down: routing fails closed with 503', async () => {
@@ -606,7 +801,7 @@ test('static hosts: the hub dials them itself, forwards the headers without the 
 
 test('static hosts: a refusal or an unreachable host is a connect failure, and the client moves on', async () => {
   const registry = new MemoryRegistry();
-  const refusing = await staticHost({ refuse: true });
+  const refusing = await staticHost({ refuse: 403 });
   const gone = await closedPort();
   registry.addStaticSlot('127.0.0.1', refusing.port);
   registry.addStaticSlot('localhost', gone);
@@ -618,7 +813,46 @@ test('static hosts: a refusal or an unreachable host is a connect failure, and t
   assert.equal(slotRow(registry, '127.0.0.1', refusing.port).failCount, 1);
   assert.equal(slotRow(registry, 'localhost', gone).failCount, 1);
   assert.equal(claimed(registry).length, 0);
-  await assert.rejects(h.connect(`${url}/connect?node=127.0.0.1`), (err) => err.status === 502 && /answered HTTP 428: version mismatch/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=127.0.0.1`), (err) => err.status === 502 && /answered HTTP 403: Forbidden/.test(err.body));
+});
+
+// Static hosts (and nodes that don't know their version) take a client of any version, so run-server
+// is the one to refuse it. That is the client's doing: it costs no slot a failure and isn't tried
+// elsewhere, so a client on the wrong version can't put healthy slots into cooldown.
+test('a run-server 428 for the client\'s Playwright version is passed on and never counted against a slot', async () => {
+  const registry = new MemoryRegistry();
+  const hosts = [await staticHost({ refuse: 428 }), await staticHost({ refuse: 428 })];
+  for (const host of hosts) registry.addStaticSlot('127.0.0.1', host.port);
+  const { url } = await startHub({ connectAttempts: 3, failThreshold: 3 }, registry);
+  const old = (version) => browserHeaders('chromium', version);
+
+  for (let i = 0; i < 4; i++) {
+    await assert.rejects(h.connect(`${url}/connect`, old('1.50.0')), (err) => err.status === 428 && !/tried/.test(err.body)
+      && /^Playwright version mismatch: the client is 1\.50, static host 127\.0\.0\.1:\d+ runs 1\.64\. Keep the client/.test(err.body));
+  }
+  assert.equal(hosts.reduce((n, host) => n + host.seen.length, 0), 4, 'one host per client: no failover');
+  assert.deepEqual(hosts.map((host) => slotRow(registry, '127.0.0.1', host.port).failCount), [0, 0]);
+  assert.ok((await registry.slotStates(3, 300000)).every((row) => !row.failing && !row.inUse));
+
+  // A node that doesn't know its Playwright version: the same.
+  const unknown = await fakeNode(url, 'unknown-version', { playwrightVersion: 'unknown', mode: 'fail', failStatus: 428 });
+  for (let i = 0; i < 4; i++) {
+    await assert.rejects(h.connect(`${url}/connect`, old('1.50.0')),
+      (err) => err.status === 428 && /the client is 1\.50, node unknown-version slot 1 runs 1\.64\./.test(err.body));
+  }
+  assert.equal(unknown.opens.length, 4);
+  assert.equal(slotRow(registry, 'unknown-version', 1).failCount, 0);
+  // So a client on the right version gets that slot at once.
+  unknown.mode = 'echo';
+  const ws = await h.connect(`${url}/connect`, old('1.64.1'));
+  assert.equal((await whoami(ws)).node, 'unknown-version');
+  ws.close();
+
+  // An agent from before open-failed carried the status: the 428 in its message is enough.
+  await fakeNode(url, 'old-agent', { playwrightVersion: 'unknown', mode: 'fail', failStatus: 428, oldAgent: true });
+  await assert.rejects(h.connect(`${url}/connect?node=old-agent`, old('1.50.0')), { status: 428 });
+  assert.equal(slotRow(registry, 'old-agent', 1).failCount, 0);
+  assert.equal(claimed(registry).length, 0);
 });
 
 test('logs one line per routing decision and per queue timeout, and never a token', async () => {
@@ -627,8 +861,9 @@ test('logs one line per routing decision and per queue timeout, and never a toke
   await fakeNode(url, 'logged');
   await h.connect(`${url}/connect?gateway_token=s3cret-token`, browserHeaders('chromium'));
   await assert.rejects(h.connect(`${url}/connect`, { 'x-gateway-token': 's3cret-token', ...browserHeaders('chromium') }), { status: 503 });
-  assert.ok(lines.some((l) => /^info client 127\.0\.0\.1 -> logged\/1 \(chromium, waited \d+\.\ds\)$/.test(l)), lines.join('\n'));
-  assert.ok(lines.some((l) => /^warn client 127\.0\.0\.1 gave up after \d+\.\ds: no free chromium slot \(1 matching slot, busy\)$/.test(l)), lines.join('\n'));
+  assert.ok(lines.some((l) => /^info client #1 127\.0\.0\.1 -> logged\/1 \(chromium, waited \d+\.\ds\)$/.test(l)), lines.join('\n'));
+  assert.ok(lines.some((l) => /^info client #2 127\.0\.0\.1 waits for a free chromium slot: 1 matching slot, busy$/.test(l)), lines.join('\n'));
+  assert.ok(lines.some((l) => /^warn client #2 127\.0\.0\.1 gave up after \d+\.\ds: no free chromium slot \(1 matching slot, busy\)$/.test(l)), lines.join('\n'));
   assert.ok(lines.every((l) => !l.includes('s3cret-token')));
 });
 

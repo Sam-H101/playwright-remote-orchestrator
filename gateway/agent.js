@@ -345,9 +345,11 @@ class Agent extends EventEmitter {
     const { config, log } = this;
     const id = typeof msg.id === 'string' && /^[0-9a-f-]{36}$/.test(msg.id) ? msg.id : null;
     if (!id) return log.warn('ignoring an open frame without a valid id');
-    const failed = (message) => {
+    // status: the HTTP status run-server refused the upgrade with, so the hub can tell the client's fault
+    // (428: its Playwright version) from the slot's.
+    const failed = (message, status = undefined) => {
       log.warn(`session ${id}: ${message}`);
-      this.send({ type: 'open-failed', id, message });
+      this.send({ type: 'open-failed', id, message, status });
     };
     const slot = this.slots[msg.slot - 1];
     if (!slot) return failed(`no slot ${msg.slot}`);
@@ -369,7 +371,7 @@ class Agent extends EventEmitter {
       res.on('data', (chunk) => { if (body.length < 2000) body += chunk; });
       res.on('end', () => {
         settled = true;
-        failed(`run-server on port ${slot.port} answered HTTP ${res.statusCode}${body.trim() ? `: ${body.trim()}` : ''}`);
+        failed(`run-server on port ${slot.port} answered HTTP ${res.statusCode}${body.trim() ? `: ${body.trim()}` : ''}`, res.statusCode);
         upstream.terminate();
       });
       res.on('error', () => {});

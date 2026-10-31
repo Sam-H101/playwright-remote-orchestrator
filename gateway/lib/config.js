@@ -52,10 +52,13 @@ function hubConfig(env = process.env) {
     queueTimeoutMs: int(env.GATEWAY_QUEUE_TIMEOUT_S, 60, 'GATEWAY_QUEUE_TIMEOUT_S', 0, 86400) * 1000,
     queueMax: int(env.GATEWAY_QUEUE_MAX, 200, 'GATEWAY_QUEUE_MAX', 0, 100000),
     connectAttempts: int(env.GATEWAY_CONNECT_ATTEMPTS, 3, 'GATEWAY_CONNECT_ATTEMPTS', 1, 20),
-    // The same names and defaults as src/database.py: a slot with this many consecutive connect failures
-    // is skipped, except for one try per cooldown counted from its last run.
+    // A slot with this many consecutive connect failures is skipped, except for one try per cooldown
+    // counted from its last run. The Grid UI reads the same names with the same defaults (ui/store.py).
     failThreshold: int(env.SLOT_FAIL_THRESHOLD || env.GRID_FAIL_THRESHOLD, 3, 'SLOT_FAIL_THRESHOLD', 0, 1000000),
     failCooldownMs: int(env.SLOT_FAIL_COOLDOWN_S, 300, 'SLOT_FAIL_COOLDOWN_S', 0, 86400 * 365) * 1000,
+    // A hub renews its row in hubs every third of this; one not renewed for this long is taken for gone
+    // and its claims are freed. The Grid UI reads it too, to tell a long session from a leftover claim.
+    hubLeaseMs: int(env.GATEWAY_HUB_LEASE_S, 90, 'GATEWAY_HUB_LEASE_S', 10, 86400) * 1000,
   };
 }
 

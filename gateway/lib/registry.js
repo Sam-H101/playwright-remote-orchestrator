@@ -23,17 +23,23 @@ const { hashToken } = require('./protocol');
 //   touchToken(id)            set the token's lastUsedAt to now
 // Routing /connect. A slot is a portStatus row and its portUsage row; `id` is their shared id.
 //   slotStates(threshold, cooldownMs)  every slot as { id, server, slot, healthy, inUse, failCount, failing,
-//                             retryInMs, claimedBy, node }: failing is failCount >= threshold within cooldownMs of
-//                             its last run (src/database.py's rule), retryInMs how long until it may be tried
-//                             again, node its nodes row ({ online, browsers: [], playwrightVersion }) or null for
-//                             a static host
-//   claimSlot(id, claimedBy)  inUse 0 -> 1 with LastRunDate now, atomically; resolves whether this call got it
-//   releaseSlot(id, claimedBy)  inUse = 0 with LastRunDate now, only while the claim is still claimedBy's;
-//                             resolves whether it was
-//   reassertClaim(id, claimedBy)  inUse 0 -> 1 again for a claim the stale-claim sweep freed under a live
-//                             session (that sweep leaves claimedBy alone); resolves whether it got it back
-//   releaseClaims(prefix)     free every claim whose claimedBy starts with prefix (a restarted hub's leftovers);
-//                             resolves how many were in use
+//                             retryInMs, claimedBy, lastRun, node }: failing is failCount >= threshold within
+//                             cooldownMs of its last run (the rule the Grid UI shows too), retryInMs how long until
+//                             it may be tried again, lastRun its LastRunDate as an opaque stamp (only ever compared
+//                             with claimSlot's), node its nodes row ({ online, browsers: [], playwrightVersion })
+//                             or null for a static host
+//   claimSlot(id, claimedBy)  inUse 0 -> 1 with LastRunDate now, atomically; resolves the claim's stamp
+//                             (its LastRunDate), or null when someone else has the slot
+//   releaseSlot(id, claimedBy, run)  inUse = 0 with LastRunDate now, only while the row still holds that
+//                             claim (claimedBy and, when given, the stamp `run`); resolves whether it did
+//   reassertClaim(id, claimedBy, run)  inUse 0 -> 1 again for a claim an older stale-claim sweep freed
+//                             under a live session (it left claimedBy and LastRunDate alone); resolves whether it did
+//   renewLease(instance, { host, port })  this hub's row in hubs, lastSeen now
+//   liveHubs(leaseMs)         hubs heard from within leaseMs, as { instance, host, port, lastSeenMs }
+//   releaseDeadHubClaims(instance, leaseMs)  free the claims ('hub:<instance>:<n>') of every hub except
+//                             `instance` that has no hubs row heard from within leaseMs, and drop those rows;
+//                             resolves how many slots were in use
+//   leaveHub(instance)        delete this hub's row (it stopped and gave its claims back)
 //   addFailure(id), resetFailures(id)  failCount + 1, failCount = 0
 //   close()
 
@@ -42,6 +48,11 @@ function splitSchema(sql) {
     .map((stmt) => stmt.split(/\r?\n/).filter((line) => !/^\s*--/.test(line)).join('\n').trim())
     .filter(Boolean);
 }
+
+// A claim's stamp narrows an UPDATE to that claim; true stands for "claimed, stamp not read back".
+const stamped = (run) => (run && run !== true ? ' AND LastRunDate = ?' : '');
+const stampParam = (run) => (run && run !== true ? [run] : []);
+const likeEscape = (text) => String(text).replace(/[\\%_]/g, '\\$&');
 
 const healthyList = (slots) => slots.filter((s) => s.healthy).map((s) => s.index).join(',');
 
@@ -84,7 +95,7 @@ class MySqlRegistry {
       timezone: 'Z',
       dateStrings: true,
     });
-    // Same idea as src/database.py: MySQL may still be starting when the hub comes up.
+    // MySQL may still be starting when the hub comes up (src/database.py waits for it the same way).
     for (let attempt = 1; ; attempt++) {
       try {
         await this.applySchema();
@@ -230,12 +241,12 @@ class MySqlRegistry {
     await this.query('UPDATE accessTokens SET lastUsedAt = UTC_TIMESTAMP() WHERE id = ?', [id]);
   }
 
-  // The free-slot rule of src/database.py (FREE_SLOTS_SQL), but for every slot, so the hub can also tell
-  // busy from unhealthy from failing. The time arithmetic stays on the database clock, as it does there.
+  // Every slot with what the hub needs to tell free from busy, unhealthy and failing. The failing and
+  // cooldown arithmetic stays on the database clock, as the Grid UI's does.
   async slotStates(threshold, cooldownMs) {
     const cooldown = Math.ceil(cooldownMs / 1000);
     const [rows] = await this.query(
-      `SELECT ps.id, ps.PortServer AS server, ps.PortNumber AS slot, ps.PortStatus AS status, pu.inUse, pu.failCount, pu.claimedBy,
+      `SELECT ps.id, ps.PortServer AS server, ps.PortNumber AS slot, ps.PortStatus AS status, pu.inUse, pu.failCount, pu.claimedBy, pu.LastRunDate AS lastRun,
          (pu.failCount >= ? AND pu.LastRunDate IS NOT NULL AND pu.LastRunDate >= UTC_TIMESTAMP() - INTERVAL ? SECOND) AS failing,
          TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), pu.LastRunDate + INTERVAL ? SECOND) AS retryIn,
          n.name AS nodeName, n.online, n.browsers, n.playwrightVersion
@@ -249,7 +260,7 @@ class MySqlRegistry {
       return {
         id: Number(r.id), server: r.server, slot: Number(r.slot), healthy: Number(r.status) === 1,
         inUse: Number(r.inUse) === 1, failCount: Number(r.failCount), failing,
-        retryInMs: failing ? (Math.max(0, Number(r.retryIn)) + 1) * 1000 : 0, claimedBy: r.claimedBy ?? null,
+        retryInMs: failing ? (Math.max(0, Number(r.retryIn)) + 1) * 1000 : 0, claimedBy: r.claimedBy ?? null, lastRun: r.lastRun ?? null,
         node: r.nodeName == null ? null : {
           online: Number(r.online) === 1, browsers: splitList(r.browsers), playwrightVersion: r.playwrightVersion ?? null,
         },
@@ -257,30 +268,62 @@ class MySqlRegistry {
     });
   }
 
-  // The same conditional UPDATE as set_in_use_port in src/database.py, so two claimers never both win.
+  // The conditional UPDATE every claimer uses (inUse 0 -> 1), so two claimers never both win. The stamp
+  // is read back so a later look can tell this claim from one made over it by a claimer that leaves
+  // claimedBy alone.
   async claimSlot(id, claimedBy) {
     const [result] = await this.query(
       'UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP(), claimedBy = ? WHERE id = ? AND inUse = 0', [claimedBy, id]);
-    return result.affectedRows > 0;
+    if (!result.affectedRows) return null;
+    const [[row]] = await this.query('SELECT LastRunDate FROM portUsage WHERE id = ? AND claimedBy = ?', [id, claimedBy]);
+    return (row && row.LastRunDate) || true;
   }
 
-  async releaseSlot(id, claimedBy) {
+  async releaseSlot(id, claimedBy, run = null) {
     const [result] = await this.query(
-      'UPDATE portUsage SET inUse = 0, LastRunDate = UTC_TIMESTAMP(), claimedBy = NULL WHERE id = ? AND claimedBy = ?', [id, claimedBy]);
+      `UPDATE portUsage SET inUse = 0, LastRunDate = UTC_TIMESTAMP(), claimedBy = NULL WHERE id = ? AND claimedBy = ?${stamped(run)}`,
+      [id, claimedBy, ...stampParam(run)]);
     return result.affectedRows > 0;
   }
 
-  async reassertClaim(id, claimedBy) {
-    const [result] = await this.query('UPDATE portUsage SET inUse = 1 WHERE id = ? AND inUse = 0 AND claimedBy = ?', [id, claimedBy]);
-    return result.affectedRows > 0;
-  }
-
-  async releaseClaims(prefix) {
-    const like = `${prefix.replace(/[\\%_]/g, '\\$&')}%`;
+  async reassertClaim(id, claimedBy, run = null) {
     const [result] = await this.query(
-      'UPDATE portUsage SET inUse = 0, LastRunDate = UTC_TIMESTAMP(), claimedBy = NULL WHERE claimedBy LIKE ? AND inUse = 1', [like]);
-    await this.query('UPDATE portUsage SET claimedBy = NULL WHERE claimedBy LIKE ?', [like]);
+      `UPDATE portUsage SET inUse = 1 WHERE id = ? AND inUse = 0 AND claimedBy = ?${stamped(run)}`, [id, claimedBy, ...stampParam(run)]);
+    return result.affectedRows > 0;
+  }
+
+  async renewLease(instance, { host = null, port = null } = {}) {
+    await this.query(
+      `INSERT INTO hubs (instance, host, port, startedAt, lastSeen) VALUES (?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+       ON DUPLICATE KEY UPDATE lastSeen = UTC_TIMESTAMP(), host = ?, port = ?`,
+      [instance, host, port, host, port]);
+  }
+
+  async liveHubs(leaseMs) {
+    const [rows] = await this.query(
+      `SELECT instance, host, port, TIMESTAMPDIFF(SECOND, lastSeen, UTC_TIMESTAMP()) AS ago FROM hubs
+       WHERE lastSeen >= UTC_TIMESTAMP() - INTERVAL ? SECOND`, [Math.ceil(leaseMs / 1000)]);
+    return rows.map((r) => ({
+      instance: r.instance, host: r.host, port: r.port == null ? null : Number(r.port), lastSeenMs: Math.max(0, Number(r.ago)) * 1000,
+    }));
+  }
+
+  // The instance is the middle of 'hub:<instance>:<n>'. The hub that asks is never taken for dead, even
+  // if its own lease lapsed while the database was away.
+  async releaseDeadHubClaims(instance, leaseMs) {
+    const lease = Math.ceil(leaseMs / 1000);
+    const dead = `claimedBy LIKE 'hub:%' AND claimedBy NOT LIKE ? AND SUBSTRING_INDEX(SUBSTRING_INDEX(claimedBy, ':', 2), ':', -1) NOT IN
+      (SELECT instance FROM hubs WHERE lastSeen >= UTC_TIMESTAMP() - INTERVAL ? SECOND)`;
+    const params = [`hub:${likeEscape(instance)}:%`, lease];
+    const [result] = await this.query(
+      `UPDATE portUsage SET inUse = 0, LastRunDate = UTC_TIMESTAMP(), claimedBy = NULL WHERE inUse = 1 AND ${dead}`, params);
+    await this.query(`UPDATE portUsage SET claimedBy = NULL WHERE inUse = 0 AND ${dead}`, params);
+    await this.query('DELETE FROM hubs WHERE instance <> ? AND (lastSeen IS NULL OR lastSeen < UTC_TIMESTAMP() - INTERVAL ? SECOND)', [instance, lease]);
     return result.affectedRows;
+  }
+
+  async leaveHub(instance) {
+    await this.query('DELETE FROM hubs WHERE instance = ?', [instance]);
   }
 
   async addFailure(id) {
@@ -378,6 +421,7 @@ class MemoryRegistry {
     this.tokens = new Map(); // id -> accessTokens row; tests add them with addToken
     this.nextTokenId = 1;
     this.nextSlotId = 1;
+    this.hubs = new Map(); // instance -> { host, port, startedAt, lastSeen (ms) }
   }
 
   newSlot(status) {
@@ -504,7 +548,7 @@ class MemoryRegistry {
         const failing = s.failCount >= threshold && s.lastRun !== null && s.lastRun >= now - cooldownMs;
         out.push({
           id: s.id, server, slot: number, healthy: s.status === 1, inUse: !!s.inUse, failCount: s.failCount, failing,
-          retryInMs: failing ? s.lastRun + cooldownMs - now : 0, claimedBy: s.claimedBy,
+          retryInMs: failing ? s.lastRun + cooldownMs - now : 0, claimedBy: s.claimedBy, lastRun: s.lastRun,
           node: node ? { online: !!node.online, browsers: splitList(node.browsers), playwrightVersion: node.playwrightVersion ?? null } : null,
         });
       }
@@ -514,30 +558,46 @@ class MemoryRegistry {
 
   async claimSlot(id, claimedBy) {
     const slot = this.slotById(id);
-    if (!slot || slot.inUse) return false;
-    Object.assign(slot, { inUse: 1, lastRun: Date.now(), claimedBy });
+    if (!slot || slot.inUse) return null;
+    // A stamp of its own per claim, as LastRunDate is (bar its one-second resolution).
+    const lastRun = Math.max(Date.now(), (slot.lastRun ?? 0) + 1);
+    Object.assign(slot, { inUse: 1, lastRun, claimedBy });
+    return lastRun;
+  }
+
+  async releaseSlot(id, claimedBy, run = null) {
+    const slot = this.slotById(id);
+    if (!slot || slot.claimedBy !== claimedBy || (run && run !== true && slot.lastRun !== run)) return false;
+    Object.assign(slot, { inUse: 0, lastRun: Math.max(Date.now(), (slot.lastRun ?? 0) + 1), claimedBy: null });
     return true;
   }
 
-  async releaseSlot(id, claimedBy) {
+  async reassertClaim(id, claimedBy, run = null) {
     const slot = this.slotById(id);
-    if (!slot || slot.claimedBy !== claimedBy) return false;
-    Object.assign(slot, { inUse: 0, lastRun: Date.now(), claimedBy: null });
-    return true;
-  }
-
-  async reassertClaim(id, claimedBy) {
-    const slot = this.slotById(id);
-    if (!slot || slot.inUse || slot.claimedBy !== claimedBy) return false;
+    if (!slot || slot.inUse || slot.claimedBy !== claimedBy || (run && run !== true && slot.lastRun !== run)) return false;
     slot.inUse = 1;
     return true;
   }
 
-  async releaseClaims(prefix) {
+  async renewLease(instance, { host = null, port = null } = {}) {
+    const known = this.hubs.get(instance);
+    this.hubs.set(instance, { host, port, startedAt: known ? known.startedAt : Date.now(), lastSeen: Date.now() });
+  }
+
+  async liveHubs(leaseMs) {
+    const now = Date.now();
+    return [...this.hubs].filter(([, hub]) => hub.lastSeen >= now - leaseMs)
+      .map(([instance, hub]) => ({ instance, host: hub.host, port: hub.port, lastSeenMs: now - hub.lastSeen }));
+  }
+
+  async releaseDeadHubClaims(instance, leaseMs) {
+    const live = new Set((await this.liveHubs(leaseMs)).map((hub) => hub.instance));
+    live.add(instance);
     let freed = 0;
     for (const slots of this.slots.values()) {
       for (const slot of slots.values()) {
-        if (typeof slot.claimedBy !== 'string' || !slot.claimedBy.startsWith(prefix)) continue;
+        const match = /^hub:([^:]*):/.exec(typeof slot.claimedBy === 'string' ? slot.claimedBy : '');
+        if (!match || live.has(match[1])) continue;
         if (slot.inUse) {
           freed++;
           Object.assign(slot, { inUse: 0, lastRun: Date.now() });
@@ -545,7 +605,12 @@ class MemoryRegistry {
         slot.claimedBy = null;
       }
     }
+    for (const name of [...this.hubs.keys()]) if (!live.has(name)) this.hubs.delete(name);
     return freed;
+  }
+
+  async leaveHub(instance) {
+    this.hubs.delete(instance);
   }
 
   async addFailure(id) {

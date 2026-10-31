@@ -17,10 +17,12 @@ CREATE TABLE IF NOT EXISTS portStatus (
 )
 ;
 -- A slot is claimed by setting inUse 0 -> 1 with a conditional UPDATE, which also stamps
--- LastRunDate; releasing sets inUse = 0 and stamps it again. claimedBy names a claim the gateway
--- hub made for a /connect session ('hub:<hub instance>:<n>'; NULL for any other claimer): the hub
--- releases only its own claims, and frees every 'hub:' claim when it starts, since a hub that
--- stopped took its sessions with it. The hub adds the column to a portUsage table made before it.
+-- LastRunDate; releasing sets inUse = 0 and stamps it again. Every claimer sets claimedBy in its
+-- claim UPDATE: the gateway hub writes 'hub:<hub instance>:<n>' for a /connect session, anything
+-- else writes NULL. The hub releases only its own claims (claimedBy and LastRunDate unchanged), and a
+-- hub's claims live as long as its row in hubs: the stale-claim sweep of the checks leaves them alone,
+-- and a hub frees those of a hub whose lease ran out. The hub adds the column to a portUsage table
+-- made before it.
 CREATE TABLE IF NOT EXISTS portUsage (
     id INT PRIMARY KEY,
     portNumber INT NOT NULL,
@@ -76,5 +78,18 @@ CREATE TABLE IF NOT EXISTS accessTokens (
     revokedAt DATETIME NULL,
     UNIQUE KEY uq_token_hash (tokenHash),
     KEY idx_kind (kind)
+)
+;
+-- Gateway hubs using this database, one row per running hub process (instance is the <hub instance>
+-- of its claims). A hub renews lastSeen every GATEWAY_HUB_LEASE_S / 3 seconds and deletes its row
+-- when it stops. A row not renewed for GATEWAY_HUB_LEASE_S belongs to a hub that is gone: the other
+-- hubs, or the next one to start, free its claims and delete the row. The Grid UI reads it to tell a
+-- long session through a live hub from a claim nobody holds any more.
+CREATE TABLE IF NOT EXISTS hubs (
+    instance VARCHAR(16) NOT NULL PRIMARY KEY,
+    host VARCHAR(255) NULL,
+    port INT NULL,
+    startedAt DATETIME NULL,
+    lastSeen DATETIME NULL
 )
 ;

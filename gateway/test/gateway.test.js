@@ -94,7 +94,7 @@ test('pipes text and binary frames, forwards x-playwright-* headers and the quer
   assert.equal(info2.headers['x-gateway-token'], undefined);
 });
 
-test('answers 400, 401, 404, 502 and 504 with plain HTTP', async () => {
+test('answers 400, 401, 404, 428, 502 and 504 with plain HTTP', async () => {
   const { url } = await h.startHub({ clientToken: 'tok', openTimeoutMs: 800 });
   const agent = await h.startAgent(url, { name: 'n1', slots: 2 });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
@@ -105,9 +105,12 @@ test('answers 400, 401, 404, 502 and 504 with plain HTTP', async () => {
   await assert.rejects(h.connect(`${url}/connect?node=bad%20name&gateway_token=tok`), (err) => err.status === 400 && /node must be/.test(err.body));
   await assert.rejects(h.connect(`${url}/connect?gateway_token=tok`, { 'x-playwright-browser': 'fire fox' }), { status: 400 });
   await assert.rejects(h.connect(`${url}/elsewhere`), { status: 404 });
-  // Both slots refuse (as run-server does on a version mismatch); each is tried once.
-  await assert.rejects(h.connect(`${url}/connect?gateway_token=tok`, { 'x-fake-reject': '1' }),
-    (err) => err.status === 502 && /428/.test(err.body) && /version mismatch/.test(err.body) && /tried 2 slots/.test(err.body));
+  // Both slots refuse the session (as run-server does for a path or host it doesn't serve); each is tried once.
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=tok`, { 'x-fake-reject': '403' }),
+    (err) => err.status === 502 && /answered HTTP 403/.test(err.body) && /tried 2 slots/.test(err.body));
+  // run-server's 428 is about the client's Playwright version: passed on at once, no other slot tried.
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=tok`, { 'x-fake-reject': '428' }),
+    (err) => err.status === 428 && /^Playwright version mismatch: the client is 1\.50, node n1 slot \d runs 0\.0\./.test(err.body) && !/tried/.test(err.body));
 
   // A node that registers but never answers opens.
   const silentAgent = await h.rawAgent(url);
