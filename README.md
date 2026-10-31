@@ -7,12 +7,24 @@
 ## Limitations
 
 * Currently it does not know if the remote nodes are up or down. Future state it will use the failure counters + a pinger to mark them up / down.
-* queue.db needs to be shared along with the src files between the different containers. this is because it is using sqlite databases to determine which ports and hosts are free. 
+* Port and host state is kept in MySQL, so every orchestrator container just needs to reach the MySQL service. Ports are claimed with an atomic update, so two containers never get the same port.
 
 
 ## Building 
 
 1. Run docker-compose build
+
+## Running with MySQL
+
+The MySQL service lives in its own compose file, `docker-compose.mysql.yaml`. Start it together with the main file:
+
+```
+docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml up -d
+```
+
+Credentials default to `orchestrator` / `orchestrator`. Override them with a `.env` file or shell variables: `MYSQL_ROOT_PASSWORD`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`. The orchestrator containers read `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER` and `DB_PASSWORD`, which fall back to the `mysql:` section of `src/database.yaml`.
+
+To use an existing MySQL server instead, skip `docker-compose.mysql.yaml` and set those `DB_*` variables (or `src/database.yaml`) to point at it.
 
 
 ## Running the checks with local server
@@ -36,7 +48,7 @@ Bump the version in all three places together: `PLAYWRIGHT_VERSION` in `docker/p
 ## Configuration
 
 1. modify `src/database.yaml` with the servername, start port, and end port
-2. append `--fr true` to the docker-compose file and run it once. afterwords remove the `--fr true`. This is used to initialize the database the orchestrator uses to determine if ports are open or not.
+2. The tables are created and seeded automatically the first time a check runs. You can also do it up front by appending `--fr true` to the command and running it once. Re-running it is safe, and it adds rows for any new hosts or ports you add to `src/database.yaml`.
 
 ## Creating a check
 

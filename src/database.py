@@ -1,153 +1,143 @@
-import sqlite3
-from sqlite3 import Error
 import datetime
 import random
-from . import queues, config
+import time
+
+import pymysql
+
+from . import config
 
 c = config.config()
 
 
 class database():
-    dbfile = ""
-    mqueue = None
+    conn = None
 
     def __init__(self):
+        self.settings = c.get_mysql_config()
 
-        self.dbfile = 'src/{}'.format(c.get_db_file_file())
-        self.mqueue = queues.queues()
+    def create_connection(self, retries=10, delay=3):
+        """ create (or reuse) a connection to the MySQL database """
+        if self.conn is not None:
+            self.conn.ping(reconnect=True)
+            return self.conn
 
-    def create_connection(self):
-        """ create a database connection to a SQLite database """
-        conn = None
+        last_error = None
+        for _ in range(retries):
+            try:
+                self.conn = pymysql.connect(
+                    host=self.settings["host"],
+                    port=self.settings["port"],
+                    user=self.settings["user"],
+                    password=self.settings["password"],
+                    database=self.settings["database"],
+                    autocommit=True,
+                )
+                return self.conn
+            except pymysql.err.OperationalError as e:  # MySQL may still be starting
+                last_error = e
+                print("waiting for mysql: {}".format(e))
+                time.sleep(delay)
+        raise last_error
 
-        try:
-            conn = sqlite3.connect(self.dbfile)
-            print(sqlite3.version)
-        except Error as e:
-            print(e)
-        finally:
-            if conn:
-                conn.close()
-
-        def initial_db_start(self):
-        con = sqlite3.connect(self.dbfile)
-        cur = con.cursor()
+    def initial_db_start(self):
+        """ create the tables and seed a row per host/port. Safe to run more than once. """
+        con = self.create_connection()
         now = datetime.datetime.now()
-        id_ctr = 0
-        cur.execute("""
-           CREATE TABLE portStatus (
-           PortNumber INTEGER,
-           PortStatus INTEGER,
-           PortServer INTEGER,
-           LastUpdateTime BLOB,
-           id INTEGER PRIMARY KEY AUTOINCREMENT
-           )
+        with con.cursor() as cur:
+            cur.execute("""
+               CREATE TABLE IF NOT EXISTS portStatus (
+               id INT AUTO_INCREMENT PRIMARY KEY,
+               PortNumber INT NOT NULL,
+               PortStatus INT NOT NULL DEFAULT 0,
+               PortServer VARCHAR(255) NOT NULL,
+               LastUpdateTime DATETIME NULL,
+               UNIQUE KEY uq_server_port (PortServer, PortNumber)
+               )
+            """)
+            cur.execute("""
+               CREATE TABLE IF NOT EXISTS portUsage (
+               id INT PRIMARY KEY,
+               portNumber INT NOT NULL,
+               inUse TINYINT NOT NULL DEFAULT 0,
+               LastRunDate DATETIME NULL,
+               failCount INT NOT NULL DEFAULT 0,
+               KEY idx_in_use (inUse),
+               CONSTRAINT fk_port_usage_status FOREIGN KEY (id) REFERENCES portStatus (id) ON DELETE CASCADE
+               )
+            """)
 
-
-        """)
-        con.commit()
-        cur.execute("""
-           CREATE TABLE portUsage (
-           portNumber INTEGER,
-           inUse INTEGER,
-           LastRunDate BLOB,
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           failCount INTEGER
-           )
-        """)
-        con.commit()
-        for server in c.get_hosts_config():
-            host = server["server"]
-            start_port = server["port_start"]
-            end_port = server["port_end"]
-            i = start_port
-            while i < end_port:
-                try:  # Dirty method to create a database
-                    cur.execute(
-                        "INSERT INTO PortUsage(portNumber, InUse, LastRunDate, id, failCount)VALUES({}, 0, '', {}, 0)".format(
-                            i, id_ctr))
-                    cur.execute(
-                        "INSERT INTO portStatus (PortNumber, PortStatus, PortServer, LastUpdateTime, id) VALUES({}, 0, '{}', '{}', {})".format(
-                            i, host, now, id_ctr))
-                except:
-                    pass
-                i = i + 1
-                id_ctr = id_ctr + 1
-
-        con.commit()
-        con.close()
+            rows = []
+            for server in c.get_hosts_config():
+                host = server["server"]
+                for port in range(server["port_start"], server["port_end"]):
+                    rows.append((port, host, now))
+            if rows:
+                cur.executemany(
+                    "INSERT IGNORE INTO portStatus (PortNumber, PortStatus, PortServer, LastUpdateTime) VALUES (%s, 0, %s, %s)",
+                    rows)
+            cur.execute("""
+               INSERT IGNORE INTO portUsage (id, portNumber, inUse, LastRunDate, failCount)
+               SELECT id, PortNumber, 0, NULL, 0 FROM portStatus
+            """)
 
     def check_ports_not_in_use(self):
-        con = sqlite3.connect(self.dbfile)
-        cur = con.cursor()
+        con = self.create_connection()
         sql = """
-        SELECT ps.PortNumber, ps.id, ps.PortServer, pu.InUse  FROM portStatus ps Join PortUsage pu 
-        ON ps.id = pu.id 
-        WHERE pu.InUse = 0
+        SELECT ps.PortNumber, ps.id, ps.PortServer, pu.inUse FROM portStatus ps JOIN portUsage pu
+        ON ps.id = pu.id
+        WHERE pu.inUse = 0
         """
-        res = cur.execute(sql)
-        res = res.fetchall()
-
-        con.close()
-        return res
+        with con.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall()
 
     def set_in_use_port(self, portnum, id=None):
-        con = sqlite3.connect(self.dbfile)
-        cur = con.cursor()
-        if id is not None:
-            cur.execute(
-                "UPDATE PortUsage SET InUse = 1, LastRunDate = '{}' WHERE id = {}".format(datetime.datetime.now(), id))
-        else:
-            cur.execute("UPDATE PortUsage SET InUse = 1, LastRunDate = '{}' WHERE portNumber = {}".format(
-                datetime.datetime.now(), portnum[0]))
-
-        con.commit()
-        cur.close()
-        con.close()
+        """ mark a port in use. Returns True only if this call claimed a port that was free. """
+        con = self.create_connection()
+        with con.cursor() as cur:
+            if id is not None:
+                count = cur.execute(
+                    "UPDATE portUsage SET inUse = 1, LastRunDate = %s WHERE id = %s AND inUse = 0",
+                    (datetime.datetime.now(), id))
+            else:
+                count = cur.execute(
+                    "UPDATE portUsage SET inUse = 1, LastRunDate = %s WHERE portNumber = %s AND inUse = 0",
+                    (datetime.datetime.now(), portnum[0]))
+        return count > 0
 
     def release_in_use_port(self, portnum, id=None):
-        con = sqlite3.connect(self.dbfile)
-        cur = con.cursor()
-        if id is not None:
-            cur.execute(
-                "UPDATE PortUsage SET InUse = 0, LastRunDate = '{}' WHERE id = {}".format(datetime.datetime.now(), id))
-        else:
-            cur.execute("UPDATE PortUsage SET InUse = 0, LastRunDate = '{0}' WHERE portNumber = {1}".format(
-                datetime.datetime.now(), portnum[0]))
-        con.commit()
-        cur.close()
-        con.close()
+        con = self.create_connection()
+        with con.cursor() as cur:
+            if id is not None:
+                cur.execute(
+                    "UPDATE portUsage SET inUse = 0, LastRunDate = %s WHERE id = %s",
+                    (datetime.datetime.now(), id))
+            else:
+                cur.execute(
+                    "UPDATE portUsage SET inUse = 0, LastRunDate = %s WHERE portNumber = %s",
+                    (datetime.datetime.now(), portnum[0]))
 
     def increment_failure(self, port):
-        id = port[1]
-        con = sqlite3.connect(self.dbfile)
-        cur = con.cursor()
-        fail_count = cur.execute("SELECT failCount from PortUsage WHERE id = {}".format(id)).fetchone()
-        fail_count = fail_count[0]
-        fail_count = fail_count + 1
-        print(fail_count)
-        cur.execute("UPDATE PortUsage SET failCount = {} WHERE id = {}".format(fail_count, id))
-        con.commit()
-        cur.close()
-        con.close()
+        con = self.create_connection()
+        with con.cursor() as cur:
+            cur.execute("UPDATE portUsage SET failCount = failCount + 1 WHERE id = %s", (port[1],))
 
     def reset_failure(self, port):
-        con = sqlite3.connect(self.dbfile)
-        cur = con.cursor()
-        id = port[1]
-        cur.execute("UPDATE PortUsage SET failCount = 0 WHERE id = {}".format(id))
-        con.commit()
-        cur.close()
-        con.close()
+        con = self.create_connection()
+        with con.cursor() as cur:
+            cur.execute("UPDATE portUsage SET failCount = 0 WHERE id = %s", (port[1],))
 
-    def get_a_port(self):
-        self.create_connection()
-        ports = self.check_ports_not_in_use()
-        portnumselector = random.randint(0, ports.__len__() - 1)
-        port = ports[portnumselector]
-        self.set_in_use_port(port, port[1])
-        self.mqueue.put_item(port)
-        return self.mqueue.get_item()
+    def get_a_port(self, attempts=50):
+        # The conditional UPDATE in set_in_use_port is atomic, so two orchestrators
+        # can never claim the same port. If another one wins the race, pick again.
+        for _ in range(attempts):
+            ports = self.check_ports_not_in_use()
+            if not ports:
+                raise RuntimeError("no free ports available")
+            port = random.choice(ports)
+            if self.set_in_use_port(port, port[1]):
+                return port
+        raise RuntimeError("could not claim a free port after {} attempts".format(attempts))
 
     def release_port(self, port_num):
         self.release_in_use_port(port_num, port_num[1])
