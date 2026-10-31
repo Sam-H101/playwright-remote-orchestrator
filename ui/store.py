@@ -1,30 +1,60 @@
 """Read/write access to the orchestrator's slot tables for the Grid UI.
 
-Each row in portStatus/PortUsage is one Playwright server port ("slot").
-Slots are grouped by PortServer into nodes. A slot with InUse = 1 is a live
+Each row in portStatus/portUsage is one Playwright server port ("slot").
+Slots are grouped by PortServer into nodes. A slot with inUse = 1 is a live
 session, started at LastRunDate.
+
+The connection settings match the orchestrator's: the mysql section of
+src/database.yaml (or ORCHESTRATOR_CONFIG), overridden by DB_HOST, DB_PORT,
+DB_USER, DB_PASSWORD and DB_NAME.
 """
 import datetime
 import os
 import sqlite3
 
-DB_ENGINE = os.environ.get("GRID_DB_ENGINE", "sqlite").lower()
+import yaml
+
+DB_ENGINE = os.environ.get("GRID_DB_ENGINE", "mysql").lower()
 SQLITE_PATH = os.environ.get("GRID_DB_PATH", "src/runner.db")
-QUEUE_PATH = os.environ.get("GRID_QUEUE_PATH", "queue.db")
+CONFIG_PATH = os.environ.get("ORCHESTRATOR_CONFIG", "src/database.yaml")
 FAIL_THRESHOLD = int(os.environ.get("GRID_FAIL_THRESHOLD", "3"))
 STALE_AFTER_S = int(os.environ.get("GRID_STALE_AFTER", "3600"))
+
+_ENV_OVERRIDES = {
+    "host": "DB_HOST",
+    "port": "DB_PORT",
+    "user": "DB_USER",
+    "password": "DB_PASSWORD",
+    "database": "DB_NAME",
+}
+
+
+def mysql_settings():
+    settings = {}
+    try:
+        with open(CONFIG_PATH) as stream:
+            settings = dict((yaml.safe_load(stream) or {}).get("mysql") or {})
+    except OSError:
+        pass
+    for key, env in _ENV_OVERRIDES.items():
+        if os.environ.get(env):
+            settings[key] = os.environ[env]
+    settings["port"] = int(settings.get("port", 3306))
+    return settings
 
 
 def _connect():
     if DB_ENGINE == "mysql":
         import pymysql
 
+        s = mysql_settings()
         return pymysql.connect(
-            host=os.environ.get("MYSQL_HOST", "localhost"),
-            port=int(os.environ.get("MYSQL_PORT", "3306")),
-            user=os.environ.get("MYSQL_USER", "root"),
-            password=os.environ.get("MYSQL_PASSWORD", ""),
-            database=os.environ.get("MYSQL_DATABASE", "orchestrator"),
+            host=s.get("host", "localhost"),
+            port=s["port"],
+            user=s.get("user"),
+            password=s.get("password", ""),
+            database=s.get("database", "orchestrator"),
+            connect_timeout=5,
         )
     return sqlite3.connect(SQLITE_PATH, timeout=5)
 
@@ -46,31 +76,14 @@ def _parse_time(value):
         return None
 
 
-def queue_size():
-    """Pending items in the persist-queue directory, or None if unreadable."""
-    path = os.path.join(QUEUE_PATH, "data.db") if os.path.isdir(QUEUE_PATH) else QUEUE_PATH
-    if not os.path.exists(path):
-        return None
-    try:
-        con = sqlite3.connect("file:{}?mode=ro".format(path), uri=True, timeout=2)
-        try:
-            tables = [r[0] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'queue%'")]
-            return sum(con.execute("SELECT COUNT(*) FROM {}".format(t)).fetchone()[0] for t in tables)
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return None
-
-
 def snapshot():
     """Current state of every node, slot and live session."""
     con = _connect()
     try:
         cur = con.cursor()
         cur.execute("""
-            SELECT ps.id, ps.PortServer, ps.PortNumber, pu.InUse, pu.LastRunDate, pu.failCount
-            FROM portStatus ps JOIN PortUsage pu ON ps.id = pu.id
+            SELECT ps.id, ps.PortServer, ps.PortNumber, pu.inUse, pu.LastRunDate, pu.failCount
+            FROM portStatus ps JOIN portUsage pu ON ps.id = pu.id
             ORDER BY ps.PortServer, ps.PortNumber
         """)
         rows = cur.fetchall()
@@ -126,7 +139,6 @@ def snapshot():
         "generated": now.isoformat(timespec="seconds"),
         "fail_threshold": FAIL_THRESHOLD,
         "stale_after_s": STALE_AFTER_S,
-        "queue_size": queue_size(),
         "totals": {
             "nodes": len(node_list),
             "slots": total,
@@ -154,15 +166,15 @@ def _execute(sql, params):
 def release_slot(slot_id):
     """Force a stuck slot back to free."""
     return _execute(
-        "UPDATE PortUsage SET InUse = 0, LastRunDate = ? WHERE id = ?",
+        "UPDATE portUsage SET inUse = 0, LastRunDate = ? WHERE id = ?",
         (str(datetime.datetime.now()), slot_id))
 
 
 def reset_slot_failures(slot_id):
-    return _execute("UPDATE PortUsage SET failCount = 0 WHERE id = ?", (slot_id,))
+    return _execute("UPDATE portUsage SET failCount = 0 WHERE id = ?", (slot_id,))
 
 
 def reset_node_failures(host):
     return _execute(
-        "UPDATE PortUsage SET failCount = 0 WHERE id IN (SELECT id FROM portStatus WHERE PortServer = ?)",
+        "UPDATE portUsage SET failCount = 0 WHERE id IN (SELECT id FROM portStatus WHERE PortServer = ?)",
         (host,))

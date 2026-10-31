@@ -89,7 +89,6 @@ body {
 }
 
 .topbar-stats { margin-left: auto; display: flex; align-items: center; gap: 20px; }
-.stat-inline strong { margin-left: 4px; }
 
 .capacity { width: 170px; }
 .capacity-label { font-size: 12px; opacity: .85; margin-bottom: 3px; }

@@ -17,7 +17,6 @@
       <button role="tab" data-view="sessions" aria-selected="false">Sessions <span class="badge" id="session-badge">0</span></button>
     </nav>
     <div class="topbar-stats">
-      <div class="stat-inline" title="Items waiting in the port queue">Queue <strong id="queue-size">–</strong></div>
       <div class="capacity" title="Slots in use / total slots">
         <div class="capacity-label"><span id="cap-text">–</span></div>
         <div class="meter"><div class="meter-fill" id="cap-fill"></div></div>
@@ -41,7 +40,7 @@
         <span><i class="sq free"></i>Free</span>
         <span><i class="sq busy"></i>In use</span>
         <span><i class="sq warn"></i>Has failures</span>
-        <span><i class="sq bad"></i>Failing (≥ <span id="threshold">3</span>)</span>
+        <span><i class="sq bad"></i><span>Failing (≥ <span id="threshold">3</span>)</span></span>
       </div>
       <div class="nodes" id="nodes"></div>
     </section>

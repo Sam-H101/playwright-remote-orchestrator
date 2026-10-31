@@ -33,10 +33,10 @@
 
 ## Grid UI
 
-A management console in the style of a Selenium Grid dashboard lives in `ui/`. It shows every node (a host from `src/database.yaml`), its slots (ports), live sessions (ports currently in use), failure counts and the port queue, and refreshes every 5 seconds.
+A management console in the style of a Selenium Grid dashboard lives in `ui/`. It shows every node (a host from `src/database.yaml`), its slots (ports), live sessions (ports currently in use) and failure counts, and refreshes every 5 seconds. It reads the same MySQL database as the orchestrator, with the same `DB_*` settings.
 
-* With docker: `docker-compose up grid_ui`, then open http://localhost:4444
-* Locally: `pip install -r ui/requirements.txt`, then `python -m ui.app` from the repo root
+* With docker: `docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml up -d grid_ui mysql`, then open http://localhost:4444
+* Locally: `pip install -r ui/requirements.txt`, set the `DB_*` variables (or the `mysql:` section of `src/database.yaml`), then `python -m ui.app` from the repo root
 
 Pages and endpoints:
 
@@ -48,12 +48,12 @@ Settings (environment variables):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GRID_DB_PATH` | `src/runner.db` | SQLite database with the slot tables |
-| `GRID_QUEUE_PATH` | `queue.db` | persist-queue directory used for the queue size |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `mysql:` section of `src/database.yaml` | MySQL connection, shared with the orchestrator |
+| `ORCHESTRATOR_CONFIG` | `src/database.yaml` | Config file to read the `mysql:` section from |
 | `GRID_FAIL_THRESHOLD` | `3` | Failures at which a slot counts as failing |
 | `GRID_STALE_AFTER` | `3600` | Seconds after which a running session is flagged as stale (likely a check that died without releasing its port) |
 | `GRID_ADMIN_TOKEN` | unset | If set, management actions need this token |
-| `GRID_DB_ENGINE` | `sqlite` | Set to `mysql` to read from MySQL (`MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`) |
+| `GRID_DB_ENGINE` | `mysql` | Set to `sqlite` (with `GRID_DB_PATH`) to read a legacy `runner.db` instead |
 
 The compose file publishes the UI on 127.0.0.1 only. Set `GRID_ADMIN_TOKEN` before exposing it more widely.
 

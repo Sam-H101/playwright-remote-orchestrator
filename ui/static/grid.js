@@ -100,7 +100,6 @@
     var d = state.data;
     if (!d) return;
     var t = d.totals;
-    $("queue-size").textContent = d.queue_size == null ? "n/a" : d.queue_size;
     $("cap-text").textContent = t.busy + " / " + t.slots + " slots in use";
     $("cap-fill").style.width = (t.slots ? (100 * t.busy / t.slots) : 0) + "%";
     $("session-badge").textContent = d.sessions.length;
@@ -118,8 +117,7 @@
       ["Sessions", t.busy],
       ["Free slots", t.free],
       ["Failing slots", t.failing],
-      ["Stale sessions", t.stale],
-      ["Queue", d.queue_size == null ? "n/a" : d.queue_size]
+      ["Stale sessions", t.stale]
     ];
     $("tiles").innerHTML = tiles.map(function (x) {
       return '<div class="tile"><div class="label">' + esc(x[0]) + '</div><div class="value">' + esc(x[1]) + "</div></div>";
