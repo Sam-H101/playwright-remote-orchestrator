@@ -18,7 +18,6 @@ services:
       - ./logs/example_playwright/:/app/logs/
       - ./src/:/app/src
       - ./main.py:/app/main.py
-      - ./queue.db:/app/queue.db
       - ./full/example/example.py:/app/example.py
     command: python3 /app/main.py --fil example.py --fol /app/ -i 100
 

@@ -1,5 +1,13 @@
 
-dbfile: "runner.db" # Database File Name
+# MySQL connection settings. Each value can be overridden with an environment
+# variable (DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME), which is how
+# docker-compose.mysql.yaml wires the containers to the MySQL service.
+mysql:
+  host: "mysql"           # MySQL host name
+  port: 3306              # MySQL port
+  user: "orchestrator"    # MySQL user
+  password: "orchestrator" # MySQL password
+  database: "orchestrator" # MySQL database (schema) name
 hosts:
   - server: "" #Server name
     port_start: 3000 # Start Port for db creation
