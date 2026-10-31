@@ -56,9 +56,10 @@ class FakeCursor:
         self.db.executed.append((sql, args))
         rows = self.db.rows
         if sql == database.RECLAIM_STALE_SQL:
-            stale = [r for r in rows.values() if r["inUse"] and r["ago"] is not None and r["ago"] > args[0]]
+            stale = [r for r in rows.values() if r["inUse"] and r["ago"] is not None and r["ago"] > args[0]
+                     and not (r.get("claimedBy") or "").startswith("hub:")]
             for r in stale:
-                r["inUse"] = 0
+                r.update(inUse=0, claimedBy=None)
             return len(stale)
         if sql == "SELECT name FROM nodes":
             self.result = [(name,) for name in sorted(self.db.nodes)]
@@ -184,10 +185,23 @@ def test_reclaim_stale_claims_frees_only_old_claims(make_db, monkeypatch, caplog
     assert "freed 1 slot(s) claimed more than 2100 seconds ago" in caplog.text
 
 
+def test_reclaim_stale_claims_leaves_hub_sessions_alone_however_long_they_run(make_db, monkeypatch):
+    # A /connect session through the hub may run for hours; its claim goes with its hub's lease, not its age.
+    # Sweep after sweep it stays claimed, so it is never freed and claimed again in a loop.
+    monkeypatch.setattr(database, "STALE_CLAIM_AFTER", 2100)
+    db = make_db([(1, 1, "A", 1), (2, 2, "A", 1)])
+    db.conn.rows[1].update(inUse=1, ago=9000, claimedBy="hub:5c1e09a2:7")
+    db.conn.rows[2].update(inUse=1, ago=9000, claimedBy=None)
+    assert [db.reclaim_stale_claims() for _ in range(3)] == [1, 0, 0]
+    assert (db.conn.rows[1]["inUse"], db.conn.rows[1]["claimedBy"]) == (1, "hub:5c1e09a2:7")
+    assert db.conn.rows[2]["inUse"] == 0
+
+
 def test_stale_claim_default_covers_the_check_timeout(monkeypatch):
     sql = " ".join(database.RECLAIM_STALE_SQL.split())
-    # claimedBy is left alone, so the hub claims a live session's slot again (see src/schema.sql)
-    assert sql == "UPDATE portUsage SET inUse = 0 WHERE inUse = 1 AND LastRunDate < UTC_TIMESTAMP() - INTERVAL %s SECOND"
+    # The hub's claims live as long as its lease (see src/schema.sql); %% is pymysql's literal %.
+    assert sql == ("UPDATE portUsage SET inUse = 0, claimedBy = NULL WHERE inUse = 1 AND LastRunDate < UTC_TIMESTAMP() "
+                   "- INTERVAL %s SECOND AND (claimedBy IS NULL OR claimedBy NOT LIKE 'hub:%%')")
     assert database.STALE_CLAIM_AFTER > int(os.environ.get("CHECK_TIMEOUT_S", "1800"))
 
 
@@ -212,7 +226,7 @@ def test_lost_connection_reconnects(make_db, monkeypatch):
 def test_schema_statements_split():
     statements = database.schema_statements()
     assert [re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", s).group(1) for s in statements] == \
-        ["portStatus", "portUsage", "nodes", "accessTokens"]
+        ["portStatus", "portUsage", "nodes", "accessTokens", "hubs"]
     assert not any(line.lstrip().startswith("--") for s in statements for line in s.splitlines())
 
 

@@ -26,7 +26,7 @@ def make_db(tmp_path, monkeypatch):
         db = database.database(config.config())
         if not made:
             with db.create_connection().cursor() as cur:
-                cur.execute("DROP TABLE IF EXISTS portUsage, portStatus, nodes")
+                cur.execute("DROP TABLE IF EXISTS portUsage, portStatus, nodes, hubs")
         made.append(db)
         return db
     yield make
@@ -73,13 +73,17 @@ def test_seed_skip_and_prune(make_db):
 
 
 def test_stale_claims_are_reclaimed(make_db):
-    db = make_db(RUNNER)
+    db = make_db(RUNNER + "  - {server: runner02, port_start: 3000, port_end: 3001}\n")
     db.initial_db_start()
     sql(db, "UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP() - INTERVAL 2101 SECOND,"
-            " claimedBy = 'hub:0a1b2c3d:7' WHERE portNumber = 3000")
+            " claimedBy = 'hub:0a1b2c3d:7' WHERE id = (SELECT id FROM portStatus WHERE PortServer = 'runner01'"
+            " AND PortNumber = 3000)")
     sql(db, "UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP() - INTERVAL 60 SECOND"
-            " WHERE portNumber = 3001")
-    assert db.reclaim_stale_claims() == 1
-    # claimedBy stays, so a hub whose session still runs claims the slot again
-    assert sql(db, "SELECT portNumber, inUse, claimedBy FROM portUsage ORDER BY portNumber") == \
-        ((3000, 0, "hub:0a1b2c3d:7"), (3001, 1, None))
+            " WHERE id = (SELECT id FROM portStatus WHERE PortServer = 'runner01' AND PortNumber = 3001)")
+    sql(db, "UPDATE portUsage SET inUse = 1, LastRunDate = UTC_TIMESTAMP() - INTERVAL 2101 SECOND"
+            " WHERE id = (SELECT id FROM portStatus WHERE PortServer = 'runner02')")
+    # Only the old claim of a claimer other than the hub: a hub session runs as long as its hub's lease.
+    assert [db.reclaim_stale_claims() for _ in range(2)] == [1, 0]
+    assert sql(db, "SELECT ps.PortServer, ps.PortNumber, pu.inUse, pu.claimedBy FROM portUsage pu"
+                   " JOIN portStatus ps ON ps.id = pu.id ORDER BY ps.PortServer, ps.PortNumber") == \
+        (("runner01", 3000, 1, "hub:0a1b2c3d:7"), ("runner01", 3001, 1, None), ("runner02", 3000, 0, None))

@@ -20,17 +20,18 @@ def env_int(*names, default):
     return default
 
 
-# A claim older than this was left by a claimer that died mid-session, and is freed. The hub claims
-# the slot of every /connect session and takes back a live session's slot within 30 s if this frees
-# it, but keep it above the longest session anyway: a check is killed after CHECK_TIMEOUT_S.
+# A claim older than this was left by a claimer that died mid-session, and is freed. Keep it above
+# the longest session of such a claimer: a check is killed after CHECK_TIMEOUT_S.
 STALE_CLAIM_AFTER = env_int("SLOT_STALE_AFTER_S",
                             default=max(env_int("CHECK_TIMEOUT_S", default=1800), 1800) + 300)
 
-# Parameter: STALE_CLAIM_AFTER. LastRunDate is the claim time while inUse = 1. claimedBy is left as it
-# is: the hub tells a slot freed this way from one taken over by another claimer.
+# Parameter: STALE_CLAIM_AFTER. LastRunDate is the claim time while inUse = 1. The hub's claims
+# ('hub:...') are left alone: a /connect session may run for hours, and the hubs free the claims of a
+# hub that stopped by its lease (the hubs table), so their age says nothing.
 RECLAIM_STALE_SQL = """
-UPDATE portUsage SET inUse = 0
+UPDATE portUsage SET inUse = 0, claimedBy = NULL
 WHERE inUse = 1 AND LastRunDate < UTC_TIMESTAMP() - INTERVAL %s SECOND
+AND (claimedBy IS NULL OR claimedBy NOT LIKE 'hub:%%')
 """
 
 
@@ -55,7 +56,7 @@ class database():
         self.config = cfg or config.config()
         self.settings = self.config.get_mysql_config()
 
-    def create_connection(self, retries=10, delay=3):
+    def create_connection(self, retries=10, delay=3, connect_timeout=10):
         """ create (or reuse) a connection to the MySQL database """
         if self.conn is not None:
             try:
@@ -66,7 +67,7 @@ class database():
                 self.conn = None
 
         last_error = None
-        for _ in range(retries):
+        for attempt in range(retries):
             try:
                 self.conn = pymysql.connect(
                     host=self.settings["host"],
@@ -75,12 +76,14 @@ class database():
                     password=self.settings["password"],
                     database=self.settings["database"],
                     autocommit=True,
+                    connect_timeout=connect_timeout,
                 )
                 return self.conn
             except pymysql.err.OperationalError as e:  # MySQL may still be starting
                 last_error = e
-                print("waiting for mysql: {}".format(e))
-                time.sleep(delay)
+                if attempt + 1 < retries:
+                    print("waiting for mysql: {}".format(e))
+                    time.sleep(delay)
         raise last_error
 
     def initial_db_start(self):
@@ -134,7 +137,8 @@ class database():
                 """, [(id,) for id, _, _ in gone])
 
     def reclaim_stale_claims(self):
-        """ free slots claimed more than STALE_CLAIM_AFTER seconds ago. Returns how many. """
+        """ free slots claimed more than STALE_CLAIM_AFTER seconds ago by a claimer other than the hub.
+        Returns how many. """
         con = self.create_connection()
         with con.cursor() as cur:
             count = cur.execute(RECLAIM_STALE_SQL, (STALE_CLAIM_AFTER,))

@@ -20,6 +20,8 @@ from src import config, database
 CONNECT_FAILURE_MARKER = "connect_Failure"
 HUB_FAILURE_MARKER = "hub_Failure"
 CHECK_TIMEOUT = int(os.environ.get("CHECK_TIMEOUT_S", "1800"))
+# The tables and the stale-claim sweep are housekeeping: with MySQL down, one quick try and the check runs.
+HOUSEKEEPING_CONNECT_TIMEOUT = 5
 
 # Playwright reports a refused handshake as "BrowserType.connect: WebSocket error: <url without its query>
 # <status> <reason>", with the hub's own message on the next line (which pytest starts with "E").
@@ -31,8 +33,9 @@ CONNECT_TIMEOUT = re.compile(r"browserType\.connect: Timeout (\d+)ms exceeded", 
 HINTS = [
     (400, re.compile(r"^node "), "check GATEWAY_NODE"),
     (401, None, "check GATEWAY_CLIENT_TOKEN: it is missing, wrong, revoked or expired"),
-    (404, None, "check GATEWAY_NODE: the hub knows no node or static host of that name"),
-    (410, None, "the check builds a /connect/<node>/<slot> address; make it connect to PW_WS_ENDPOINT"),
+    (404, re.compile(r"^no node or static host "), "check GATEWAY_NODE: the hub knows no node or static host of "
+                                                    "that name"),
+    (404, None, "the hub has no /connect: it predates routing by browser, so upgrade it (or check GATEWAY_URL)"),
     (428, None, "the check's Playwright differs from the nodes' (see Upgrading Playwright in the README)"),
     (503, re.compile(r"^no free "), "every slot that fits stayed busy or failing for the hub's "
                                     "GATEWAY_QUEUE_TIMEOUT_S; add slots or spread the checks out"),
@@ -40,6 +43,8 @@ HINTS = [
     (503, re.compile(r"does not offer|no node offers"), "install the browser on a node and add it to "
                                                         "that node's BROWSERS (--browsers, -Browsers)"),
     (503, re.compile(r"database"), "the hub can't reach MySQL"),
+    (503, re.compile(r"endpoints were removed"), "the check builds a /connect/<node>/<slot> address; make it connect "
+                                                 "to PW_WS_ENDPOINT"),
     (502, None, "no slot the hub tried could open a browser; see the hub's log and the Grid UI"),
     (504, None, "the slots the hub tried did not answer in time; see the hub's log and the Grid UI"),
 ]
@@ -129,12 +134,17 @@ def datest(testfile, endpoint):
 
 def prepare_db(db, initialised):
     """ create the tables and sync hosts: once, then free stale claims. Returns whether the tables are
-    done. The hub routes the checks, so a database problem here is logged and the check runs anyway. """
+    done. The hub routes the checks, so this only gets one quick try at MySQL, and a database problem is
+    logged and the check runs anyway. """
     try:
+        db.create_connection(retries=1, connect_timeout=HOUSEKEEPING_CONNECT_TIMEOUT)
         if not initialised:
             db.initial_db_start()
             initialised = True
         db.reclaim_stale_claims()
+    except database.pymysql.err.MySQLError as e:
+        checklog.warning('could not reach MySQL to create the tables or free stale claims (%s); '
+                         'running the check anyway, retrying next run', e)
     except Exception:
         checklog.exception('could not create or seed the tables or free stale claims, retrying next run')
     return initialised

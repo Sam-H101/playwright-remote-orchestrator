@@ -18,7 +18,7 @@ def client_endpoint(url, client_token=None, node=None):
     base = url.rstrip("/")
     path = urlsplit(base).path
     if "/connect/" in path:
-        # The hub answers the removed /connect/<node>/<slot> endpoints with 410.
+        # The hub refuses the removed /connect/<node>/<slot> endpoints (503, saying so).
         raise ValueError("GATEWAY_URL must be the hub's address (e.g. ws://hub:4500), not a /connect/<node>/<slot> "
                          "endpoint like {!r}; set GATEWAY_NODE to stay on one node".format(path))
     # A GATEWAY_URL copied from a client snippet may already end in /connect.

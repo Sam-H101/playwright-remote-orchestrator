@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main  # noqa: E402
+from src import database  # noqa: E402
 
 ENDPOINT = "ws://hub:4500/connect?gateway_token=s3cret&node=runner-a"
 
@@ -40,10 +41,12 @@ E           {2}
 
 
 class FakeDb:
-    def __init__(self, fail_init=False, fail_reclaim=False):
+    def __init__(self, fail_init=False, fail_reclaim=False, unreachable=False):
         self.fail_init = fail_init
         self.fail_reclaim = fail_reclaim
+        self.unreachable = unreachable
         self.calls = []
+        self.connects = []
 
     def initial_db_start(self):
         self.calls.append("init")
@@ -55,6 +58,11 @@ class FakeDb:
         if self.fail_reclaim:
             raise RuntimeError("db down")
         return 0
+
+    def create_connection(self, retries=10, delay=3, connect_timeout=10):
+        self.connects.append((retries, connect_timeout))
+        if self.unreachable:
+            raise database.pymysql.err.OperationalError(2003, "Can't connect to MySQL server on 'mysql'")
 
 
 def fake_check(monkeypatch, result):
@@ -108,8 +116,11 @@ def test_redact_hides_only_the_token(endpoint, shown):
      "the hub answered 401: missing or bad gateway token (check GATEWAY_CLIENT_TOKEN"),
     (401, "Unauthorized", "gateway token is revoked", "gateway token is revoked (check GATEWAY_CLIENT_TOKEN"),
     (404, "Not Found", "no node or static host named zz is known to the hub", "(check GATEWAY_NODE: "),
+    # A hub from before /connect routing answers a bare /connect like any unknown path.
+    (404, "Not Found", "not found", "(the hub has no /connect: it predates routing by browser, so upgrade it"),
     (400, "Bad Request", "node must be 1-128 characters of A-Z a-z 0-9 . _ -", "(check GATEWAY_NODE)"),
-    (410, "Gone", "the /connect/<node>/<slot> endpoints were removed: connect to /connect", "PW_WS_ENDPOINT"),
+    (503, "Service Unavailable", "the /connect/<node>/<slot> endpoints were removed: connect to /connect and the "
+     "hub picks a free slot for the browser you launch (add ?node=<name> to stay on one node)", "PW_WS_ENDPOINT"),
     (428, "Precondition Required", "Playwright version mismatch: the client is 1.62, the nodes offering "
      "chromium run 1.64.", "Upgrading Playwright"),
     (503, "Service Unavailable", "no free chromium slot within 60s: 4 matching slots, all busy",
@@ -224,6 +235,36 @@ def test_database_problems_do_not_stop_the_check(monkeypatch, logs):
     db = FakeDb(fail_reclaim=True)
     assert main.run_test("example.py", ENDPOINT, 0, db=db, sleep=None) == 0
     assert db.calls == ["init", "reclaim"]
+
+
+def test_mysql_down_costs_one_quick_try_not_the_start_up_wait(monkeypatch, logs):
+    seen = fake_check(monkeypatch, (0, "ok"))
+    db = FakeDb(unreachable=True)
+    assert main.run_test("example.py", ENDPOINT, 0, db=db, sleep=None) == 0
+    assert seen["env"]["PW_WS_ENDPOINT"] == ENDPOINT
+    assert db.connects == [(1, main.HOUSEKEEPING_CONNECT_TIMEOUT)] and db.calls == []
+    assert "could not reach MySQL" in logs.text and "running the check anyway" in logs.text
+    assert "Traceback" not in logs.text
+
+
+def test_create_connection_tries_once_without_sleeping_when_asked(monkeypatch):
+    attempts, sleeps = [], []
+
+    def connect(**kwargs):
+        attempts.append(kwargs["connect_timeout"])
+        raise database.pymysql.err.OperationalError(2003, "Can't connect")
+    monkeypatch.setattr(database.pymysql, "connect", connect)
+    monkeypatch.setattr(database.time, "sleep", sleeps.append)
+    db = database.database.__new__(database.database)
+    db.conn = None
+    db.settings = {"host": "mysql", "port": 3306, "user": "u", "password": "p", "database": "d"}
+    with pytest.raises(database.pymysql.err.OperationalError):
+        db.create_connection(retries=1, connect_timeout=5)
+    assert (attempts, sleeps) == ([5], [])
+    attempts.clear()
+    with pytest.raises(database.pymysql.err.OperationalError):
+        db.create_connection(retries=3, delay=2)
+    assert (attempts, sleeps) == ([10, 10, 10], [2, 2])
 
 
 def test_interval_loop_survives_errors(monkeypatch):
