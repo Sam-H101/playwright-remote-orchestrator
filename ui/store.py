@@ -60,7 +60,14 @@ _schema_attempted = False
 
 
 class DatabaseUnavailable(Exception):
-    """The database can't be reached or queried."""
+    """The database can't be reached or queried.
+
+    str() is the full detail for the server log and signed-in admins; .public says what went wrong
+    without the file path or server names, for anyone else."""
+
+    def __init__(self, message, public=None):
+        super().__init__(message)
+        self.public = public or "The database can't be reached."
 
 
 class DatabasePermissionDenied(DatabaseUnavailable):
@@ -144,9 +151,29 @@ def _session():
             raise _MissingTables(str(e)) from e
         if _is_permission_error(e):
             raise DatabasePermissionDenied(
-                "The grid UI's database user lacks the privileges for this: {}".format(e)) from e
+                "The grid UI's database user lacks the privileges for this: {}".format(e),
+                "The grid UI's database user lacks the privileges for this.") from e
         where = "" if DB_ENGINE == "mysql" else " ({})".format(SQLITE_PATH)
-        raise DatabaseUnavailable("{}{}: {}".format(type(e).__name__, where, e)) from e
+        raise DatabaseUnavailable("{}{}: {}".format(type(e).__name__, where, e), _public_reason(e)) from e
+
+
+def _public_reason(error):
+    """The kind of failure, without paths or host names."""
+    code = error.args[0] if DB_ENGINE == "mysql" and error.args and isinstance(error.args[0], int) else None
+    if code is not None:
+        return "{}: MySQL error {}.".format(type(error).__name__, code)
+    first = str(error).splitlines()[0] if str(error) else ""
+    if first and "/" not in first and "\\" not in first:
+        return "{}: {}.".format(type(error).__name__, first.rstrip("."))
+    return "{}.".format(type(error).__name__)
+
+
+def db_identity():
+    """Which database this process reads, as a value that changes when the setting does."""
+    if DB_ENGINE == "mysql":
+        s = mysql_settings()
+        return ("mysql", s.get("host"), s.get("port"), s.get("database"))
+    return ("sqlite", os.path.abspath(SQLITE_PATH))
 
 
 def _sql(sql):
@@ -427,6 +454,33 @@ def release_slot(slot_id):
     """Force a stuck slot back to free."""
     return _execute(
         "UPDATE portUsage SET inUse = 0, LastRunDate = {} WHERE id = ?".format(_now_sql()), (slot_id,))
+
+
+def release_claim(slot_id, claimed_at):
+    """Release a slot only if it still holds the claim the caller looked at (claimed_at: the
+    session's "started" as /api/status reports it). A check that finished and a new one that claimed
+    the slot meanwhile must not be cut off by a confirm that described the old one.
+
+    Returns ("released", rows), ("reclaimed", 0), ("free", 0) or ("not_found", 0)."""
+    try:
+        with _session() as cur:
+            if DB_ENGINE == "mysql":
+                lock = " FOR UPDATE"
+            else:
+                cur.execute("BEGIN IMMEDIATE")
+                lock = ""
+            cur.execute(_sql("SELECT inUse, LastRunDate FROM portUsage WHERE id = ?" + lock), (slot_id,))
+            row = cur.fetchone()
+            if row is None:
+                return "not_found", 0
+            if not row[0]:
+                return "free", 0
+            if _iso(_parse_time(row[1])) != claimed_at:
+                return "reclaimed", 0
+            cur.execute(_sql("UPDATE portUsage SET inUse = 0, LastRunDate = {} WHERE id = ?".format(_now_sql())), (slot_id,))
+            return "released", cur.rowcount
+    except _MissingTables:
+        return "not_found", 0
 
 
 def reset_slot_failures(slot_id):

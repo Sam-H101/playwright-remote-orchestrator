@@ -11,7 +11,9 @@ export function toast(text, bad = false) {
   timer = setTimeout(() => { el.hidden = true; }, bad ? 6000 : 3000);
 }
 
-export async function copy(text, what) {
+// Copies, says so in a toast, and (given the button that asked) shows a check on that button for a
+// moment, so the confirmation is where the eye already is.
+export async function copy(text, what, button) {
   let ok = false;
   try {
     if (navigator.clipboard && window.isSecureContext) {
@@ -31,6 +33,19 @@ export async function copy(text, what) {
   }
   if (ok) toast("Copied " + (what || "to the clipboard"));
   else toast("Copy isn't available here. Select the text and copy it instead.", true);
+  if (ok && button) {
+    const use = button.querySelector("use");
+    if (use) {
+      clearTimeout(button.__copied);
+      if (!button.__icon) button.__icon = use.getAttribute("href");
+      use.setAttribute("href", "#i-check");
+      button.classList.add("copied");
+      button.__copied = setTimeout(() => {
+        use.setAttribute("href", button.__icon);
+        button.classList.remove("copied");
+      }, 1600);
+    }
+  }
   return ok;
 }
 

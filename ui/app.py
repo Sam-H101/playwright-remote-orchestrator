@@ -3,14 +3,17 @@
 Run locally:  python -m ui.app   (from the repo root)
 """
 import ipaddress
+import logging
 import mimetypes
 import os
 import socket
 import urllib.parse
 
-from flask import Flask, abort, jsonify, render_template, request
+from flask import Flask, abort, g, jsonify, render_template, request
 
-from . import auth, store
+from . import auth, recorder, store
+
+log = logging.getLogger(__name__)
 
 # The Windows registry can map .js to text/plain; with nosniff the browser would then refuse the modules.
 mimetypes.add_type("text/javascript", ".js")
@@ -20,6 +23,12 @@ ADMIN_TOKEN = os.environ.get("GRID_ADMIN_TOKEN", "")
 # "ws://hub:4500", a name only the containers can resolve). Unset: the page derives one.
 PUBLIC_GATEWAY_URL = (os.environ.get("GATEWAY_PUBLIC_URL") or "").rstrip("/")
 GRID_NAME = os.environ.get("GRID_NAME", "")
+# How often a visible page polls /api/status. Each poll is one snapshot of the database, so a grid
+# watched by many people on a busy MySQL server may want a slower page.
+try:
+    POLL_MS = max(1000, int(os.environ.get("GRID_UI_POLL_MS", "1500")))
+except ValueError:
+    POLL_MS = 1500
 # Extra host names the UI may be managed through (besides IP addresses, localhost and this
 # machine's names), comma separated; "*" allows any. Guards the actions against DNS rebinding.
 ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("GRID_UI_ALLOWED_HOSTS", "").split(",") if h.strip()}
@@ -27,6 +36,9 @@ ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("GRID_UI_ALLOWED_HOST
 app = Flask(__name__)
 # Read at call time, so the setting can change while the app runs (the tests rely on it).
 auth.configure(lambda: ADMIN_TOKEN)
+# One per process. Every status poll feeds it the snapshot it reads anyway; a background thread
+# (GRID_RECORDER_INTERVAL seconds, 0 to turn it off) keeps it going while no page is open.
+RECORDER = recorder.Recorder(lambda: store.snapshot(), lambda: store.db_identity(), recorder.interval_from_env())
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
@@ -118,9 +130,29 @@ def _security_headers(response):
     return response
 
 
+def _db_error_text(error):
+    """The full error (it may name a file path or a server) only for a signed-in admin; the log
+    always has it."""
+    _log_db_error(error)
+    try:
+        signed_in = auth.current_principal() is not None
+    except Exception:  # refused by the guessing limit: certainly not signed in
+        signed_in = False
+    return str(error) if signed_in else getattr(error, "public", "The database can't be reached.")
+
+
+_last_db_error = [None]
+
+
+def _log_db_error(error):
+    if str(error) != _last_db_error[0]:  # once per distinct error, not once per poll
+        _last_db_error[0] = str(error)
+        log.warning("database unavailable: %s", error)
+
+
 @app.errorhandler(store.DatabaseUnavailable)
 def database_unavailable(error):
-    return jsonify(error=str(error)), 503
+    return jsonify(error=_db_error_text(error)), 503
 
 
 @app.errorhandler(store.TokensUnavailable)
@@ -130,7 +162,7 @@ def tokens_unavailable(error):
 
 @app.errorhandler(store.DatabasePermissionDenied)
 def database_permission_denied(error):
-    return jsonify(error=str(error)), 403
+    return jsonify(error=_db_error_text(error)), 403
 
 
 @app.get("/")
@@ -142,17 +174,54 @@ def index():
 @app.get("/status")
 @app.get("/api/status")
 def status():
+    RECORDER.ensure_running()
     try:
-        data = store.snapshot()
+        data, _ = RECORDER.observe()
     except store.DatabaseUnavailable as e:
         # ?soft=1 (the page's own polls): the outage as data, not an HTTP error the browser logs every
         # few seconds. Without it the answer is the 503 (or 403) it has always been.
         if request.args.get("soft") != "1":
             raise
-        return _private(jsonify(error=str(e), unavailable=True))
+        return _private(jsonify(error=_db_error_text(e), unavailable=True))
+    data = dict(data)  # the recorder keeps the snapshot it was given
     data["grid_name"] = GRID_NAME or None
     data["public_gateway_url"] = PUBLIC_GATEWAY_URL or None
+    data["poll_ms"] = POLL_MS
+    # ?events=<cursor>: also what the recorder saw since then (0: all of the last 15 minutes).
+    if request.args.get("events") is not None:
+        data.update(RECORDER.export(request.args.get("events")))
     return jsonify(data)
+
+
+@app.get("/api/events")
+def events():
+    """The recorder's events since ?since=<epoch ms> (default: all it holds), for scripts and tools."""
+    RECORDER.ensure_running()
+    try:
+        RECORDER.observe()
+    except store.DatabaseUnavailable:
+        pass  # what was recorded before the outage is still worth having
+    return _private(jsonify(RECORDER.export(request.args.get("since", "0"))))
+
+
+def _observe_before_action():
+    # A fresh "before" snapshot, so the one after the action differs from it only by the action
+    # (and whatever the checks did in the same instant).
+    try:
+        RECORDER.observe()
+    except Exception as e:
+        log.debug("recorder: no snapshot before the action: %s", e)
+
+
+def _attribute(match):
+    """Record the action's effect and mark it as this admin's. Returns the event ids."""
+    principal = getattr(g, "principal", None)
+    try:
+        _, ids = RECORDER.observe(attribute=(match, principal.name if principal else ""))
+    except Exception as e:
+        log.debug("recorder: no snapshot after the action: %s", e)
+        return []
+    return ids
 
 
 @app.get("/api/session")
@@ -165,28 +234,54 @@ def session():
 @app.post("/api/slots/<int:slot_id>/release")
 @auth.admin_required()
 def release_slot(slot_id):
-    return jsonify(updated=store.release_slot(slot_id))
+    body = request.get_json(silent=True)
+    claimed_at = body.get("claimed_at") if isinstance(body, dict) else None
+    _observe_before_action()
+    if claimed_at is None:
+        updated = store.release_slot(slot_id)
+    else:
+        # The page sends the claim its confirm described; anything else is a different check's.
+        result, updated = store.release_claim(slot_id, str(claimed_at))
+        if result == "not_found":
+            return jsonify(error="There is no slot {}.".format(slot_id)), 404
+        if result == "free":
+            return jsonify(error="That check already finished: the slot is free, so nothing was released.",
+                           released=False), 409
+        if result == "reclaimed":
+            return jsonify(error="Another check claimed this slot since you looked, so nothing was released.",
+                           reclaimed=True, released=False), 409
+    ids = _attribute(lambda e: e.get("slot") == slot_id and e["type"] == "finished")
+    return jsonify(updated=updated, events=ids)
 
 
 @app.post("/api/slots/<int:slot_id>/reset-failures")
 @auth.admin_required()
 def reset_slot(slot_id):
-    return jsonify(updated=store.reset_slot_failures(slot_id))
+    _observe_before_action()
+    updated = store.reset_slot_failures(slot_id)
+    ids = _attribute(lambda e: e.get("slot") == slot_id and e["type"] == "reset")
+    return jsonify(updated=updated, events=ids)
 
 
 @app.post("/api/nodes/reset-failures")
 @auth.admin_required()
 def reset_node():
-    return jsonify(updated=store.reset_node_failures(_host_arg()))
+    host = _host_arg()
+    _observe_before_action()
+    updated = store.reset_node_failures(host)
+    ids = _attribute(lambda e: e.get("node") == host and e["type"] == "reset")
+    return jsonify(updated=updated, events=ids)
 
 
 @app.post("/api/nodes/forget")
 @auth.admin_required()
 def forget_node():
     host = _host_arg()
+    _observe_before_action()
     result, count = store.forget_node(host)
     if result == "forgotten":
-        return jsonify(forgotten=True, host=host, slots=count)
+        ids = _attribute(lambda e: e.get("node") == host and e["type"] == "node-left")
+        return jsonify(forgotten=True, host=host, slots=count, events=ids)
     if result == "not_found":
         return jsonify(error="{} is not a registered gateway node.".format(host)), 404
     if result == "online":

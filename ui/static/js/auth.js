@@ -1,29 +1,37 @@
 // Admin sign-in: state, credentials, prompting and sign-out, and nothing else knows how it works.
 // Today's provider is the shared admin token, kept for this browser tab only. Another provider
-// (OAuth) would change this file and ui/auth.py; views only call state(), signIn(), signOut(),
-// headers() and onChange().
+// (OAuth) changes this file and ui/auth.py: it adds an entry to SHEETS for its kind, and the server
+// lists it in /api/session. Views only call state(), signIn(), signOut(), headers() and onChange(),
+// and show state().summary rather than knowing what a provider is called.
 import { html, setHTML } from "./html.js";
 
 const KEY = "gridToken";
 const HEADER = "X-Grid-Token";
 
-// Tab-scoped storage, wrapped once: it can be blocked (privacy modes) and must never throw.
-// The flight recorder keeps its buffer here too, so this is the one place that touches it.
-export const tabStore = {
-  get(key) { try { return window.sessionStorage.getItem(key); } catch (e) { return null; } },
-  set(key, value) { try { window.sessionStorage.setItem(key, value); return true; } catch (e) { return false; } },
-  remove(key) { try { window.sessionStorage.removeItem(key); } catch (e) { /* nothing stored */ } },
+// The secret lives in tab-scoped storage, which can be blocked (privacy modes) and must never throw.
+const tab = {
+  get() { try { return window.sessionStorage.getItem(KEY); } catch (e) { return null; } },
+  set(value) { try { window.sessionStorage.setItem(KEY, value); return true; } catch (e) { return false; } },
+  remove() { try { window.sessionStorage.removeItem(KEY); } catch (e) { /* nothing stored */ } },
 };
 
 let session = { signedIn: false, name: null, method: null, adminConfigured: false, providers: [], known: false };
 const listeners = new Set();
 let pending = null;
 
-const secret = () => tabStore.get(KEY) || "";
+const secret = () => tab.get() || "";
 
 function notify() {
   const s = state();
   listeners.forEach((cb) => { try { cb(s); } catch (e) { console.error(e); } });
+}
+
+// "Signed in with admin token · this tab only": what the account menu says, worded per provider kind.
+function summary() {
+  if (!session.signedIn) return "";
+  const p = session.providers.find((x) => x.id === session.method);
+  const label = p ? p.label.charAt(0).toLowerCase() + p.label.slice(1) : "admin sign-in";
+  return "Signed in with " + label + (!p || p.kind === "secret" ? " · this tab only" : "");
 }
 
 export function state() {
@@ -33,6 +41,7 @@ export function state() {
     provider: session.method,
     adminConfigured: session.adminConfigured,
     providers: session.providers.slice(),
+    summary: summary(),
     known: session.known,
   };
 }
@@ -53,6 +62,11 @@ async function ask(candidate) {
     cache: "no-store", credentials: "same-origin",
     headers: { Accept: "application/json", [HEADER]: candidate },
   });
+  if (r.status === 429) {
+    let body = {};
+    try { body = await r.json(); } catch (e) { body = {}; }
+    throw new Error(body.error || "Too many wrong attempts. Try again later.");
+  }
   if (!r.ok) throw new Error("The sign-in check failed with HTTP " + r.status + ".");
   return r.json();
 }
@@ -68,7 +82,7 @@ export async function init() {
   try {
     const body = await ask(secret());
     // A stored secret the server no longer accepts is useless: forget it rather than resend it.
-    if (!body.signedIn && secret()) tabStore.remove(KEY);
+    if (!body.signedIn && secret()) tab.remove();
     adopt(body);
   } catch (e) {
     session.known = false;
@@ -79,14 +93,14 @@ export async function init() {
 
 // The server refused our credentials: we're signed out, whatever we thought.
 export function markSignedOut() {
-  tabStore.remove(KEY);
+  tab.remove();
   if (session.signedIn) { session.signedIn = false; session.name = session.method = null; }
   session.adminConfigured = true;
   notify();
 }
 
 export function signOut() {
-  tabStore.remove(KEY);
+  tab.remove();
   session.signedIn = false;
   session.name = session.method = null;
   notify();
@@ -97,17 +111,26 @@ const REASONS = {
   expired: "Sign in again to continue.",
 };
 
-// Opens the sign-in sheet. Resolves true once signed in, false when dismissed. Concurrent callers
-// share the one sheet.
+// One sheet per provider kind. "secret": a password field checked against /api/session.
+const SHEETS = { secret: secretSheet };
+
+// Opens sign-in. Resolves true once signed in, false when dismissed. Concurrent callers share it.
 export function signIn(reason) {
   if (pending) return pending;
-  pending = new Promise((resolve) => {
+  pending = (async () => {
+    // The page may predate GRID_ADMIN_TOKEN being set: ask the server what it offers now.
+    if (!session.providers.length) await init();
+    const offered = session.providers.filter((p) => SHEETS[p.kind]);
+    if (!offered.length) return false;
+    return SHEETS[offered[0].kind](offered.filter((p) => p.kind === offered[0].kind), reason);
+  })().finally(() => { pending = null; });
+  return pending;
+}
+
+function secretSheet(providers, reason) {
+  return new Promise((resolve) => {
     const dlg = document.getElementById("signin-dialog");
     const anchor = document.getElementById("account-btn");
-    if (!session.providers.length) {
-      // The page may predate GRID_ADMIN_TOKEN being set: ask the server what it offers now.
-      session.providers = [{ id: "token", kind: "secret", label: "Admin token" }];
-    }
     const purpose = typeof reason === "string" && !REASONS[reason] ? reason : "";
     dlg.__html = null; // always fresh elements: the listeners below belong to this one prompt
     setHTML(dlg, html`
@@ -116,7 +139,7 @@ export function signIn(reason) {
           <h2 id="signin-title">Sign in</h2>
           <p class="sheet-sub">${purpose ? purpose + "." : REASONS[reason] || "Admin actions need you to sign in."}</p>
         </header>
-        ${session.providers.filter((p) => p.kind === "secret").map((p) => html`
+        ${providers.map((p) => html`
           <div class="field">
             <label for="signin-${p.id}">${p.label}</label>
             <input type="password" id="signin-${p.id}" name="${p.id}" autocomplete="off" spellcheck="false" required
@@ -134,7 +157,6 @@ export function signIn(reason) {
     const finish = (ok) => {
       if (done) return;
       done = true;
-      pending = null;
       if (dlg.open) dlg.close();
       dlg.classList.remove("anchored");
       resolve(ok);
@@ -149,16 +171,16 @@ export function signIn(reason) {
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const value = input.value;
-      if (!value) return showError("Enter the admin token.");
+      if (!value) return showError("Enter the " + providers[0].label.toLowerCase() + ".");
       const btn = dlg.querySelector("#signin-ok");
       btn.disabled = true;
       try {
         const body = await ask(value);
         if (!body.signedIn) {
           adopt(body);
-          return showError(body.adminConfigured ? "That admin token was rejected." : "This grid has no admin sign-in configured.");
+          return showError(body.adminConfigured ? "That " + providers[0].label.toLowerCase() + " was rejected." : "This grid has no admin sign-in configured.");
         }
-        tabStore.set(KEY, value);
+        tab.set(value);
         adopt(body);
         notify();
         finish(true);
@@ -180,5 +202,4 @@ export function signIn(reason) {
     dlg.showModal();
     if (input) input.focus();
   });
-  return pending;
 }

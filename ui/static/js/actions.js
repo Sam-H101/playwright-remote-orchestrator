@@ -31,6 +31,8 @@ async function run(url, body, done, expect) {
     const res = await api.post(url, body);
     if (res === null) return null; // sign-in dismissed: nothing happened
     toast(done);
+    // The server names the events this action caused: the activity log shows them as "you", once.
+    if (Array.isArray(res.events)) app.live.mine(res.events);
     return res;
   } catch (err) {
     toast(err.message, true);
@@ -46,6 +48,9 @@ export async function releaseSlot(id) {
   const name = slotName(f.node, f.slot);
   if (!(await ensureSignedIn("Sign in to release " + name))) return false;
   const s = f.session, started = s && app.ms(s.started);
+  // The claim this confirm describes. If that check ends and another claims the slot while the
+  // dialog is open, the server refuses (409) instead of cutting off the new one.
+  const claimedAt = (s && s.started) || f.slot.last_run;
   const held = started != null ? "Claimed " + clock(started, false) + ", running " + duration((app.now() - started) / 1000) + (s.stale ? " (stale)" : "") + ". " : "";
   const ok = await confirm({
     title: "Release " + name + "?",
@@ -54,8 +59,8 @@ export async function releaseSlot(id) {
   });
   if (!ok) return false;
   const target = { slot: f.slot.id, node: f.node.host, subject: name };
-  const res = await run("api/slots/" + encodeURIComponent(f.slot.id) + "/release", {}, name + " released.", ["release", target]);
-  if (res) app.live.noteAction("release", target, "you released " + name);
+  const res = await run("api/slots/" + encodeURIComponent(f.slot.id) + "/release", claimedAt ? { claimed_at: claimedAt } : {},
+    name + " released.", ["release", target]);
   return !!res;
 }
 
@@ -66,7 +71,6 @@ export async function resetSlot(id) {
   if (!(await ensureSignedIn("Sign in to reset failures on " + name))) return false;
   const target = { slot: f.slot.id, node: f.node.host, subject: name };
   const res = await run("api/slots/" + encodeURIComponent(f.slot.id) + "/reset-failures", {}, "Failures reset on " + name + ".", ["reset", target]);
-  if (res) app.live.noteAction("reset", target, "you reset failures on " + name);
   return !!res;
 }
 
@@ -83,7 +87,6 @@ export async function resetNode(host) {
   });
   if (!ok) return false;
   const res = await run("api/nodes/reset-failures", { host }, "Failures reset on " + host + ".", ["reset", { node: host }]);
-  if (res) app.live.noteAction("reset", { node: host, subject: host }, "you reset failures on " + host);
   return !!res;
 }
 
@@ -99,7 +102,6 @@ export async function forgetNode(host) {
   });
   if (!ok) return false;
   const res = await run("api/nodes/forget", { host }, host + " was removed.", ["forget", { node: host }]);
-  if (res) app.live.noteAction("forget", { node: host, subject: host }, "you forgot " + host);
   return !!res;
 }
 

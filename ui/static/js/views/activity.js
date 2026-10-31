@@ -1,4 +1,5 @@
-// Activity: the flight recorder's full log, filterable, copyable, honest about its reach.
+// Activity: the flight recorder's full log, filterable, copyable, honest about its reach. One row
+// per change: an admin action is the event it caused, attributed, not a second line beside it.
 import { app } from "../app.js";
 import { html, patchList, setHTML, setText } from "../html.js";
 import { clock, runLength } from "../format.js";
@@ -6,7 +7,7 @@ import { describe } from "../live.js";
 import * as router from "../router.js";
 import { copy, toast } from "../ui/toast.js";
 
-const KINDS = [["claim", "Claims"], ["finish", "Finished runs"], ["failure", "Failures and health"], ["reset", "Resets"], ["node", "Nodes"], ["admin", "Your actions"]];
+const KINDS = [["claim", "Claims"], ["finish", "Finished runs"], ["failure", "Failures and health"], ["reset", "Resets"], ["node", "Nodes"], ["admin", "Admin actions"]];
 const RANGES = [["5m", "5 min", 5 * 60e3], ["15m", "15 min", 15 * 60e3], ["all", "All", Infinity]];
 
 export function filterEvents(events, params, now) {
@@ -21,13 +22,13 @@ export function filterEvents(events, params, now) {
 function row(e) {
   const dur = e.type === "finished" ? (e.approx ? "approx." : runLength(e.dur)) : "";
   const inspect = e.slot != null ? ["slot", e.slot] : e.node ? ["node", e.node] : null;
-  return html`<tr data-key="${e.id}" class="k-${e.kind}${e.failed ? " failed" : ""}${e.by === "you" ? " yours" : ""}" data-jk tabindex="-1"
+  return html`<tr data-key="${e.id}" class="k-${e.kind}${e.failed ? " failed" : ""}${e.you ? " yours" : ""}" data-jk tabindex="-1"
       ${inspect ? html`data-inspect="${inspect[0]}" data-id="${inspect[1]}"` : ""}>
     <td class="cell-time mono">${clock(e.t)}</td>
     <td class="cell-kind"><span class="ev-glyph" aria-hidden="true"></span><span class="sr-only">${e.kind}</span></td>
     <td class="cell-subject">${inspect ? html`<a class="mono" href="#/${inspect[0]}/${encodeURIComponent(inspect[1])}" data-inspect="${inspect[0]}" data-id="${inspect[1]}" tabindex="-1">${e.subject || e.node}</a>`
       : html`<span class="mono">${e.subject || ""}</span>`}</td>
-    <td class="cell-detail">${e.by === "you" && e.type === "admin" ? e.text : describe(e)}</td>
+    <td class="cell-detail">${describe(e)}</td>
     <td class="cell-dur mono">${dur}</td>
   </tr>`;
 }
@@ -58,9 +59,7 @@ export function createActivity(section) {
       </table>
       <div class="empty compact" id="act-empty" hidden></div>
     </div>
-    <p class="hint act-reach">This page sees what changes between polls of the grid's database, about every 1.5 s while it's visible:
-      claims, finished runs (runs shorter than a poll show as “approx.”), connect failures, resets, health and nodes.
-      It can't see which check ran, or why a connection failed: no error text is stored.</p>`);
+    <p class="hint act-reach" id="act-reach"></p>`);
 
   const rows = section.querySelector("#act-rows");
   let params = {};
@@ -77,6 +76,7 @@ export function createActivity(section) {
     const evs = filterEvents(app.live.recorder.events, params, app.now()).map((e) => {
       const o = Object.assign({}, e);
       delete o.seen;
+      delete o.observed;
       o.time = new Date(e.t).toISOString();
       return o;
     });
@@ -84,7 +84,7 @@ export function createActivity(section) {
   });
   section.querySelector("#act-clear").addEventListener("click", () => {
     app.live.clear();
-    toast("Recording cleared. It starts again now.");
+    toast(app.live.recorder.source === "server" ? "Cleared from this page. New events show up from now on." : "Recording cleared. It starts again now.");
   });
 
   function options(select, list, value, all) {
@@ -110,14 +110,21 @@ export function createActivity(section) {
     section.querySelectorAll("#act-range [data-range]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.range === range)));
 
     const evs = filterEvents(recorder.events, params, now).slice().reverse();
-    setText(section.querySelector("#act-sub"), "Recorded by this tab since " + clock(recorder.since) + " · " +
-      recorder.events.length + " events in the last 15 min · " + recorder.dropped + " dropped");
+    const server = recorder.source === "server";
+    setText(section.querySelector("#act-sub"), (server ? "Recorded by the Grid UI server since " : "Seen by this page since ") +
+      clock(recorder.since) + " · " + recorder.events.length + " events in the last 15 min · " + recorder.dropped + " dropped");
+    setText(section.querySelector("#act-reach"), (server
+      ? "The Grid UI server compares snapshots of the grid's database every couple of seconds, whether or not anyone has this page open, and keeps 15 minutes. "
+      : "This page compares snapshots of the grid's database about every 1.5 s while it's visible. ") +
+      "It sees claims, finished runs (runs shorter than a snapshot show as “approx.”), connect failures, resets, health and nodes. " +
+      "It can't see which check ran, or why a connection failed: no error text is stored.");
     patchList(rows, evs, (e) => e.id, row);
     const empty = section.querySelector("#act-empty");
     empty.hidden = evs.length > 0;
     setHTML(empty, recorder.events.length
       ? html`<h2>No events match</h2><p>Nothing in these filters yet.</p><a class="btn small" href="#/activity">Clear filters</a>`
-      : html`<h2>Nothing recorded yet</h2><p>Events appear here as this page sees checks claim and release slots, failures, and nodes come and go.</p>`);
+      : html`<h2>Nothing in the last 15 minutes</h2><p>${server ? "Events appear here as checks claim and release slots, as connections fail, and as nodes come and go."
+        : "History starts when this page opens. Events appear here as it sees checks claim and release slots, failures, and nodes come and go."}</p>`);
   }
 
   return { update };

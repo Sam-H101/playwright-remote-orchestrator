@@ -290,7 +290,12 @@ def test_add_a_host_makes_a_bound_token_and_waits_for_the_node(admin_grid, admin
     url, path = admin_grid
     p = admin_page
     p.goto(url + "#/access")
+    p.wait_for_selector("#token-rows tr")
+    assert not p.is_visible("#add-host")  # one call to action in the header, not a second form above the list
+    p.click("#add-host-btn")
     p.wait_for_selector("#add-host #ah-node")
+    assert p.get_attribute("#add-host-btn", "aria-expanded") == "true"
+    assert p.get_attribute("#ah-node", "placeholder").startswith("e.g. ")
     p.click("#add-host .choice-card:has-text('Linux')")
     p.fill("#ah-node", "Bad Name")
     p.click("#ah-create")
@@ -308,6 +313,22 @@ def test_add_a_host_makes_a_bound_token_and_waits_for_the_node(admin_grid, admin
     refresh_now(p)
     p.wait_for_selector("#wait-line.done a[data-inspect=node]")
     assert "win-build-02 registered" in p.text_content("#wait-line")
+
+    # The same host again: a warning first (tokens would pile up), then a second token only on purpose.
+    p.click("[data-reveal-done]")
+    p.click("#confirm-ok")  # hide it without copying: it was only a test
+    p.wait_for_selector(".reveal", state="detached")
+    p.wait_for_function("() => document.querySelectorAll('#token-rows tr').length === 7")
+    p.fill("#ah-node", "WIN-BUILD-02")
+    assert "Registers as win-build-02" in p.text_content("#ah-hint")
+    p.click("#ah-create")
+    p.wait_for_selector("#ah-error.notice")
+    assert "already has an active agent token" in p.text_content("#ah-error")
+    assert run(path, "SELECT COUNT(*) FROM accessTokens WHERE nodeName = 'win-build-02'") == [(1,)]
+    assert "Create another token" in p.text_content("#ah-create")
+    p.click("#ah-create")
+    p.wait_for_selector(".reveal")
+    assert run(path, "SELECT COUNT(*) FROM accessTokens WHERE nodeName = 'win-build-02'") == [(2,)]
 
 
 def test_access_fits_a_phone(admin_grid, browser):  # noqa: F811

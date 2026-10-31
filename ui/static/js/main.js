@@ -4,7 +4,8 @@ import * as api from "./api.js";
 import * as auth from "./auth.js";
 import * as router from "./router.js";
 import * as keys from "./keys.js";
-import { createLive, describe } from "./live.js";
+import { createLive } from "./live.js";
+import { localStore } from "./storage.js";
 import { html, icon, setHTML, setText } from "./html.js";
 import { age, ago, clock, duration, inTime, parseTime, plural, slotName, slotState, stateWord } from "./format.js";
 import { bindActions, forgetNode, resetNode } from "./actions.js";
@@ -21,7 +22,7 @@ const $ = (id) => document.getElementById(id);
 const root = document.documentElement;
 
 // ---- live data ----------------------------------------------------------------
-const live = createLive({ load: api.status, storage: auth.tabStore });
+const live = createLive({ load: api.status, storage: localStore });
 app.live = live;
 
 // ---- views ------------------------------------------------------------------------
@@ -102,6 +103,9 @@ function renderTop(msg, v) {
   freshness();
 }
 
+// Which hop is down, in the freshness chip's few words.
+const why = () => (live.errorKind === "database" ? "database unreachable" : "Grid UI server unreachable");
+
 function freshness() {
   const el = $("freshness"), text = $("fresh-text");
   const age = live.lastOk ? Math.max(0, Math.round((Date.now() - live.lastOk) / 1000)) : null;
@@ -111,11 +115,11 @@ function freshness() {
     label = "Paused" + (age != null ? " · " + duration(age) + " old" : "");
   } else if (age == null) {
     tone = live.error ? "bad" : "wait";
-    label = live.error ? "No data · database unreachable" : "Connecting…";
+    label = live.error ? "No data · " + why() : "Connecting…";
   } else {
     label = "Live · " + (age < 1 ? "now" : age + "s");
-    if (age >= 30) { tone = "bad"; label = "Stale · " + duration(age) + (live.error ? " · database unreachable" : " · no response"); }
-    else if (age >= 10) { tone = "warn"; label = "Delayed · " + age + "s" + (live.error ? " · database unreachable" : ""); }
+    if (age >= 30) { tone = "bad"; label = "Stale · " + duration(age) + " · " + (live.error ? why() : "no response"); }
+    else if (age >= 10) { tone = "warn"; label = "Delayed · " + age + "s" + (live.error ? " · " + why() : ""); }
   }
   el.className = "freshness f-" + tone;
   setText(text, label);
@@ -165,7 +169,7 @@ function openAccountMenu() {
   const s = auth.state();
   const compact = root.dataset.density === "compact";
   setHTML(accountMenu, html`
-    ${s.signedIn ? html`<p class="menu-note" role="none"><span class="acct-dot" aria-hidden="true"></span>Signed in with admin token · this tab only</p>`
+    ${s.signedIn ? html`<p class="menu-note" role="none"><span class="acct-dot" aria-hidden="true"></span>${s.summary}</p>`
       : html`<p class="menu-note" role="none">Admin sign-in isn't configured: anyone who can open this page can manage the grid.</p>`}
     <button type="button" role="menuitemcheckbox" aria-checked="${compact}" data-menu="density">Compact rows</button>
     ${s.signedIn ? html`<button type="button" role="menuitem" data-menu="signout">${icon("i-logout")}Sign out</button>` : ""}`);
@@ -372,13 +376,21 @@ document.addEventListener("keydown", (e) => {
 });
 document.addEventListener("click", (e) => {
   const copyBtn = e.target.closest("[data-copy]");
-  if (copyBtn) { copy(copyBtn.dataset.copy, copyBtn.dataset.copyLabel); return; }
+  if (copyBtn) { copy(copyBtn.dataset.copy, copyBtn.dataset.copyLabel, copyBtn); return; }
   const link = e.target.closest("a[data-inspect]");
   if (link && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.button === 0) {
     e.preventDefault();
     const opener = link.closest("[data-jk]") || link;
     app.inspect(link.dataset.inspect, link.dataset.inspect === "node" ? link.dataset.id : Number(link.dataset.id), opener);
+    return;
   }
+  // A whole row is the target (its chevron and hover say so), except its own buttons and links,
+  // and except when the click ends a text selection.
+  const row = e.target.closest("[data-jk][data-inspect]");
+  if (!row || e.target.closest("a, button, input, select, textarea, label, [data-act]") || e.button !== 0) return;
+  if (row.closest("#view-sessions")) return; // the sessions table opens its rows itself
+  if (String(window.getSelection && window.getSelection()).length) return;
+  app.inspect(row.dataset.inspect, row.dataset.inspect === "node" ? row.dataset.id : Number(row.dataset.id), row);
 });
 
 // Admin controls anywhere on the page. After an action, focus lands somewhere sensible.

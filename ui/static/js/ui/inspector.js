@@ -3,7 +3,7 @@
 import { app, prefs } from "../app.js";
 import { html, icon, setHTML, patchList } from "../html.js";
 import {
-  age, clock, connectUrl, duration, fullDate, nodeSentence, parseTime, platformOf, plural, reproduce,
+  age, clock, connectUrl, duration, endpointParts, fullDate, nodeSentence, parseTime, platformOf, plural, reproduce,
   runLength, slotName, slotNameLong, slotSentence, slotState, stateWord,
 } from "../format.js";
 import { describe } from "../live.js";
@@ -18,16 +18,20 @@ const STATE_TONE = { free: "ok", busy: "accent", unhealthy: "warn", failing: "ba
 const pill = (tone, text) => html`<span class="pill p-${tone}"><span class="glyph g-${tone}" aria-hidden="true"></span>${text}</span>`;
 
 function eventRow(e) {
-  return html`<li data-key="${e.id}" class="ev k-${e.kind}${e.failed ? " failed" : ""}">
+  return html`<li data-key="${e.id}" class="ev k-${e.kind}${e.failed ? " failed" : ""}${e.you ? " yours" : ""}">
     <span class="mono ev-time">${clock(e.t)}</span>
     <span class="ev-glyph" aria-hidden="true"></span>
-    <span class="ev-text">${e.by === "you" && e.type === "admin" ? e.text : describe(e)}</span></li>`;
+    <span class="ev-text">${describe(e)}</span></li>`;
 }
 
+// An endpoint breaks only after "/" (never inside a node name such as runner-b81e04).
 function copyable(text, label) {
-  return html`<span class="copyable"><code class="mono">${text}</code><button type="button" class="icon-btn tiny" data-copy="${text}"
+  return html`<span class="copyable"><code class="mono endpoint">${endpointParts(text).map((p) => html`<span class="seg">${p}</span><wbr>`)}</code><button type="button" class="icon-btn tiny" data-copy="${text}"
     data-copy-label="${label}" aria-label="Copy ${label}">${icon("i-copy")}</button></span>`;
 }
+
+// Where the events came from, said next to them.
+const reach = () => (app.live.recorder.source === "server" ? "· recorded by the Grid UI" : "· seen by this page");
 
 export function createInspector({ onClose }) {
   const el = document.getElementById("inspector");
@@ -192,7 +196,7 @@ export function createInspector({ onClose }) {
         <header class="insp-head" data-part="head"></header>
         <p class="insp-sentence" data-part="sentence"></p>
         <dl class="facts" data-part="facts"></dl>
-        <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Recent events <span class="dim">· this tab</span></h3>
+        <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Recent events <span class="dim" data-part="reach"></span></h3>
           <ol class="ev-list" data-part="events"></ol></section>
         ${reproBlock(gateway)}
         <div class="insp-actions" data-part="actions"></div>`,
@@ -201,7 +205,7 @@ export function createInspector({ onClose }) {
         <p class="insp-sentence" data-part="sentence"></p>
         <div class="insp-duration" data-part="bar"></div>
         <dl class="facts" data-part="facts"></dl>
-        <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Recent events <span class="dim">· this tab</span></h3>
+        <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Recent events <span class="dim" data-part="reach"></span></h3>
           <ol class="ev-list" data-part="events"></ol></section>
         ${reproBlock(gateway)}
         <div class="insp-actions" data-part="actions"></div>`,
@@ -211,7 +215,7 @@ export function createInspector({ onClose }) {
         <dl class="facts" data-part="facts"></dl>
         <section class="insp-section" aria-labelledby="mini-title"><h3 class="section-label" id="mini-title">Slots</h3>
           <div class="insp-mini" data-part="mini" role="group" aria-label="Slots on this node"></div></section>
-        <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Runs and failures <span class="dim">· this tab</span></h3>
+        <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Runs and failures <span class="dim" data-part="reach"></span></h3>
           <p class="insp-stats" data-part="stats"></p>
           <ol class="ev-list" data-part="events"></ol></section>
         <div class="insp-actions" data-part="actions"></div>`,
@@ -265,8 +269,9 @@ export function createInspector({ onClose }) {
       html`<dt>Endpoint</dt><dd>${copyable(endpoint, "the endpoint")}</dd>`,
       html`<dt>Run-server</dt><dd>${gateway ? (slot.healthy ? html`<span class="ok-text">Passes health checks</span>` : html`<span class="warn-text">Not answering health checks</span>`) : html`<span class="dim">Not checked (static host)</span>`}</dd>`,
       html`<dt>Failures</dt><dd><span class="meter-wrap"><span class="meter${slot.fails >= cfg.threshold ? " over" : ""}" role="img"
-        aria-label="${slot.fails} of ${cfg.threshold} consecutive failures"><span class="meter-fill" data-meter="${meter}"></span></span>
-        <span class="mono">${slot.fails} of ${cfg.threshold}</span></span></dd>`,
+        aria-label="${plural(slot.fails, "consecutive failure")}, limit ${cfg.threshold}"><span class="meter-fill" data-meter="${meter}"></span></span>
+        <span><span class="mono">${slot.fails}</span> ${slot.fails === 1 ? "failure" : "failures"} · limit <span class="mono">${cfg.threshold}</span>${slot.fails >= cfg.threshold
+          ? html` <span class="bad-text">· over</span>` : ""}</span></span></dd>`,
       html`<dt>Next retry</dt><dd>${retry ? html`<span class="mono">${clock(retry)}</span> · <span data-retry="${slot.retry_at}" data-short></span>` : html`<span class="dim">${slot.fails >= cfg.threshold ? "Due now" : "Not cooling down"}</span>`}</dd>`,
       html`<dt>${slot.busy ? "Current run" : "Last run"}</dt><dd>${run ? html`<span class="mono">${clock(run)}</span> · ${slot.busy
         ? html`running <span data-dur="${slot.last_run}"></span>` : html`<span data-ago="${slot.last_run}"></span>`}` : html`<span class="dim">Never</span>`}</dd>`,
@@ -281,8 +286,10 @@ export function createInspector({ onClose }) {
   }
 
   function renderEvents(list) {
+    if (parts.reach) parts.reach.textContent = reach();
     if (!list.length) {
-      setHTML(parts.events, html`<li class="ev-empty">Nothing seen yet. This list fills as this page watches.</li>`);
+      setHTML(parts.events, html`<li class="ev-empty">${app.live.recorder.source === "server"
+        ? "Nothing in the last 15 minutes." : "Nothing seen yet. This list fills as this page watches."}</li>`);
       return;
     }
     parts.events.__html = null;
@@ -317,7 +324,7 @@ export function createInspector({ onClose }) {
         aria-label="Running for ${duration(s.duration_s)}; stale after ${duration(cfg.staleAfter)}"><span class="dur-fill"></span><span class="dur-mark" title="${duration(cfg.staleAfter)}"></span></div>
       <div class="dur-legend mono"><span>Started ${clock(started)}</span><span data-dur="${s.started || ""}"></span><span>stale at ${duration(cfg.staleAfter)}</span></div>`);
     part("facts", html`
-      <dt>Started</dt><dd><span class="mono">${clock(started)}</span> <span class="dim">${fullDate(started)}</span></dd>
+      <dt>Started</dt><dd><time class="mono" datetime="${s.started || ""}" title="${fullDate(started)}">${clock(started)}</time> · <span data-ago="${s.started || ""}"></span></dd>
       ${slotFacts(f)}
       <dt>Node</dt><dd>${s.kind === "gateway" ? (s.node_online ? "Online" : html`<span class="warn-text">Offline</span>`) : "Static host"}</dd>`);
     renderEvents(eventsFor((e) => e.slot === f.slot.id));

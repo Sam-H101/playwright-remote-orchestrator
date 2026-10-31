@@ -55,13 +55,17 @@ export function attentionItems(data) {
   return items.sort((a, b) => (SEVERITY[a.sev] - SEVERITY[b.sev]) || a.subject.localeCompare(b.subject));
 }
 
+// What failed, in the words the verdict uses: the database behind a working UI server, or the UI
+// server itself (or the network to it). They send whoever is on call to different places.
+const OUTAGE = { database: "Can't reach the database", network: "Can't reach the Grid UI server", server: "Can't reach the Grid UI server" };
+
 // The one verdict: the view's h1 and the top bar's chip.
-export function verdict(data, error, items) {
+export function verdict(data, error, items, kind) {
   if (!data) {
-    return error ? { h1: "Can't reach the database", chip: "No data", tone: "bad" } : { h1: "Loading…", chip: "No data", tone: "off" };
+    return error ? { h1: OUTAGE[kind] || OUTAGE.database, chip: "No data", tone: "bad" } : { h1: "Loading…", chip: "No data", tone: "off" };
   }
   const t = data.totals;
-  if (error) return { h1: "Can't reach the database", chip: "No data", tone: "bad" };
+  if (error) return { h1: OUTAGE[kind] || OUTAGE.database, chip: "No data", tone: "bad" };
   if (!data.db.initialised || !t.slots) return { h1: "No nodes yet", chip: "No nodes", tone: "off" };
   if (!t.available && !t.busy) return { h1: "Grid down", chip: "Down", tone: "bad" };
   if (!t.available) return { h1: "No free slots", chip: "Full · 0 free", tone: "warn" };
@@ -117,12 +121,21 @@ export function createOverview(section) {
           <li><i class="cell mini s-free" aria-hidden="true"></i>Free</li>
           <li><i class="cell mini s-busy" aria-hidden="true"></i>In use</li>
           <li><i class="cell mini s-unhealthy" aria-hidden="true"></i>Unhealthy</li>
-          <li><i class="cell mini s-failing" aria-hidden="true"></i>Failing</li>
-          <li><i class="cell mini s-cooling legend-sweep" aria-hidden="true"></i>Cooling down (fills until its retry)</li>
+          <li><i class="cell mini s-cooling legend-sweep" aria-hidden="true"></i>Failing</li>
           <li><i class="cell mini s-offline" aria-hidden="true"></i>Offline</li>
-          <li><i class="cell mini s-free has-fails" aria-hidden="true"><span class="badge">1</span></i>Has failures (count)</li>
-          <li><i class="cell mini s-free changed-ok" aria-hidden="true"></i>Changed in the last 10 s</li>
         </ul>
+        <details class="legend-more">
+          <summary class="btn ghost small">More markers</summary>
+          <ul class="legend legend-pop" aria-label="More slot markers">
+            <li><i class="cell mini s-cooling legend-sweep" aria-hidden="true"></i>Failing, cooling down: fills up as its retry nears</li>
+            <li><i class="cell mini s-failing" aria-hidden="true"></i>Failing, retry due: the next check may try it</li>
+            <li><i class="cell mini s-free has-fails" aria-hidden="true"><span class="badge">1</span></i>Connect failures so far (the count)</li>
+            <li><i class="cell mini s-free changed-neutral" aria-hidden="true"></i>Claimed in the last 10 s</li>
+            <li><i class="cell mini s-free changed-ok" aria-hidden="true"></i>Run finished in the last 10 s</li>
+            <li><i class="cell mini s-free changed-bad" aria-hidden="true"></i>Failures went up in the last 10 s</li>
+            <li><span class="legend-n mono" aria-hidden="true">3</span>Slot number on gateway nodes, port on static hosts</li>
+          </ul>
+        </details>
       </div>
       <div id="matrix-root"></div>
     </section>
@@ -134,7 +147,7 @@ export function createOverview(section) {
     onMenu: (host, btn) => app.rowMenu(host, btn),
     hub: () => app.hub(),
   });
-  section.querySelector(".legend-sweep").style.setProperty("--sweep", "200deg");
+  section.querySelectorAll(".legend-sweep").forEach((el) => el.style.setProperty("--sweep", "200deg"));
   const list = section.querySelector("#att-list");
   let firstRun = null; // { token } once the empty state made one
 
@@ -142,10 +155,13 @@ export function createOverview(section) {
     const box = section.querySelector("#ov-error");
     if (!live.error) { setHTML(box, html``); return; }
     const age = live.lastOk ? Math.round((Date.now() - live.lastOk) / 1000) : null;
+    const db = live.errorKind === "database";
     setHTML(box, html`<div class="panel db-error" role="alert">
       <div class="db-error-head">${icon("i-alert")}<div>
-        <p class="db-error-title">The grid can't read its database.</p>
-        <p class="db-error-sub">${age != null ? html`Showing data from <span data-age-ms="${live.lastOk}"></span>. ` : "No data yet. "}Retrying <span data-next-poll></span>.</p>
+        <p class="db-error-title">${db ? "The Grid UI is up, but it can't read its database." : "This page can't reach the Grid UI server."}</p>
+        <p class="db-error-sub">${db ? "Check the database server and the UI's DB settings."
+          : html`No usable answer from <span class="mono">${location.host}</span>: check that the Grid UI service is running, and your connection to it (VPN, proxy).`}
+          ${age != null ? html`Showing data from <span data-age-ms="${live.lastOk}"></span>.` : "No data yet."} Retrying <span data-next-poll></span>.</p>
       </div><button type="button" class="btn small" data-retry-now>Retry now</button></div>
       <code class="mono db-error-msg">${live.error}</code></div>`);
   }
@@ -216,7 +232,7 @@ export function createOverview(section) {
   function update(msg) {
     const data = msg.data, live = msg.live;
     const items = attentionItems(data);
-    const v = verdict(data, live.error, items);
+    const v = verdict(data, live.error, items, live.errorKind);
     setText(section.querySelector("#verdict-word"), v.h1);
     section.querySelector("#verdict-glyph").className = "glyph g-" + v.tone;
     section.querySelector("#ov-h1").className = "verdict t-" + v.tone;

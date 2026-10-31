@@ -9,7 +9,8 @@ const PLATFORMS = {
 };
 const BROWSERS = { chromium: "Cr", chrome: "Cr", firefox: "Ff", webkit: "Wk" };
 const STATE_WORDS = {
-  free: "Free", busy: "In use", unhealthy: "Unhealthy", failing: "Failing", offline: "Offline", cooling: "Cooling down",
+  // One state, one word: a failing slot waiting for its retry is still "Failing".
+  free: "Free", busy: "In use", unhealthy: "Unhealthy", failing: "Failing", offline: "Offline", cooling: "Failing · cooling down",
 };
 
 export const pad = (n) => String(n).padStart(2, "0");
@@ -137,6 +138,14 @@ export function publicHub(status, pageHost) {
   if (!m) return raw.replace(/\/+$/, "");
   const host = pageHost && pageHost.indexOf(":") !== -1 && pageHost[0] !== "[" ? "[" + pageHost + "]" : pageHost || m[2];
   return m[1].toLowerCase() + "://" + host + (m[3] ? ":" + m[3] : "");
+}
+
+// An endpoint split where a line may break: after "://" and each "/", never inside a node name.
+export function endpointParts(url) {
+  const m = /^([a-z]+:\/\/)?(.*)$/i.exec(String(url || ""));
+  const parts = m[2].split("/").map((p, i, all) => (i < all.length - 1 ? p + "/" : p)).filter(Boolean);
+  if (m[1] && parts.length) parts[0] = m[1] + parts[0];
+  return parts;
 }
 
 export function connectUrl(hub, node, slot) {

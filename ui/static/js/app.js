@@ -1,20 +1,13 @@
 // Shared page context, filled in by main.js, so views don't import each other.
 import { publicHub, parseTime } from "./format.js";
+import { localStore } from "./storage.js";
 
 const HUB_KEY = "gridHub";
 
-function local(key, value) {
-  try {
-    if (value === undefined) return window.localStorage.getItem(key);
-    if (value === null) window.localStorage.removeItem(key);
-    else window.localStorage.setItem(key, value);
-  } catch (e) { /* storage blocked: not remembered */ }
-  return null;
-}
-
+// Per-browser preferences (theme, density, rail, inspector width, hub address).
 export const prefs = {
-  get: (key, fallback) => { const v = local(key); return v == null ? fallback : v; },
-  set: (key, value) => local(key, value == null ? null : String(value)),
+  get: (key, fallback) => { const v = localStore.get(key); return v == null ? fallback : v; },
+  set: (key, value) => { if (value == null) localStore.remove(key); else localStore.set(key, String(value)); },
 };
 
 const hubListeners = new Set();

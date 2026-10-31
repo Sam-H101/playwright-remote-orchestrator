@@ -1,4 +1,5 @@
-// The slot matrix: every node as one dense row, every slot as a glyph-coded 28px cell. The whole
+// The slot matrix: every node as one dense row, every slot as a glyph-coded 28px cell labelled with
+// its slot number (gateway) or port (static host), the number checks and reports use. The whole
 // matrix is one role=grid with a roving tabindex, so 300 slots are still a single Tab stop.
 import { html, icon, patchList, setHTML } from "../html.js";
 import { browserMonograms, platformOf, plural, slotState, stateWord, parseTime } from "../format.js";
@@ -24,7 +25,8 @@ export function slotCell(node, slot, extra = "") {
   const label = cellLabel(node, slot);
   return html`<div role="gridcell" class="cell s-${st}${slot.fails && st !== "failing" && st !== "cooling" ? " has-fails" : ""} ${extra}"
     data-slot="${slot.id}" data-fk="slot-${slot.id}" data-nav tabindex="-1" aria-label="${label}"
-    ${slot.retry_at ? html`data-retry="${slot.retry_at}" data-label="${label}"` : ""}>${slot.fails ? html`<span class="badge" aria-hidden="true">${slot.fails}</span>` : ""}</div>`;
+    ${slot.retry_at ? html`data-retry="${slot.retry_at}" data-label="${label}"` : ""}><span class="cell-n" aria-hidden="true">${slot.port}</span>${slot.fails
+      ? html`<span class="badge" aria-hidden="true">${slot.fails}</span>` : ""}</div>`;
 }
 
 export function statusGlyph(node) {
@@ -180,8 +182,9 @@ export function createMatrix(root, { onOpen, onMenu, hub }) {
     if (cell) hideTip(cell);
   });
 
-  // Afterglow: a 600 ms ring on the change, then a 10 s halo (green: finished cleanly; red:
-  // failures went up). Applied after rendering, because a re-rendered row starts clean.
+  // Afterglow: a 600 ms ring on the change, then a 10 s halo. Its colour is not a state colour (so a
+  // just-freed slot doesn't read as "healthy" or "selected"): neutral when a run finished, accent
+  // when one was claimed, red when failures went up. Applied after rendering: a new row starts clean.
   function glow(recorder, fresh) {
     const now = Date.now();
     const latest = new Map();

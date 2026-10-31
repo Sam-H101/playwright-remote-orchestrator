@@ -1,11 +1,15 @@
 // Every request to the grid goes through here, with credentials from auth.js.
 import * as auth from "./auth.js";
 
+// kind says which hop failed, so the page can say so: "network" (no answer from the Grid UI
+// server at all), "server" (it answered, but not with JSON: a proxy, a crash), "database" (the UI
+// is up and its database isn't), or "http" (a refusal the body explains).
 export class ApiError extends Error {
-  constructor(message, status, body) {
+  constructor(message, status, body, kind = "http") {
     super(message);
     this.status = status;
     this.body = body || {};
+    this.kind = kind;
   }
 }
 
@@ -18,9 +22,17 @@ async function send(method, url, body) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body || {});
   }
-  const r = await fetch(url, opts);
-  let data = {};
-  try { data = await r.json(); } catch (e) { data = {}; }
+  let r;
+  try {
+    r = await fetch(url, opts);
+  } catch (e) {
+    throw new ApiError("No answer from the Grid UI server at " + location.host + ".", 0, {}, "network");
+  }
+  let data = null;
+  try { data = await r.json(); } catch (e) { data = null; }
+  if (data === null && !r.ok) {
+    throw new ApiError("The Grid UI server at " + location.host + " answered HTTP " + r.status + " without data.", r.status, {}, "server");
+  }
   return { status: r.status, ok: r.ok, body: data || {} };
 }
 
@@ -47,10 +59,10 @@ export async function post(url, body) {
   return r.body;
 }
 
-// The page polls with ?soft=1, so a database outage comes back as data rather than as an HTTP
-// error the browser would log on every poll.
-export async function status() {
-  const body = await get("api/status?soft=1");
-  if (body.unavailable) throw new ApiError(body.error || "The database is unavailable.", 503, body);
+// The page's poll. ?soft=1: a database outage comes back as data rather than as an HTTP error the
+// browser would log every time. ?events=<cursor>: what the server's recorder saw since then.
+export async function status(cursor) {
+  const body = await get("api/status?soft=1&events=" + encodeURIComponent(cursor == null ? 0 : cursor));
+  if (body.unavailable) throw new ApiError(body.error || "The database is unavailable.", 503, body, "database");
   return body;
 }

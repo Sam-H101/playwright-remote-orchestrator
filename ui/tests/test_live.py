@@ -85,7 +85,18 @@ UNIT = r"""async ([liveUrl, formatUrl]) => {
   const now = Date.now();
   rec.add(Array.from({ length: 520 }, (_, i) => ({ type: "claimed", t: now - 1000 + i })), now);
   rec.add([{ type: "claimed", t: now - 20 * 60e3 }], now);
+  rec.flush();
   out.recorder = [rec.events.length, rec.dropped, JSON.parse(mem.get("gridRecorder")).events.length, new L.Recorder(store).events.length];
+
+  // The same run told twice (two server processes, or the server and this page) is one event, with
+  // the better facts and the admin attribution kept.
+  const merged = new L.Recorder(null);
+  merged.merge([{ id: "f:1:9", type: "finished", t: now, approx: true, start: null, dur: null }], now);
+  merged.merge([{ id: "f:1:9", type: "finished", t: now, approx: false, start: now - 4000, dur: 4000 }], now);
+  merged.merge([{ id: "f:1:9", type: "finished", t: now, kind: "admin", by: "Admin" }], now);
+  merged.mark(["f:1:9"]);
+  out.merged = [merged.events.length, merged.events[0].approx, merged.events[0].dur, L.describe(merged.events[0])];
+  out.byOthers = [L.describe({ type: "finished", kind: "admin", by: "dana", dur: 4000 }), L.describe({ type: "node-left", kind: "admin", by: "" })];
 
   out.format = {
     duration: [F.duration(3725), F.duration(42), F.duration(272), F.duration(null)],
@@ -125,6 +136,8 @@ def test_diff_and_formatters_are_pure_and_right(grid, page):
     assert out["heartbeat"] == 0 and out["none"] == 0
     assert out["bursts"] == [[7, 4100]]
     assert out["recorder"] == [500, 20, 500, 500]  # capped at 500, the overflow counted, old events expire
+    assert out["merged"] == [1, False, 4000, "released by you after 4.0 s"]
+    assert out["byOthers"] == ["released by dana after 4.0 s", "forgotten from the Grid UI"]
 
     f = out["format"]
     assert f["duration"] == ["1h 2m", "42s", "4m 32s", "–"]
@@ -314,7 +327,9 @@ def test_signed_out_admin_controls_sign_in_first_then_confirm(grid, page, monkey
     assert run(path, "SELECT inUse FROM portUsage WHERE id = (SELECT id FROM portStatus WHERE PortServer = 'pw-static.lab.local' AND PortNumber = 3000)") == [(0,)]
     page.goto(url + "#/activity?kind=admin")
     page.wait_for_selector("#act-rows tr")
-    assert "you released pw-static.lab.local:3000" in page.text_content("#act-rows")
+    rows = page.locator("#act-rows tr")
+    assert rows.count() == 1  # one row per action: the release it caused, attributed, not a note beside it
+    assert "pw-static.lab.local:3000" in rows.first.text_content() and "released by you after 2h" in rows.first.text_content()
 
 
 def test_a_database_error_is_one_panel_with_the_retry(tmp_path, monkeypatch, page):
@@ -378,3 +393,107 @@ def test_a_large_grid_stays_usable(tmp_path, monkeypatch, browser):
             p.close()
     finally:
         server.shutdown()
+
+
+def test_a_tab_opened_after_a_burst_still_sees_it(grid, browser):
+    """The 2 am case: nobody had the page open while seven 4-second checks ran. The server recorded
+    them, and a fresh tab shows them straight away."""
+    url, path = grid
+    first = browser.new_page()
+    first.goto(url)
+    first.wait_for_selector(".mx-row[data-key]")
+    first.close()  # the last page closes; the server keeps recording
+    ids = free_ids(path)
+    marks = ",".join("?" * len(ids))
+    claimed = utc()
+    run(path, "UPDATE portUsage SET inUse = 1, LastRunDate = ? WHERE id IN ({})".format(marks), [claimed] + ids)
+    time.sleep(2.6)  # the server's recorder takes a snapshot of the claims
+    finished = (datetime.datetime.strptime(claimed, "%Y-%m-%d %H:%M:%S") + datetime.timedelta(seconds=4)).strftime("%Y-%m-%d %H:%M:%S")
+    run(path, "UPDATE portUsage SET inUse = 0, LastRunDate = ? WHERE id IN ({})".format(marks), [finished] + ids)
+    time.sleep(2.6)  # ... and of the releases
+
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})  # nothing cached: a new browser
+    p = ctx.new_page()
+    try:
+        p.goto(url)
+        p.wait_for_selector(".tl-flag:has-text('7 runs · 4.0 s avg')", timeout=4000)
+        assert p.locator("#tl-lanes .bar.done").count() >= 7
+        assert p.text_content("#runs-counter").startswith("7 runs finished")
+        p.goto(url + "#/activity?kind=finish")
+        p.wait_for_selector("#act-rows tr")
+        assert p.locator("#act-rows tr", has_text="finished in 4.0 s").count() == 7
+        assert p.text_content("#act-sub").startswith("Recorded by the Grid UI server since")
+    finally:
+        ctx.close()
+
+
+def test_the_runs_summary_counts_one_window_and_keeps_stale_claims_apart(grid, page):
+    url, _ = grid
+    page.goto(url)
+    page.wait_for_selector(".mx-row[data-key]")
+    text = page.text_content("#runs-summary")
+    # The demo has 8 claims; one is 2 h old (stale): it isn't a running check.
+    # "Since hh:mm" when the server's recording is younger than the window.
+    assert ("Last 5 min" in text or "Since " in text) and "7 running" in text and "0 finished" in text and "1 stale claim not counted" in text
+    page.click("#tl-zoom [data-zoom='1m']")
+    assert "Last 1 min" in page.text_content("#runs-summary")
+    assert page.evaluate("localStorage.getItem('gridRunsZoom')") == "1m"
+
+
+def test_a_lost_connection_is_not_blamed_on_the_database(grid, page):
+    url, _ = grid
+    page.goto(url)
+    page.wait_for_selector(".mx-row[data-key]")
+    page.route("**/api/status*", lambda route: route.abort())
+    page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+    page.wait_for_selector(".db-error[role=alert]")
+    assert page.text_content("#ov-h1") == "Can't reach the Grid UI server"
+    assert "can't reach the Grid UI server" in page.text_content(".db-error")
+    assert "database" not in page.text_content(".db-error-title")
+    page.wait_for_function("() => document.getElementById('fresh-text').textContent.includes('Grid UI server unreachable')"
+                           " || document.getElementById('fresh-text').textContent.startsWith('Live')", timeout=3000)
+
+
+def test_whole_rows_open_the_inspector(grid, page):
+    url, _ = grid
+    for width in (1440, 375):
+        page.set_viewport_size({"width": width, "height": 860})
+        page.goto(url + "#/overview")
+        page.wait_for_selector("#att-list .att-row")
+        page.locator("#att-list .att-row").first.locator(".att-cause").click()
+        page.wait_for_function(r"() => /^#\/(slot|node|session)\//.test(location.hash)")
+        assert page.is_visible("#inspector")
+        page.keyboard.press("Escape")
+        page.wait_for_selector("#inspector", state="hidden")
+
+
+def test_a_release_never_ends_a_newer_claim(grid, page):
+    url, path = grid
+    page.goto(url)
+    page.wait_for_selector("#att-list [data-act=release]")
+    page.click("#att-list [data-act=release]")
+    page.wait_for_selector("#confirm-dialog[open]")
+    sid = run(path, "SELECT id FROM portStatus WHERE PortServer = 'pw-static.lab.local' AND PortNumber = 3000")[0][0]
+    run(path, "UPDATE portUsage SET LastRunDate = ? WHERE id = ?", (utc(), sid))  # the old check ended; a new one claimed it
+    page.click("#confirm-ok")
+    page.wait_for_selector("#toast.bad")
+    assert "Another check claimed this slot" in page.text_content("#toast")
+    assert run(path, "SELECT inUse FROM portUsage WHERE id = ?", (sid,)) == [(1,)]
+
+
+def test_slot_cells_show_their_number_and_the_inspector_wraps_its_snippets(grid, page):
+    url, path = grid
+    page.goto(url)
+    page.wait_for_selector(".mx-row[data-key]")
+    static = page.eval_on_selector_all(".mx-row[data-key='pw-static.lab.local'] .cell .cell-n", "els => els.map(e => e.textContent)")
+    assert static == ["3000", "3001", "3002", "3003"]
+    assert page.eval_on_selector_all(".mx-row[data-key='WIN-BUILD-01'] .cell .cell-n", "els => els.map(e => e.textContent)") == ["1", "2", "3", "4"]
+    sid = run(path, "SELECT id FROM portStatus WHERE PortServer = 'runner-b81e04' AND PortNumber = 3")[0][0]
+    page.set_viewport_size({"width": 375, "height": 812})
+    page.goto(url + "#/slot/{}".format(sid))
+    page.wait_for_selector("#repro-code")
+    page.wait_for_timeout(200)
+    assert page.evaluate("(() => { const p = document.querySelector('#inspector pre'); return p.scrollWidth <= p.clientWidth + 1; })()")
+    facts = page.text_content("#insp-body .facts")
+    assert "4 failures · limit 3" in facts and "of 3" not in facts
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

@@ -25,7 +25,10 @@ export function createAccess(section) {
         <p class="view-sub">Agents send an <strong>agent token</strong> to register a node with the hub; checks send a <strong>client token</strong> to open a browser session.
           Give each group of hosts its own token, so you can revoke one without touching the rest.</p>
       </div>
-      <button type="button" class="btn primary" id="new-token-btn" data-new-token hidden>${icon("i-plus")}New token</button>
+      <div class="head-actions">
+        <button type="button" class="btn" id="new-token-btn" data-new-token hidden>${icon("i-plus")}New token</button>
+        <button type="button" class="btn primary" id="add-host-btn" aria-expanded="false" aria-controls="add-host" hidden>${icon("i-server")}Add a host</button>
+      </div>
     </header>
     <div class="banner" id="access-banner" role="status" hidden></div>
     <div id="reveal"></div>
@@ -65,7 +68,7 @@ export function createAccess(section) {
   dismissible(dlg);
   // ok, signedout, unconfigured, error, loading
   const access = { state: "loading", data: null, sig: null, error: null, kind: "all", status: "all", reveal: null, loading: false, loadedAt: 0, note: "", refused: false };
-  const host = { platform: "windows", pending: null, done: null };
+  const host = { platform: "windows", pending: null, done: null, open: false, confirmDup: null };
   let visible = false;
 
   // ---- loading ---------------------------------------------------------------
@@ -200,9 +203,11 @@ export function createAccess(section) {
   function render() {
     const d = access.state === "ok" ? access.data : null, list = !!(d && d.ready && d.tokens.length);
     $("#new-token-btn").hidden = !list;
+    $("#add-host-btn").hidden = !(d && d.ready);
+    $("#add-host-btn").setAttribute("aria-expanded", String(host.open));
     $("#token-toolbar").hidden = !list;
     $("#token-panel").hidden = !list;
-    $("#add-host").hidden = !(d && d.ready);
+    $("#add-host").hidden = !(d && d.ready && host.open);
     setHTML($("#access-state"), list ? html`` : stateMarkup());
     if (list) renderTokens(d);
     if (d && d.ready) renderAddHost();
@@ -280,6 +285,7 @@ export function createAccess(section) {
         <div class="usage-grid">${usages(r).map((u, i) => html`<div class="step"><div class="step-label">${u[0]}</div>
           <div class="snippet"><code class="mono" data-usage="${i}">${u[1]}</code><button type="button" class="${r.platform ? "btn primary small" : "icon-btn tiny"}" data-copy="${u[1]}" data-copy-label="the command"
             data-fk="reveal-use-${i}" aria-label="Copy the command for ${u[0].split(":")[0]}">${icon("i-copy")}${r.platform ? "Copy command" : ""}</button></div></div>`)}</div>
+        ${r.platform && r.platform !== "docker" ? html`<p class="hint">The token is part of this command, so it also stays in that shell's history on the host.</p>` : ""}
       </div>
       ${r.waitFor ? html`<p class="wait-line" id="wait-line" role="status"></p>` : ""}
     </section>`);
@@ -309,8 +315,9 @@ export function createAccess(section) {
     if (box.__built) return;
     box.__built = true;
     setHTML(box, html`
-      <header class="ah-head"><h2 id="ah-title">Add a host</h2>
-        <p>Makes an agent token bound to one node name, shows the one command that installs it, and waits for the host to register.</p></header>
+      <header class="ah-head"><div><h2 id="ah-title">Add a host</h2>
+        <p>Makes an agent token bound to one node name, shows the one command that installs it, and waits for the host to register.</p></div>
+        <button type="button" class="btn ghost small" data-ah-close>Cancel</button></header>
       <form class="ah-steps" id="ah-form" novalidate>
         <fieldset class="ah-step"><legend><span class="step-n">1</span>Platform</legend>
           <div class="ah-platforms">${PLATFORMS.map(([id, label, ic]) => html`<label class="choice-card">
@@ -318,18 +325,28 @@ export function createAccess(section) {
         </fieldset>
         <div class="ah-step"><label class="step-legend" for="ah-node"><span class="step-n">2</span>Bind to node name</label>
           <input id="ah-node" class="mono" type="text" list="node-names" maxlength="128" autocomplete="off" autocapitalize="off" spellcheck="false"
-            placeholder="win-build-02" aria-describedby="ah-hint ah-error">
+            placeholder="e.g. win-build-02" aria-describedby="ah-hint ah-error">
           <p class="hint" id="ah-hint">The host registers under this name, and only it can use the token.</p>
           <p class="form-error" id="ah-error" role="alert" hidden></p>
         </div>
-        <div class="ah-step"><span class="step-legend"><span class="step-n">3</span>Create and copy</span>
+        <div class="ah-step"><span class="step-legend"><span class="step-n">3</span>Create the token</span>
           <button type="submit" class="btn primary" id="ah-create">${icon("i-plus")}Create token and command</button>
           <p class="hint">An agent token named “<span id="ah-name">node agent</span>”, valid for a year.</p>
         </div>
       </form>`);
     const input = box.querySelector("#ah-node");
+    const HINT = "The host registers under this name, and only it can use the token.";
+    const createLabel = (text) => setHTML(box.querySelector("#ah-create"), html`${icon("i-plus")}${text}`);
     input.addEventListener("input", () => {
-      box.querySelector("#ah-name").textContent = (input.value.trim().toLowerCase() || "node") + " agent";
+      const typed = input.value.trim(), name = typed.toLowerCase();
+      box.querySelector("#ah-name").textContent = (name || "node") + " agent";
+      // Node names are lower case: say what it will really be called.
+      box.querySelector("#ah-hint").textContent = typed && typed !== name ? "Registers as " + name + ": node names are lower case." : HINT;
+      if (host.confirmDup) {
+        host.confirmDup = null;
+        createLabel("Create token and command");
+        box.querySelector("#ah-error").hidden = true;
+      }
     });
     box.querySelector("#ah-form").addEventListener("change", (e) => {
       if (e.target.name === "ah-platform") host.platform = e.target.value;
@@ -345,8 +362,21 @@ export function createAccess(section) {
         return;
       }
       err.hidden = true;
+      err.classList.remove("notice");
       input.removeAttribute("aria-invalid");
       const btn = box.querySelector("#ah-create");
+      // A second token for the same host usually means the first was lost: say so before piling up.
+      const dup = ((access.data && access.data.tokens) || []).find((t) => t.kind === "agent" && t.status === "active" && t.nodeName === name);
+      if (dup && host.confirmDup !== name) {
+        host.confirmDup = name;
+        err.textContent = name + " already has an active agent token, “" + dup.name + "”, created " + shortDate(parseTime(dup.createdAt), app.now()) +
+          ". Creating another leaves both working: revoke the old one in the list below once the host uses the new one.";
+        err.classList.add("notice");
+        err.hidden = false;
+        createLabel("Create another token");
+        btn.focus();
+        return;
+      }
       btn.disabled = true;
       try {
         const res = await api.post("api/tokens", { name: name + " agent", kind: "agent", nodeName: name, expiresInDays: 365 });
@@ -358,6 +388,8 @@ export function createAccess(section) {
         access.reveal = Object.assign({}, res, { platform: host.platform, waitFor: name });
         renderReveal(true);
         input.value = "";
+        host.confirmDup = null;
+        createLabel("Create token and command");
         load(true);
       } catch (ex) {
         err.textContent = ex.message;
@@ -420,7 +452,7 @@ export function createAccess(section) {
       title: "Revoke “" + t.name + "”?", text, ok: "Revoke token", note,
       items: agent ? t.nodes.map((n) => {
         const on = online.indexOf(n) !== -1;
-        return { text: n, tone: on ? "ok" : "off", label: on ? "Online: disconnected now" : "Offline" };
+        return { text: n, tone: on ? "ok" : "off", label: on ? "Online now: disconnected within about 15 s" : "Offline" };
       }) : [],
     }).then((ok) => { if (ok) return tokenAction("api/tokens/" + encodeURIComponent(id) + "/revoke", "Revoked “" + t.name + "”.", origin); });
   }
@@ -513,9 +545,23 @@ export function createAccess(section) {
     }
   });
 
+  function toggleAddHost(open) {
+    host.open = open;
+    render();
+    if (open) {
+      const first = section.querySelector('#add-host input[name="ah-platform"]:checked');
+      if (first) first.focus();
+      $("#add-host").scrollIntoView({ block: "nearest" });
+    } else {
+      $("#add-host-btn").focus();
+    }
+  }
+
   // ---- events -----------------------------------------------------------------------
   section.addEventListener("click", async (e) => {
     let el;
+    if (e.target.closest("#add-host-btn")) return toggleAddHost(!host.open);
+    if (e.target.closest("[data-ah-close]")) return toggleAddHost(false);
     if ((el = e.target.closest("[data-copy]")) && el.closest("#reveal") && access.reveal) access.reveal.copied = true;
     if (e.target.closest("[data-new-token]")) return openCreate();
     if ((el = e.target.closest("[data-revoke]"))) return confirmRevoke(el.dataset.revoke, el);
