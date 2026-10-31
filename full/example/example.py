@@ -1,4 +1,4 @@
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Playwright
 import os
 
 
@@ -7,13 +7,13 @@ second_ms = 1000
 thirty_seconds_ms = 30 * second_ms
 
 
-def test_docusign(playwright: sync_playwright):
+def test_docusign(playwright: Playwright):
     port = os.environ.get("port")
     host = os.environ.get("host")
     try:
         browser = playwright.chromium.connect("ws://{}:{}".format(host,port))
-    except:
-        raise "connect_Failure"
+    except Exception as ex:
+        raise Exception("connect_Failure") from ex
     page = browser.new_page()
     try:
         page.goto(url)
@@ -30,15 +30,14 @@ def test_docusign(playwright: sync_playwright):
             if not key.__contains__("GRN"):
 
                 fail = True
-            else:
-                pass
+                break
 
             i = i + 1
+        if fail:
+            raise Exception("NA{} Failed".format(i))
+
         page.close()
         browser.close()
-
-        if fail:
-            raise "NA{} Failed".format(i)
 
     except Exception as ex:
         page.screenshot(path="main_error.jpeg")
