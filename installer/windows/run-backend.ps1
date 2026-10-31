@@ -3,92 +3,97 @@
     Supervisor for the Playwright Windows backend. Started by the scheduled task that install-backend.ps1 registers.
 
 .DESCRIPTION
-    Starts one `playwright run-server` per configured port, restarts any that exit (with a short back-off
-    for servers that crash repeatedly), and keeps <InstallDir>\runtime.json up to date with pid, restart
-    count and health for each port so backend-status.ps1 and the orchestrator can see what is running.
+    Runs the gateway agent (app\gateway\agent.js), which dials out to the hub, registers this node and
+    supervises one `playwright run-server` per slot on 127.0.0.1. This script only keeps the agent itself
+    alive: it restarts it with a back-off when it exits. The agent writes <InstallDir>\runtime.json, which
+    backend-status.ps1 reads.
 #>
 [CmdletBinding()]
-param(
-    [int]$CheckIntervalSec = 10
-)
+param()
 
 $ErrorActionPreference = 'Stop'
 $InstallDir = $PSScriptRoot
 Import-Module (Join-Path $InstallDir 'PlaywrightBackend.psm1') -Force
 
 $config = Get-BackendConfig -InstallDir $InstallDir
-if (-not $config) { throw "backend.json not found in $InstallDir. Run install-backend.ps1 first." }
+if (-not $config -or -not $config.hubUrl) { throw "backend.json in $InstallDir has no hubUrl. Run install-backend.ps1 first." }
 
 $logDir = Join-Path $InstallDir 'logs'
 Set-BackendLogFile (Join-Path $logDir 'supervisor.log')
-$cli = Join-Path $InstallDir 'app\node_modules\playwright-core\cli.js'
-$probeHost = Get-ProbeHost $config.bindHost
-$env:PLAYWRIGHT_BROWSERS_PATH = $config.browsersPath
 
-# Servers left behind by a previous supervisor would hold the ports and make every new start fail.
-Stop-BackendServerProcesses -InstallDir $InstallDir
+# Leftovers from an earlier supervisor would hold the slot ports, or register the same node name twice
+# and make the hub kick one of them out every 30s.
+$n = Stop-BackendProcesses -InstallDir $InstallDir
+if ($n) { Write-BackendLog "Stopped $n process(es) left over from a previous run" 'WARN' }
 
-$servers = [ordered]@{}
-foreach ($port in (Get-BackendPorts $config)) {
-    # String key: an [ordered] dictionary treats an [int] index as a position.
-    $servers["$port"] = [pscustomobject]@{ Port = $port; Process = $null; Restarts = 0; FastFails = 0; LastStart = $null; NextStart = [datetime]::MinValue }
+# Put this process in a kill-on-close job: the agent, its run-servers and their browsers inherit it, so
+# they all die with the supervisor (Stop-ScheduledTask and Task Manager only kill this process).
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class BackendJob {
+    [StructLayout(LayoutKind.Sequential)] struct Basic { public long a, b; public uint LimitFlags; public UIntPtr c, d; public uint e; public UIntPtr f; public uint g, h; }
+    [StructLayout(LayoutKind.Sequential)] struct Extended { public Basic Basic; public ulong i1, i2, i3, i4, i5, i6; public UIntPtr m1, m2, m3, m4; }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int cls, ref Extended info, int size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    static IntPtr job;
+    public static int KillChildrenWithMe() {
+        job = CreateJobObject(IntPtr.Zero, null);
+        var info = new Extended();
+        info.Basic.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if (job == IntPtr.Zero || !SetInformationJobObject(job, 9, ref info, Marshal.SizeOf(info)) ||
+            !AssignProcessToJobObject(job, GetCurrentProcess())) return Marshal.GetLastWin32Error();
+        return 0;
+    }
 }
+'@
+$jobError = [BackendJob]::KillChildrenWithMe()
+if ($jobError) { Write-BackendLog "Could not create a kill-on-close job (Win32 error $jobError); the agent may outlive this supervisor" 'WARN' }
 
-function Start-Server {
-    param($Server)
-    $out = Join-Path $logDir "server-$($Server.Port).out.log"
-    $err = Join-Path $logDir "server-$($Server.Port).err.log"
+$app = Join-Path $InstallDir 'app'
+$agentArgs = @(
+    "`"$(Join-Path $app 'gateway\agent.js')`""
+    '--hub', $config.hubUrl
+    '--name', $config.nodeName
+    '--slots', $config.slots
+    '--base-port', $config.basePort
+    '--browsers', ($config.browsers -join ',')
+    '--playwright-cli', "`"$(Join-Path $app 'node_modules\playwright-core\cli.js')`""
+    '--status-file', "`"$(Join-Path $InstallDir 'runtime.json')`""
+    '--log-dir', "`"$logDir`""
+)
+$env:PLAYWRIGHT_BROWSERS_PATH = $config.browsersPath
+# The token goes to the agent through its environment, never its command line, which any local user can read.
+$token = Get-BackendToken -Path (Join-Path $InstallDir 'agent.token')
+if ($token) { $env:GATEWAY_AGENT_TOKEN = $token } else { Remove-Item Env:GATEWAY_AGENT_TOKEN -ErrorAction SilentlyContinue }
+# Nothing inherited from the machine environment should override backend.json.
+foreach ($v in 'HUB_URL', 'NODE_NAME', 'SLOTS', 'BASE_PORT', 'PLAYWRIGHT_CLI', 'STATUS_FILE', 'LOG_DIR') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+
+Write-BackendLog "Supervisor starting: node '$($config.nodeName)', $($config.slots) slots, hub $($config.hubUrl), token $(if ($token) { 'set' } else { 'not set' })"
+
+$delay = 5
+while ($true) {
+    $out = Join-Path $logDir 'agent.log'
+    $err = Join-Path $logDir 'agent.err.log'
     # Keep the previous run's logs so a crash is still diagnosable after the restart.
     foreach ($f in $out, $err) { if (Test-Path $f) { Move-Item $f "$f.prev" -Force } }
-    $argList = @("`"$cli`"", 'run-server', '--port', $Server.Port, '--host', $config.bindHost)
-    $Server.Process = Start-Process -FilePath $config.nodeExe -ArgumentList $argList -WorkingDirectory $InstallDir `
-        -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
-    # Touch the handle so ExitCode is populated once the process exits (Windows PowerShell 5.1 quirk).
-    $null = $Server.Process.Handle
-    $Server.LastStart = Get-Date
-    Write-BackendLog "Started server on port $($Server.Port) (pid $($Server.Process.Id))"
-}
-
-Write-BackendLog "Supervisor starting: Playwright $($config.playwrightVersion), ports $($servers.Keys -join ', ')"
-
-while ($true) {
-    $now = Get-Date
-    foreach ($s in $servers.Values) {
-        if ($s.Process -and -not $s.Process.HasExited) { continue }
-        if ($s.Process) {
-            $s.Restarts++
-            # A server that dies within a minute of starting is crash-looping; back off up to 5 minutes.
-            if (($now - $s.LastStart).TotalSeconds -lt 60) { $s.FastFails++ } else { $s.FastFails = 0 }
-            $delay = 0
-            if ($s.FastFails -gt 0) { $delay = [int][math]::Min(300, 5 * [math]::Pow(2, $s.FastFails - 1)) }
-            $s.NextStart = $now.AddSeconds($delay)
-            Write-BackendLog "Server on port $($s.Port) exited with code $($s.Process.ExitCode); restart #$($s.Restarts) in ${delay}s" 'WARN'
-            $s.Process = $null
-        }
-        if ($now -ge $s.NextStart) {
-            try { Start-Server $s } catch { Write-BackendLog "Could not start port $($s.Port): $($_.Exception.Message)" 'ERROR'; $s.NextStart = $now.AddSeconds(30) }
-        }
-    }
-
-    $runtime = [ordered]@{
-        supervisorPid     = $PID
-        playwrightVersion = $config.playwrightVersion
-        updated           = (Get-Date).ToUniversalTime().ToString('o')
-        ports             = @(foreach ($s in $servers.Values) {
-            [ordered]@{
-                port     = $s.Port
-                pid      = $(if ($s.Process) { $s.Process.Id } else { $null })
-                healthy  = $(if ($s.Process) { Test-BackendPort -ProbeHost $probeHost -Port $s.Port -TimeoutMs 1000 } else { $false })
-                restarts = $s.Restarts
-                since    = $(if ($s.LastStart) { $s.LastStart.ToUniversalTime().ToString('o') } else { $null })
-            }
-        })
-    }
+    $started = Get-Date
     try {
-        $runtime | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $InstallDir 'runtime.json') -Encoding ASCII
+        $proc = Start-Process -FilePath $config.nodeExe -ArgumentList $agentArgs -WorkingDirectory $app `
+            -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
+        # Touch the handle so ExitCode is populated once the process exits (Windows PowerShell 5.1 quirk).
+        $null = $proc.Handle
+        Write-BackendLog "Started agent (pid $($proc.Id))"
+        $proc.WaitForExit()
+        $code = $proc.ExitCode
     } catch {
-        # A reader may hold the file open for a moment; the next loop rewrites it.
+        $code = "error: $($_.Exception.Message)"
     }
-
-    Start-Sleep -Seconds $CheckIntervalSec
+    # An agent that dies within a minute is crash-looping (exit 2 = bad config); back off up to 5 minutes.
+    if (((Get-Date) - $started).TotalSeconds -ge 60) { $delay = 5 }
+    Write-BackendLog "Agent exited ($code); restarting in ${delay}s. See $err" 'WARN'
+    Start-Sleep -Seconds $delay
+    $delay = [math]::Min(300, $delay * 2)
 }

@@ -1,0 +1,19 @@
+{
+  "name": "playwright-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hub and node agent that tunnel Playwright run-server sessions through one port",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "hub": "node hub.js",
+    "agent": "node agent.js",
+    "test": "node --test test/protocol.test.js test/gateway.test.js test/tokens.test.js test/routing.test.js test/mysql.test.js"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.0",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,43 +1,134 @@
-version: "3.8"
+# Orchestrator stack. MySQL lives in docker-compose.mysql.yaml; start both with
+#   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml up -d --build --scale runner=2
+# Settings come from .env (copy .env.example). The hub port is the only one runner hosts need to reach.
+
+# An existing MySQL server: set DB_* in .env. docker-compose.mysql.yaml replaces these with its
+# own server and the MYSQL_* credentials.
+x-db-env: &db-env
+  DB_HOST: ${DB_HOST:-mysql}
+  DB_PORT: ${DB_PORT:-3306}
+  DB_NAME: ${DB_NAME:-orchestrator}
+  DB_USER: ${DB_USER:-orchestrator}
+  DB_PASSWORD: ${DB_PASSWORD:-orchestrator}
+
+# The hub's /connect routing and the Grid UI's 'failing' state read the same values: a slot with this
+# many consecutive connect failures is skipped and retried once per cooldown. The hub renews its lease
+# every third of GATEWAY_HUB_LEASE_S; the UI flags a hub session as stale once its hub's lease ran out.
+x-slot-env: &slot-env
+  SLOT_FAIL_THRESHOLD: ${SLOT_FAIL_THRESHOLD:-3}
+  SLOT_FAIL_COOLDOWN_S: ${SLOT_FAIL_COOLDOWN_S:-300}
+  GATEWAY_HUB_LEASE_S: ${GATEWAY_HUB_LEASE_S:-90}
+
 services:
+  hub:
+    container_name: playwright_hub
+    image: playwright_orchestrator_hub
+    build:
+      context: .
+      dockerfile: docker/hub/Dockerfile
+    restart: unless-stopped
+    networks:
+      - playwright
+    ports:
+      - "${GATEWAY_PORT:-4500}:4500"
+    environment:
+      <<: [*db-env, *slot-env]
+      HUB_DB: ${HUB_DB:-mysql}
+      EPHEMERAL_GRACE_S: ${EPHEMERAL_GRACE_S:-120}
+      # /connect: how long a client waits for a free slot, how many may wait, how many slots one is tried on.
+      GATEWAY_QUEUE_TIMEOUT_S: ${GATEWAY_QUEUE_TIMEOUT_S:-60}
+      GATEWAY_QUEUE_MAX: ${GATEWAY_QUEUE_MAX:-200}
+      GATEWAY_CONNECT_ATTEMPTS: ${GATEWAY_CONNECT_ATTEMPTS:-3}
+      # Bootstrap tokens: the runners and the example check below use them, and they work while MySQL
+      # is down. The hub also accepts the managed tokens made on the Grid UI's Access page.
+      GATEWAY_AGENT_TOKEN: ${GATEWAY_AGENT_TOKEN:?set GATEWAY_AGENT_TOKEN in .env (see .env.example)}
+      GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:?set GATEWAY_CLIENT_TOKEN in .env (see .env.example)}
+      TOKEN_CACHE_S: ${TOKEN_CACHE_S:-10}
+      TOKEN_RECHECK_S: ${TOKEN_RECHECK_S:-15}
+    # Polls faster than the image's own check so runners start soon after the hub; start_period
+    # covers the hub waiting for MySQL on first boot.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4500/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  # Linux runner nodes. No container_name and no ports, so `--scale runner=N` works; each one
+  # registers with the hub under its container hostname as an ephemeral node (EPHEMERAL=1 in the
+  # image), so the hub removes a runner EPHEMERAL_GRACE_S after it goes away.
+  runner:
+    image: playwright_orchestrator_runner
+    build:
+      context: .
+      dockerfile: docker/runner/Dockerfile
+    restart: unless-stopped
+    init: true
+    shm_size: 1gb
+    networks:
+      - playwright
+    environment:
+      HUB_URL: ws://hub:4500
+      GATEWAY_AGENT_TOKEN: ${GATEWAY_AGENT_TOKEN:?set GATEWAY_AGENT_TOKEN in .env (see .env.example)}
+      SLOTS: ${RUNNER_SLOTS:-4}
+    depends_on:
+      hub:
+        condition: service_healthy
+
   web:
     container_name: python_playwright
     image: playwright_orchestrator_web
     build: ./docker/python
     networks:
       - playwright
+
   example_playwright:
     #user: "1032:1034" #userid of the playwright user
     container_name: example_playwright
-    image: playwright_orchestrator_web:latest
-    hostname: playright-example_playwright
-    restart: always
+    image: playwright_orchestrator_web
+    # Built by the web service; without this a first `up` tries to pull it from Docker Hub.
+    pull_policy: never
+    restart: unless-stopped
+    init: true
     networks:
       - playwright
+    # The check connects to <GATEWAY_URL>/connect; the hub picks the slot (on GATEWAY_NODE if it is set).
+    # MySQL is only used to create the tables, sync hosts: and free stale claims.
+    environment:
+      <<: *db-env
+      GATEWAY_URL: ${GATEWAY_URL:-ws://hub:4500}
+      GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:?set GATEWAY_CLIENT_TOKEN in .env (see .env.example)}
+      GATEWAY_NODE: ${GATEWAY_NODE:-}
     volumes:
       - ./logs/example_playwright/:/app/logs/
       - ./src/:/app/src
       - ./main.py:/app/main.py
       - ./full/example/example.py:/app/example.py
     command: python3 /app/main.py --fil example.py --fol /app/ -i 100
+    depends_on:
+      hub:
+        condition: service_started
+
   grid_ui:
     container_name: playwright_grid_ui
     build:
       context: .
       dockerfile: docker/ui/Dockerfile
-    restart: always
+    restart: unless-stopped
     networks:
       - playwright
     ports:
       - "127.0.0.1:4444:4444"
     environment:
+      <<: [*db-env, *slot-env]
       ORCHESTRATOR_CONFIG: /app/src/database.yaml
-      DB_HOST: ${DB_HOST:-mysql}
-      DB_PORT: ${DB_PORT:-3306}
-      DB_NAME: ${MYSQL_DATABASE:-orchestrator}
-      DB_USER: ${MYSQL_USER:-orchestrator}
-      DB_PASSWORD: ${MYSQL_PASSWORD:-orchestrator}
-      # GRID_ADMIN_TOKEN: change-me  # require this token for management actions
+      GATEWAY_URL: ${GATEWAY_URL:-ws://hub:4500}
+      # Optional: the rest of the UI works without it, and the Access page stays locked until it is set.
+      GRID_ADMIN_TOKEN: ${GRID_ADMIN_TOKEN:-}
+      GRID_UI_ALLOWED_HOSTS: ${GRID_UI_ALLOWED_HOSTS:-}
+      # Only tells the Access page that the hub has bootstrap tokens ("set"), never their values.
+      GATEWAY_AGENT_TOKEN: ${GATEWAY_AGENT_TOKEN:+set}
+      GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:+set}
     volumes:
       - ./src/database.yaml:/app/src/database.yaml:ro
 

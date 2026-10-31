@@ -4,29 +4,34 @@ on:
   push:
     paths:
       - 'installer/windows/**'
+      - 'gateway/**'
       - '.github/workflows/windows-backend-installer.yml'
   pull_request:
     paths:
       - 'installer/windows/**'
+      - 'gateway/**'
       - '.github/workflows/windows-backend-installer.yml'
   workflow_dispatch:
 
 jobs:
   install:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     defaults:
       run:
         # Windows PowerShell 5.1, which is what a fresh Windows host has.
         shell: powershell
     env:
       INSTALL_DIR: C:\PlaywrightBackend
+      HUB_HTTP: http://127.0.0.1:4500
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gateway/package-lock.json
 
       - name: Parse scripts
         run: |
@@ -38,57 +43,140 @@ jobs:
           }
           if ($failed) { exit 1 }
 
+      - name: Gateway unit tests
+        working-directory: gateway
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Start hub
+        working-directory: gateway
+        run: |
+          $env:HUB_DB = 'memory'
+          $env:HUB_PORT = '4500'
+          $env:GATEWAY_AGENT_TOKEN = 'ci-token'
+          # Without -Redirect*, Start-Process uses ShellExecute and the hub inherits none of this step's handles.
+          # With them it would hold the step's output pipe open, and the runner kills such leftovers when the step ends.
+          Start-Process cmd -ArgumentList '/c', "node hub.js > `"$env:RUNNER_TEMP\hub.log`" 2> `"$env:RUNNER_TEMP\hub.err.log`"" -WindowStyle Hidden | Out-Null
+          $deadline = (Get-Date).AddSeconds(30)
+          do {
+            Start-Sleep -Seconds 1
+            try { $health = Invoke-RestMethod "$env:HUB_HTTP/healthz" } catch { $health = $null }
+          } until ($health.ok -or (Get-Date) -gt $deadline)
+          if (-not $health.ok) { Get-Content "$env:RUNNER_TEMP\hub*.log"; throw 'The hub did not come up' }
+
+      - name: Plant files in the install folder, as other users could under the older installer
+        run: |
+          # The folder inherits Modify for Authenticated Users from C:\, and users own what they put in it.
+          New-Item -ItemType Directory "$env:INSTALL_DIR\app\node_modules\planted" -Force | Out-Null
+          Set-Content "$env:INSTALL_DIR\app\node_modules\planted\index.js" 'planted'
+          Set-Content "$env:INSTALL_DIR\planted.cmd" 'planted'
+          Set-Content "$env:INSTALL_DIR\agent.token" 'planted'
+          icacls $env:INSTALL_DIR /setowner '*S-1-5-32-545' /T /C /Q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Install
         run: |
-          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -PortStart 3000 -PortCount 2
+          # The hub must have outlived the step that started it.
+          if (-not (Invoke-RestMethod "$env:HUB_HTTP/healthz").ok) { throw 'The hub is not running' }
+          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -HubUrl ws://127.0.0.1:4500 -AgentToken ci-token -NodeName ci-node-07 -Slots 2
           if ($LASTEXITCODE -ne 0) { Get-ChildItem "$env:INSTALL_DIR\logs" | ForEach-Object { Write-Host "--- $($_.Name)"; Get-Content $_.FullName -Tail 40 }; exit $LASTEXITCODE }
           $status = Get-Content "$env:INSTALL_DIR\status.json" -Raw | ConvertFrom-Json
-          if ($status.result -ne 'success' -or $status.healthyPorts -ne 2) { throw "Unexpected status: $($status | ConvertTo-Json)" }
+          if ($status.result -ne 'success' -or -not $status.registered -or $status.healthySlots -ne 2) { throw "Unexpected status: $($status | ConvertTo-Json)" }
+          $node = (Invoke-RestMethod "$env:HUB_HTTP/api/nodes").nodes | Where-Object name -eq $status.node
+          if (-not $node -or $node.slots -ne 2 -or $node.healthySlots -ne 2) { throw "Hub does not list $($status.node) with 2 healthy slots: $($node | ConvertTo-Json)" }
+          Write-Host "Node $($status.node) registered with 2 healthy slots"
+          foreach ($f in "$env:INSTALL_DIR\planted.cmd", "$env:INSTALL_DIR\app\node_modules\planted") { if (Test-Path $f) { throw "$f survived the install" } }
+          if (-not (Select-String -Path "$env:INSTALL_DIR\logs\install.log" -Pattern 'from scratch' -SimpleMatch -Quiet)) { throw 'The planted folder was not reinstalled from scratch' }
+          Add-Content -Path $env:GITHUB_ENV -Value "CI_NODE=$($status.node)" -Encoding ASCII
 
-      - name: Re-run install (should skip npm and browser downloads)
+      - name: Token is not exposed and the install is not writable by users
         run: |
-          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -PortStart 3000 -PortCount 2
+          $acl = Get-Acl "$env:INSTALL_DIR\agent.token"
+          $sids = $acl.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+          $extra = @($sids | Where-Object { $_ -ne 'S-1-5-18' -and $_ -ne 'S-1-5-32-544' })
+          if (-not $acl.AreAccessRulesProtected -or $extra.Count) { throw "agent.token is readable by more than SYSTEM and Administrators: $($acl.AccessToString)" }
+          # The task runs these as SYSTEM, so only SYSTEM and Administrators may change them. That includes owning
+          # them: an owner can always grant itself write access again.
+          foreach ($f in $env:INSTALL_DIR, "$env:INSTALL_DIR\agent.token", "$env:INSTALL_DIR\run-backend.ps1", "$env:INSTALL_DIR\app\gateway\agent.js", "$env:INSTALL_DIR\app\node_modules\playwright-core\cli.js") {
+            $owner = (Get-Acl $f).GetOwner([Security.Principal.SecurityIdentifier]).Value
+            if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') { throw "$f is owned by $((Get-Acl $f).Owner)" }
+          }
+          foreach ($f in $env:INSTALL_DIR, "$env:INSTALL_DIR\run-backend.ps1", "$env:INSTALL_DIR\app\gateway\agent.js") {
+            $writers = @((Get-Acl $f).Access | Where-Object {
+              $sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+              $sid -ne 'S-1-5-18' -and $sid -ne 'S-1-5-32-544' -and ([int]$_.FileSystemRights -band 0x40000116)   # GENERIC_WRITE or any of the Write rights
+            })
+            if ($writers.Count) { throw "$f is writable by $($writers.IdentityReference -join ', ')" }
+          }
+          $leaks = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*ci-token*' })
+          if ($leaks.Count) { throw "Token on a command line: $($leaks.CommandLine)" }
+          foreach ($f in Get-ChildItem "$env:INSTALL_DIR\logs", "$env:INSTALL_DIR\*.json" -File) {
+            if (Select-String -Path $f.FullName -Pattern 'ci-token' -SimpleMatch -Quiet) { throw "Token written to $($f.FullName)" }
+          }
+
+      - name: Re-run the installed copy (keeps every setting, skips npm and browser downloads)
+        run: |
+          # No parameters: InstallDir is the script's folder; hub, token, name and slots come from the install.
+          powershell -NoProfile -ExecutionPolicy Bypass -File "$env:INSTALL_DIR\install-backend.ps1"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path "$env:INSTALL_DIR\logs\install.log" -Pattern 'already installed, skipping npm' -Quiet)) { throw 'Second run did not skip npm install' }
+          $cfg = Get-Content "$env:INSTALL_DIR\backend.json" -Raw | ConvertFrom-Json
+          if ($cfg.nodeName -ne $env:CI_NODE -or $cfg.slots -ne 2) { throw "The re-run changed the settings: $($cfg | ConvertTo-Json)" }
 
-      - name: Connect a client to each port
+      - name: A failed upgrade restarts the previous install
         run: |
+          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -PlaywrightVersion 0.0.0-does-not-exist
+          if ($LASTEXITCODE -ne 1) { throw "Expected exit code 1, got $LASTEXITCODE" }
+          $status = Get-Content "$env:INSTALL_DIR\status.json" -Raw | ConvertFrom-Json
+          if ($status.failedStep -ne 'install node packages' -or -not $status.restartedPrevious) { throw "Unexpected status: $($status | ConvertTo-Json)" }
+          & "$env:INSTALL_DIR\backend-status.ps1" -HealthTimeoutSec 90
+          if ($LASTEXITCODE -ne 0) { throw 'The previous install did not come back' }
+
+      - name: Connect clients through the hub
+        run: |
+          # The hub picks the slot: two browsers at once take both of the node's slots.
           $client = @'
           const { chromium } = require(process.env.INSTALL_DIR + '\\app\\node_modules\\playwright-core');
+          const url = `ws://127.0.0.1:4500/connect?node=${encodeURIComponent(process.env.CI_NODE)}`;
           (async () => {
-            for (const port of [3000, 3001]) {
-              const browser = await chromium.connect(`ws://127.0.0.1:${port}/`);
+            const browsers = await Promise.all([1, 2].map(() => chromium.connect(url, { timeout: 60000 })));
+            for (const [i, browser] of browsers.entries()) {
               const page = await browser.newPage();
               await page.setContent('<h1>ok</h1>');
               const text = await page.textContent('h1');
-              await browser.close();
-              if (text !== 'ok') throw new Error(`port ${port}: got ${text}`);
-              console.log(`port ${port}: ok`);
+              if (text !== 'ok') throw new Error(`session ${i + 1}: got ${text}`);
+              console.log(`session ${i + 1} through ${url}: ok`);
             }
+            await Promise.all(browsers.map((b) => b.close()));
           })().catch(e => { console.error(e); process.exit(1); });
           '@
-          Set-Content -Path client.js -Value $client
-          node client.js
+          Set-Content -Path "$env:RUNNER_TEMP\client.js" -Value $client
+          node "$env:RUNNER_TEMP\client.js"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:INSTALL_DIR\backend-status.ps1"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Supervisor restarts a killed server
+      - name: Supervisor restarts a killed agent
         run: |
-          $runtime = Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json
-          $victim = ($runtime.ports | Where-Object port -eq 3000).pid
-          Stop-Process -Id $victim -Force
-          $deadline = (Get-Date).AddSeconds(60)
-          do {
-            Start-Sleep -Seconds 3
-            & "$env:INSTALL_DIR\backend-status.ps1" -Json | Out-Null
-            $ok = $LASTEXITCODE -eq 0
-          } until ($ok -or (Get-Date) -gt $deadline)
-          if (-not $ok) { Get-Content "$env:INSTALL_DIR\logs\supervisor.log"; throw 'Port 3000 did not come back' }
-          & "$env:INSTALL_DIR\backend-status.ps1"
+          $old = (Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json).pid
+          Stop-Process -Id $old -Force
+          Start-Sleep -Seconds 1
+          & "$env:INSTALL_DIR\backend-status.ps1" -HealthTimeoutSec 90
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:INSTALL_DIR\logs\supervisor.log"; throw 'The agent did not come back' }
+          $new = (Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json).pid
+          if ($new -eq $old) { throw "runtime.json still names the killed agent ($old)" }
 
-      - name: Status reports a stopped backend as degraded
+      - name: Stopping the task stops the agent and reports degraded
         run: |
           Stop-ScheduledTask -TaskName PlaywrightBackend
-          Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object CommandLine -like '*PlaywrightBackend*' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+          Start-Sleep -Seconds 5
+          # The supervisor's kill-on-close job takes the agent, run-servers and browsers down with it.
+          $left = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object CommandLine -like "*$env:INSTALL_DIR\app\*")
+          if ($left.Count) { throw "Still running after Stop-ScheduledTask: $($left.CommandLine -join '; ')" }
+          if ((Invoke-RestMethod "$env:HUB_HTTP/api/nodes").nodes | Where-Object name -eq $env:CI_NODE) { throw 'Hub still lists the node' }
           & "$env:INSTALL_DIR\backend-status.ps1" -Json
           if ($LASTEXITCODE -ne 2) { throw "Expected exit code 2, got $LASTEXITCODE" }
           $global:LASTEXITCODE = 0
@@ -105,5 +193,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backend-logs
-          path: C:\PlaywrightBackend\logs
+          path: |
+            C:\PlaywrightBackend\logs
+            C:\PlaywrightBackend\*.json
+            ${{ runner.temp }}\hub*.log
           if-no-files-found: ignore

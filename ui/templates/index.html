@@ -2,98 +2,192 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
   <title>Playwright Grid</title>
+  <script src="{{ url_for('static', filename='theme.js') }}"></script>
   <link rel="stylesheet" href="{{ url_for('static', filename='grid.css') }}">
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <script type="module" src="{{ url_for('static', filename='js/main.js') }}"></script>
 </head>
-<body data-token-required="{{ 'true' if token_required else 'false' }}">
+<body>
+  <svg class="sprite" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="i-windows" viewBox="0 0 16 16"><path d="M2.5 2.5h4.75v4.75H2.5zM8.75 2.5h4.75v4.75H8.75zM2.5 8.75h4.75v4.75H2.5zM8.75 8.75h4.75v4.75H8.75z"/></symbol>
+      <symbol id="i-linux" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></symbol>
+      <symbol id="i-mac" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="7" rx="1"/><path d="M1.5 12.5h13"/></symbol>
+      <symbol id="i-docker" viewBox="0 0 16 16"><path d="M8 1.8 13.5 5v6L8 14.2 2.5 11V5zM2.5 5 8 8.2 13.5 5M8 8.2v6"/></symbol>
+      <symbol id="i-server" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="4.5" rx="1"/><rect x="2" y="9" width="12" height="4.5" rx="1"/><path d="M4.5 4.75h.01M4.5 11.25h.01"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5V3A1.5 1.5 0 0 0 9 1.5H3A1.5 1.5 0 0 0 1.5 3v6A1.5 1.5 0 0 0 3 10.5h.5"/></symbol>
+      <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.05 3.05l1.06 1.06M11.89 11.89l1.06 1.06M3.05 12.95l1.06-1.06M11.89 4.11l1.06-1.06"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7Z"/></symbol>
+      <symbol id="i-close" viewBox="0 0 16 16"><path d="m4 4 8 8M12 4l-8 8"/></symbol>
+      <symbol id="i-key" viewBox="0 0 16 16"><circle cx="5.5" cy="10.5" r="3"/><path d="M7.6 8.4 13.5 2.5M11.5 4.5l2 2M9.75 6.25l1.5 1.5"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></symbol>
+      <symbol id="i-unlock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 4.9-.7"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 16 16"><path d="M8 2.2 14.3 13.5H1.7zM8 6.5v3M8 11.5v.01"/></symbol>
+      <symbol id="i-check" viewBox="0 0 16 16"><path d="m3 8.5 3 3 7-7"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 16 16"><path d="M6 3.5 10.5 8 6 12.5"/></symbol>
+      <symbol id="i-caret" viewBox="0 0 16 16"><path d="M4.5 6.5 8 10l3.5-3.5"/></symbol>
+      <symbol id="i-more" viewBox="0 0 16 16"><path d="M3.5 8h.01M8 8h.01M12.5 8h.01" stroke-width="2.4"/></symbol>
+      <symbol id="i-user" viewBox="0 0 16 16"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.5a5 5 0 0 1 10 0"/></symbol>
+      <symbol id="i-logout" viewBox="0 0 16 16"><path d="M6.5 13.5h-3a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3M10 5l3 3-3 3M13 8H6.5"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 16 16"><path d="M6 3.5v9M10 3.5v9"/></symbol>
+      <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.5v9l7.5-4.5z"/></symbol>
+      <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></symbol>
+      <symbol id="i-activity" viewBox="0 0 16 16"><path d="M1.5 8h3l2-4.5 3 9 2-4.5h3"/></symbol>
+      <symbol id="i-sessions" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M5 6h6M5 8.5h6M5 11h3.5"/></symbol>
+      <symbol id="i-panel" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10 2.5v11"/></symbol>
+      <symbol id="i-rail" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 2.5v11"/></symbol>
+      <symbol id="i-undo" viewBox="0 0 16 16"><path d="M3.5 6.5h6a3.5 3.5 0 0 1 0 7H6M6 4 3.5 6.5 6 9"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 16 16"><path d="M2.5 4.5h11M6 4.5V3h4v1.5M4 4.5l.7 9h6.6l.7-9"/></symbol>
+      <symbol id="i-node" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="4" rx="1"/><rect x="2" y="9" width="12" height="4" rx="1"/></symbol>
+      <symbol id="i-slot" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5"/></symbol>
+      <symbol id="i-keyboard" viewBox="0 0 16 16"><rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4 7h.01M6.5 7h.01M9 7h.01M11.5 7h.01M5 9.5h6"/></symbol>
+      <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M3 8h10M9 4l4 4-4 4"/></symbol>
+      <symbol id="i-link" viewBox="0 0 16 16"><path d="M6.5 9.5l3-3M7.5 4.5l1-1a2.47 2.47 0 0 1 3.5 3.5l-1 1M8.5 11.5l-1 1A2.47 2.47 0 0 1 4 9l1-1"/></symbol>
+      <symbol id="i-rows" viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></symbol>
+    </defs>
+  </svg>
+
+  <a class="skip" href="#attention">Skip to what needs you</a>
+
   <header class="topbar">
-    <div class="brand">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="2" width="9" height="9" rx="2"/><rect x="13" y="2" width="9" height="9" rx="2" opacity=".6"/><rect x="2" y="13" width="9" height="9" rx="2" opacity=".6"/><rect x="13" y="13" width="9" height="9" rx="2"/></svg>
-      <span>Playwright Grid</span>
-    </div>
-    <nav class="tabs" role="tablist">
-      <button role="tab" data-view="overview" aria-selected="true">Overview</button>
-      <button role="tab" data-view="sessions" aria-selected="false">Sessions <span class="badge" id="session-badge">0</span></button>
-    </nav>
-    <div class="topbar-stats">
-      <div class="capacity" title="Slots in use / total slots">
-        <div class="capacity-label"><span id="cap-text">–</span></div>
-        <div class="meter"><div class="meter-fill" id="cap-fill"></div></div>
-      </div>
-      <button class="icon-btn" id="pause-btn" title="Pause auto-refresh" aria-pressed="false">
-        <span class="live-dot" id="live-dot"></span><span id="pause-label">Live</span>
+    <a class="brand" href="#/overview" aria-label="Playwright Grid overview">
+      <svg class="mark" viewBox="0 0 16 16" aria-hidden="true"><rect x="1" y="1" width="6" height="6" rx="1.5"/><rect x="9" y="1" width="6" height="6" rx="1.5" opacity=".45"/><rect x="1" y="9" width="6" height="6" rx="1.5" opacity=".45"/><rect x="9" y="9" width="6" height="6" rx="1.5"/></svg>
+      <span class="brand-name">Playwright Grid</span>
+      <span class="grid-name mono" id="grid-name"></span>
+    </a>
+    <button type="button" class="verdict-chip t-off" id="verdict-chip"><span class="glyph" aria-hidden="true"></span><span id="verdict-chip-text">No data</span></button>
+    <span class="capacity mono" id="capacity"></span>
+    <span class="freshness f-wait" id="freshness"><span class="fresh-dot" aria-hidden="true"></span><span class="fresh-text" id="fresh-text">Connecting…</span></span>
+    <button type="button" class="icon-btn" id="pause-btn" aria-pressed="false" aria-label="Pause live updates" title="Pause live updates (.)"><svg class="i" aria-hidden="true"><use href="#i-pause"></use></svg></button>
+    <div class="jump-wrap">
+      <button type="button" class="jump" id="jump-btn" aria-haspopup="dialog" aria-keyshortcuts="/ Control+K" aria-label="Jump to node, slot, session or view">
+        <svg class="i" aria-hidden="true"><use href="#i-search"></use></svg><span class="jump-text">Jump to node, slot, session…</span><span class="jump-keys"><kbd>/</kbd><kbd>Ctrl K</kbd></span>
       </button>
+    </div>
+    <div class="top-right">
+      <div class="pop-wrap">
+        <button type="button" class="chip-btn unprotected" id="unprotected-btn" aria-expanded="false" aria-controls="unprotected-pop" hidden>
+          <svg class="i" aria-hidden="true"><use href="#i-unlock"></use></svg><span>Unprotected</span></button>
+        <div class="popover" id="unprotected-pop" role="note" hidden>
+          <p><strong>This grid has no admin sign-in.</strong> Anyone who can open this page can release slots, reset failures and forget nodes.</p>
+          <p>To require sign-in, set <code class="mono">GRID_ADMIN_TOKEN</code> in the Grid UI's environment and restart it.</p>
+        </div>
+      </div>
+      <div class="pop-wrap">
+        <button type="button" class="account-chip" id="account-btn" aria-expanded="false" hidden>Sign in</button>
+      </div>
+      <button type="button" class="icon-btn" id="theme-btn" aria-label="Switch theme"><svg class="i" aria-hidden="true"><use href="#i-moon"></use></svg></button>
     </div>
   </header>
 
-  <main>
-    <div class="banner" id="error-banner" hidden></div>
+  <div class="shell">
+    <nav class="rail" aria-label="Views">
+      <button type="button" class="rail-toggle" id="rail-toggle" aria-label="Show navigation labels" title="Collapse or expand the navigation"><svg class="i" aria-hidden="true"><use href="#i-rail"></use></svg></button>
+      <ul class="rail-list">
+        <li><a href="#/overview" data-nav-view="overview" title="Overview (g o)"><svg class="i" aria-hidden="true"><use href="#i-grid"></use></svg><span class="rail-label">Overview</span></a></li>
+        <li><a href="#/activity" data-nav-view="activity" title="Activity (g a)"><svg class="i" aria-hidden="true"><use href="#i-activity"></use></svg><span class="rail-label">Activity</span></a></li>
+        <li><a href="#/sessions" data-nav-view="sessions" title="Sessions (g s)"><svg class="i" aria-hidden="true"><use href="#i-sessions"></use></svg><span class="rail-label">Sessions</span><span class="nav-count mono" data-session-count hidden></span></a></li>
+        <li><a href="#/access" data-nav-view="access" title="Access (g t)"><svg class="i" aria-hidden="true"><use href="#i-key"></use></svg><span class="rail-label">Access</span></a></li>
+      </ul>
+      <div class="rail-foot">
+        <a class="rail-btn" href="#/connect" data-inspect="connect" data-id="grid" title="How checks connect to the grid"><svg class="i" aria-hidden="true"><use href="#i-link"></use></svg><span class="rail-label">Connect a check</span></a>
+        <button type="button" class="rail-btn" data-density-toggle aria-pressed="false" title="Compact rows"><svg class="i" aria-hidden="true"><use href="#i-rows"></use></svg><span class="rail-label">Compact rows</span></button>
+        <button type="button" class="rail-btn" data-shortcuts title="Keyboard shortcuts (?)"><svg class="i" aria-hidden="true"><use href="#i-keyboard"></use></svg><span class="rail-label">Keyboard shortcuts</span><kbd class="rail-label">?</kbd></button>
+      </div>
+    </nav>
 
-    <section id="view-overview" class="view">
-      <div class="tiles" id="tiles"></div>
-      <div class="toolbar">
-        <input type="search" id="node-filter" placeholder="Filter nodes by host">
-        <label class="check"><input type="checkbox" id="only-problems"> Only nodes with failing slots</label>
-      </div>
-      <div class="legend">
-        <span><i class="sq free"></i>Free</span>
-        <span><i class="sq busy"></i>In use</span>
-        <span><i class="sq warn"></i>Has failures</span>
-        <span><i class="sq bad"></i><span>Failing (≥ <span id="threshold">3</span>)</span></span>
-      </div>
-      <div class="nodes" id="nodes"></div>
-    </section>
+    <main class="main" id="main">
+      <section id="view-overview" class="view view-overview" aria-labelledby="ov-h1"></section>
+      <section id="view-activity" class="view" aria-labelledby="activity-h1" hidden></section>
+      <section id="view-sessions" class="view" aria-labelledby="sessions-h1" hidden></section>
+      <section id="view-access" class="view" aria-labelledby="access-h1" hidden></section>
+    </main>
 
-    <section id="view-sessions" class="view" hidden>
-      <div class="toolbar">
-        <input type="search" id="session-filter" placeholder="Filter by host, port or endpoint">
+    <aside class="inspector" id="inspector" aria-labelledby="insp-title" hidden>
+      <div class="insp-handle" id="insp-handle" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the inspector"
+        aria-valuemin="320" aria-valuemax="640" aria-valuenow="420"></div>
+      <div class="insp-inner">
+        <div class="insp-bar">
+          <span class="insp-kind" id="insp-kind">Slot</span>
+          <span class="insp-hint">Esc to close</span>
+          <button type="button" class="icon-btn" data-insp-close aria-label="Close the inspector"><svg class="i" aria-hidden="true"><use href="#i-close"></use></svg></button>
+        </div>
+        <div class="insp-body" id="insp-body"></div>
       </div>
-      <div class="table-wrap">
-        <table class="sessions">
-          <thead>
-            <tr>
-              <th data-sort="slot_id">Slot</th>
-              <th data-sort="host">Node</th>
-              <th data-sort="port">Port</th>
-              <th data-sort="endpoint">Endpoint</th>
-              <th data-sort="started">Started</th>
-              <th data-sort="duration_s">Duration</th>
-              <th data-sort="fails">Fails</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="session-rows"></tbody>
-        </table>
-        <p class="empty" id="sessions-empty" hidden>No sessions are running right now.</p>
-      </div>
-    </section>
-  </main>
+    </aside>
+  </div>
 
-  <dialog id="slot-dialog">
-    <form method="dialog">
-      <h2 id="slot-title">Slot</h2>
-      <dl id="slot-details"></dl>
+  <nav class="tabbar" aria-label="Views">
+    <a href="#/overview" data-nav-view="overview"><svg class="i" aria-hidden="true"><use href="#i-grid"></use></svg><span>Overview</span></a>
+    <a href="#/activity" data-nav-view="activity"><svg class="i" aria-hidden="true"><use href="#i-activity"></use></svg><span>Activity</span></a>
+    <a href="#/sessions" data-nav-view="sessions"><svg class="i" aria-hidden="true"><use href="#i-sessions"></use></svg><span>Sessions</span><span class="nav-count mono" data-session-count hidden></span></a>
+    <a href="#/access" data-nav-view="access"><svg class="i" aria-hidden="true"><use href="#i-key"></use></svg><span>Access</span></a>
+  </nav>
+
+  <div class="menu" id="account-menu" role="menu" aria-label="Account" hidden></div>
+  <div class="menu" id="row-menu" role="menu" aria-label="Node actions" hidden></div>
+
+  <dialog id="confirm-dialog" class="sheet" aria-labelledby="confirm-title"></dialog>
+  <dialog id="signin-dialog" class="sheet signin-sheet" aria-labelledby="signin-title"></dialog>
+  <dialog id="palette" class="palette" aria-label="Jump to"></dialog>
+
+  <dialog id="shortcuts-dialog" class="sheet" aria-labelledby="shortcuts-title">
+    <div class="sheet-head"><h2 id="shortcuts-title">Keyboard shortcuts</h2>
+      <button type="button" class="icon-btn" data-dismiss aria-label="Close"><svg class="i" aria-hidden="true"><use href="#i-close"></use></svg></button></div>
+    <dl class="shortcut-list" id="shortcuts-list"></dl>
+    <p class="hint">Shortcuts are ignored while you type in a field.</p>
+  </dialog>
+
+  <dialog id="new-token-dialog" class="sheet form-sheet" aria-labelledby="new-token-title">
+    <form id="new-token-form" novalidate>
+      <h2 id="new-token-title">New access token</h2>
+      <p class="sheet-sub">You see the token once, right after you create it.</p>
+      <div class="field">
+        <label for="nt-name">Name</label>
+        <input type="text" id="nt-name" maxlength="128" required autocomplete="off" placeholder="Build farm Windows hosts">
+      </div>
+      <fieldset class="field">
+        <legend>Kind</legend>
+        <div class="choices">
+          <label class="choice"><input type="radio" name="kind" value="agent" checked><span><strong>Agent</strong><small>Registers a node with the hub</small></span></label>
+          <label class="choice"><input type="radio" name="kind" value="client"><span><strong>Client</strong><small>Lets checks open browser sessions</small></span></label>
+        </div>
+      </fieldset>
+      <div class="field" id="nt-node-field">
+        <label for="nt-node">Bind to node <span class="optional">optional</span></label>
+        <input type="text" id="nt-node" class="mono" maxlength="128" list="node-names" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Any node" aria-describedby="nt-node-hint">
+        <p class="hint" id="nt-node-hint">Only an agent registering under this name can use it.</p>
+      </div>
+      <div class="field">
+        <label for="nt-expiry">Expires</label>
+        <div class="expiry">
+          <select id="nt-expiry">
+            <option value="30">In 30 days</option>
+            <option value="90">In 90 days</option>
+            <option value="365" selected>In 1 year</option>
+            <option value="">Never</option>
+            <option value="custom">Custom</option>
+          </select>
+          <span class="days" id="nt-days-wrap" hidden><input type="number" id="nt-days" min="1" max="3650" step="1" value="180" aria-label="Days until the token expires"> days</span>
+        </div>
+      </div>
+      <p class="hint notice" id="nt-first" hidden></p>
+      <p class="form-error" id="nt-error" role="alert" hidden></p>
       <div class="dialog-actions">
-        <button type="button" class="btn" data-action="reset">Reset failures</button>
-        <button type="button" class="btn danger" data-action="release">Force release</button>
-        <button class="btn ghost" value="close">Close</button>
+        <button type="button" class="btn ghost" data-dismiss>Cancel</button>
+        <button type="submit" class="btn primary" id="nt-submit">Create token</button>
       </div>
     </form>
   </dialog>
+  <datalist id="node-names"></datalist>
 
-  <dialog id="token-dialog">
-    <form method="dialog">
-      <h2>Admin token</h2>
-      <p>This grid requires a token for management actions.</p>
-      <input type="password" id="token-input" autocomplete="off">
-      <div class="dialog-actions">
-        <button class="btn" value="ok">Save</button>
-        <button class="btn ghost" value="cancel">Cancel</button>
-      </div>
-    </form>
-  </dialog>
-
-  <script src="{{ url_for('static', filename='grid.js') }}"></script>
+  <div class="tip" id="tip" role="tooltip" hidden></div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <div class="sr-only" id="live-summary" aria-live="polite"></div>
 </body>
 </html>
