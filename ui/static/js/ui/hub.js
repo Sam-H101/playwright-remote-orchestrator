@@ -14,7 +14,7 @@ export function hubField(hint = "") {
         aria-describedby="${id}-hint">
       <button type="button" class="btn ghost small" data-hub-reset hidden>Reset</button>
     </div>
-    <p class="hint" id="${id}-hint">${hint || "Where your hosts and checks reach the hub. Edit it if they use another name; every command follows."}</p>
+    <p class="hint" id="${id}-hint">${hint || "Where your hosts and checks reach the hub: its base address, without /connect. Edit it if they use another name; every command follows."}</p>
   </div>`;
 }
 
@@ -35,7 +35,10 @@ export function wireHubFields(root) {
       clearTimeout(t);
       t = setTimeout(() => app.setHub(input.value), 150);
     });
-    input.addEventListener("change", () => app.setHub(input.value));
+    input.addEventListener("change", () => {
+      app.setHub(input.value);
+      input.value = app.hub(); // a pasted /connect address shows as the base it was cut back to
+    });
     input.parentElement.querySelector("[data-hub-reset]").addEventListener("click", () => {
       app.setHub("");
       input.value = app.hub();

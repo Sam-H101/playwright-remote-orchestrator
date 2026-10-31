@@ -2,7 +2,7 @@
 // per change: an admin action is the event it caused, attributed, not a second line beside it.
 import { app } from "../app.js";
 import { html, patchList, setHTML, setText } from "../html.js";
-import { clock, runLength } from "../format.js";
+import { clock, runText } from "../format.js";
 import { describe } from "../live.js";
 import * as router from "../router.js";
 import { copy, toast } from "../ui/toast.js";
@@ -20,7 +20,7 @@ export function filterEvents(events, params, now) {
 }
 
 function row(e) {
-  const dur = e.type === "finished" ? (e.approx ? "approx." : runLength(e.dur)) : "";
+  const dur = e.type === "finished" ? runText(e) : "";
   const inspect = e.slot != null ? ["slot", e.slot] : e.node ? ["node", e.node] : null;
   return html`<tr data-key="${e.id}" class="k-${e.kind}${e.failed ? " failed" : ""}${e.you ? " yours" : ""}" data-jk tabindex="-1"
       ${inspect ? html`data-inspect="${inspect[0]}" data-id="${inspect[1]}"` : ""}>
@@ -116,7 +116,7 @@ export function createActivity(section) {
     setText(section.querySelector("#act-reach"), (server
       ? "The Grid UI server compares snapshots of the grid's database every couple of seconds, whether or not anyone has this page open, and keeps 15 minutes. "
       : "This page compares snapshots of the grid's database about every 1.5 s while it's visible. ") +
-      "It sees claims, finished runs (runs shorter than a snapshot show as “approx.”), connect failures, resets, health and nodes. " +
+      "It sees claims, finished runs (runs shorter than a snapshot show as “approx.”, runs whose slot was claimed again before the next one as “≈”), connect failures, resets, health and nodes. " +
       "It can't see which check ran, or why a connection failed: no error text is stored.");
     patchList(rows, evs, (e) => e.id, row);
     const empty = section.querySelector("#act-empty");

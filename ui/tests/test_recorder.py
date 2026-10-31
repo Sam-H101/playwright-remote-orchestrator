@@ -71,6 +71,13 @@ def test_diff_names_every_change_with_an_id_made_of_database_values():
     # The same run seen exactly by one process and only approximately by another has the same id.
     assert [(e["type"], e["approx"], e["start"], e["id"]) for e in between] == [("finished", True, None, fin[0]["id"])]
 
+    # Released and claimed again between snapshots (the hub hands a freed slot to a waiting client at
+    # once): the run's start is known and it ended about when the next began, so it has a length.
+    again = recorder.diff(snap(G0, [node("n", [slot(1, busy=True, state="busy", last_run=T)])]),
+                          snap(G1, [node("n", [slot(1, busy=True, state="busy", last_run=T4)])]))
+    assert [(e["type"], e.get("approx"), e.get("dur"), e["id"]) for e in again] == \
+        [("finished", True, 4000, fin[0]["id"]), ("claimed", None, None, "c:1:" + str(recorder.ms(T4)))]
+
     failed = recorder.diff(snap(G0, [node("n", [slot(1, busy=True, state="busy", last_run=T, fails=2)])]),
                            snap(G1, [node("n", [slot(1, last_run=T4, fails=3, state="failing")])]))
     assert [(e["type"], e.get("failed"), e.get("nowFailing")) for e in failed] == [("finished", True, None), ("failure", None, True)]
@@ -161,8 +168,10 @@ def test_a_force_release_only_ends_the_claim_the_confirm_described(grid, monkeyp
     stale = next(s for s in status["sessions"] if s["stale"])
     sid = stale["slot_id"]
 
-    # The check finished and another claimed the slot while the confirm was open.
-    run(path, "UPDATE portUsage SET LastRunDate = ? WHERE id = ?", (utc(), sid))
+    # The check finished and another claimed the slot while the confirm was open. Its claim is stamped a
+    # few seconds back, so the old run's end and the admin's release below never share a second (and an
+    # event id) however the test is timed.
+    run(path, "UPDATE portUsage SET LastRunDate = ? WHERE id = ?", (utc(-5), sid))
     r = client.post("/api/slots/{}/release".format(sid), json={"claimed_at": stale["started"]}, headers=admin)
     assert r.status_code == 409 and r.get_json()["reclaimed"] is True
     assert run(path, "SELECT inUse FROM portUsage WHERE id = ?", (sid,)) == [(1,)]
@@ -175,7 +184,12 @@ def test_a_force_release_only_ends_the_claim_the_confirm_described(grid, monkeyp
     events = client.get("/api/status?events=0").get_json()["events"]
     mine = [e for e in events if e["id"] in r.get_json()["events"]]
     assert len(mine) == 1 and mine[0]["type"] == "finished" and mine[0]["by"] == "Admin" and mine[0]["kind"] == "admin"
-    assert len([e for e in events if e.get("slot") == sid and e["type"] == "finished"]) == 1
+    # Two runs ended: the stale one, when the slot was claimed again (seen between snapshots, so approx.,
+    # with the length it had), and the one the admin released.
+    finished = sorted((e for e in events if e.get("slot") == sid and e["type"] == "finished"), key=lambda e: e["end"])
+    assert [(e["kind"], bool(e.get("approx"))) for e in finished] == [("finish", True), ("admin", False)]
+    assert finished[0]["dur"] == finished[0]["end"] - finished[0]["start"] > 0
+    assert finished[1]["start"] == finished[0]["end"]
 
     r = client.post("/api/slots/{}/release".format(sid), json={"claimed_at": current["started"]}, headers=admin)
     assert r.status_code == 409 and "already finished" in r.get_json()["error"]

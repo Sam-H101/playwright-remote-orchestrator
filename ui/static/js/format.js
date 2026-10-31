@@ -152,24 +152,49 @@ export function endpointParts(url) {
 // launches. node (optional) keeps the check on that node or static host. There is no way to name a
 // slot, and no per-slot address to show.
 export function connectUrl(hub, node) {
-  return hub.replace(/\/+$/, "") + "/connect" + (node ? "?node=" + encodeURIComponent(node) : "");
+  return hubBase(hub) + "/connect" + (node ? "?node=" + encodeURIComponent(node) : "");
+}
+
+// The hub's base address from whatever was pasted as one: the /connect address the panels show (or a
+// removed /connect/<node>/<slot> one), a query, a fragment or trailing slashes are dropped, so every
+// address built on it ends in exactly one /connect.
+export function hubBase(value) {
+  return String(value || "").trim().replace(/[?#].*$/, "").replace(/\/+$/, "").replace(/\/connect(\/.*)?$/i, "").replace(/\/+$/, "");
 }
 
 const psq = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 
-// Copy-paste snippets that connect a check to the grid. They read the client token from the
-// environment and never embed it; PW_WS_ENDPOINT is what full/example/example.py reads.
+// Copy-paste snippets that connect a check to the grid, each one that runs as it is. They read the
+// client token from the environment and never embed it. The JS one is an ES module (top-level await
+// needs one); the shell ones only set PW_WS_ENDPOINT, which a check like full/example/example.py reads.
 export function connectSnippets(hub, node) {
-  const base = hub.replace(/\/+$/, "");
+  const base = hubBase(hub);
   const path = "/connect?" + (node ? "node=" + encodeURIComponent(node) + "&" : "") + "gateway_token=";
+  const endpointNote = "# For a check that connects to PW_WS_ENDPOINT, like full/example/example.py (main.py sets it\n" +
+    "# for the checks it runs). Then run the check, e.g.: pytest full/example/example.py\n";
   return {
-    js: "const { chromium } = require('playwright');\n\nconst HUB = " + JSON.stringify(base).replace(/"/g, "'") + ";\n" +
-      "const browser = await chromium.connect(`${HUB}" + path + "${process.env.GATEWAY_CLIENT_TOKEN}`);",
+    js: "// connect.mjs: an ES module, so run it as node connect.mjs\nimport { chromium } from 'playwright';\n\n" +
+      "const HUB = " + JSON.stringify(base).replace(/"/g, "'") + ";\n" +
+      "const browser = await chromium.connect(`${HUB}" + path + "${process.env.GATEWAY_CLIENT_TOKEN}`);\n" +
+      "const page = await browser.newPage();\nawait page.goto('https://example.com');\nconsole.log(await page.title());\nawait browser.close();",
     python: "import os\nfrom playwright.sync_api import sync_playwright\n\nHUB = " + JSON.stringify(base) + "\n" +
-      "with sync_playwright() as p:\n    browser = p.chromium.connect(f\"{HUB}" + path + "{os.environ['GATEWAY_CLIENT_TOKEN']}\")",
-    powershell: "$env:PW_WS_ENDPOINT = " + psq(base + path) + " + $env:GATEWAY_CLIENT_TOKEN",
-    bash: "export PW_WS_ENDPOINT=\"" + base + path + "$GATEWAY_CLIENT_TOKEN\"",
+      "with sync_playwright() as p:\n    browser = p.chromium.connect(f\"{HUB}" + path + "{os.environ['GATEWAY_CLIENT_TOKEN']}\")\n" +
+      "    page = browser.new_page()\n    page.goto(\"https://example.com\")\n    print(page.title())\n    browser.close()",
+    powershell: endpointNote + "$env:PW_WS_ENDPOINT = " + psq(base + path) + " + $env:GATEWAY_CLIENT_TOKEN",
+    bash: endpointNote + "export PW_WS_ENDPOINT=\"" + base + path + "$GATEWAY_CLIENT_TOKEN\"",
   };
+}
+
+// The connect URL for one node, ready for the client token to be appended (copied from a node's menu).
+export function connectUrlForToken(hub, node) {
+  return connectUrl(hub, node) + (node ? "&" : "?") + "gateway_token=";
+}
+
+// A finished run's length for a column: "approx." when only its end is known, "≈ 45.0 s" when its end
+// is only known to within a snapshot (it was released and claimed again in between).
+export function runText(e) {
+  if (!e.approx) return runLength(e.dur);
+  return e.dur != null ? "≈ " + runLength(e.dur) : "approx.";
 }
 
 // Who holds a busy slot, from portUsage.claimedBy: the hub, for a check that connected to /connect,
@@ -253,9 +278,17 @@ export function slotSentence(node, slot, ctx) {
   }
   if (slot.state === "busy") {
     const started = lastRun != null ? "since " + clock(lastRun, false) + " (" + coarse((now - lastRun) / 1000) + ")" : "since an unknown time";
-    const stale = ctx.session && ctx.session.stale;
-    return "A check is using it " + started + "." + (stale ? " That's longer than " + duration(ctx.staleAfter) +
-      ", so the check may have died without releasing it." : "") +
+    const s = ctx.session, stale = s && s.stale;
+    let why = "";
+    if (s && s.via_hub && s.hub_alive) {
+      why = " The hub routed it and frees the slot the moment the session ends, however long it runs.";
+    } else if (s && s.via_hub && s.hub_alive === false) {
+      why = " The hub that claimed it has stopped (it no longer renews its lease), so nothing holds this claim: " +
+        "any running hub frees it within a minute, or release it here.";
+    } else if (stale) {
+      why = " That's longer than " + duration(ctx.staleAfter) + ", so the check may have died without releasing it.";
+    }
+    return "A check is using it " + started + "." + why +
       (slot.fails ? " " + plural(slot.fails, "connect failure") + " before this run." : "");
   }
   if (slot.state === "unhealthy") {

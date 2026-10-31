@@ -7,9 +7,11 @@ index); one without is a legacy static host (PortNumber is the run-server
 port). A slot with inUse = 1 is a live session, started at LastRunDate.
 
 Checks don't connect to a slot: every one connects to the hub's /connect, and the hub claims a free
-slot that fits the browser it launches. portUsage.claimedBy says who holds a claim: 'hub:...' for a
-session the hub routed, NULL for any other claimer. Databases the hub hasn't upgraded yet have no
-such column; their claims are reported as of unknown origin.
+slot that fits the browser it launches. portUsage.claimedBy says who holds a claim: 'hub:<hub
+instance>:<n>' for a session the hub routed, NULL for any other claimer. Databases the hub hasn't
+upgraded yet have no such column; their claims are reported as of unknown origin. A hub's claim lasts
+as long as its session, however long that is, and goes with the hub's lease (its row in hubs): it is
+stale only once that hub has stopped renewing it. Any other claim is stale after GRID_STALE_AFTER.
 
 All DATETIME columns hold UTC. "Now" is read from the database so that
 online/stale decisions match the checks' slot selection, whatever the UI
@@ -50,6 +52,8 @@ def _fail_settings(env):
 
 FAIL_THRESHOLD, FAIL_COOLDOWN_S = _fail_settings(os.environ)
 STALE_AFTER_S = int(os.environ.get("GRID_STALE_AFTER", "3600"))
+# The hub's GATEWAY_HUB_LEASE_S: a hub that hasn't renewed its row in hubs for this long is gone.
+HUB_LEASE_S = int(os.environ.get("GATEWAY_HUB_LEASE_S") or "90")
 ONLINE_WINDOW_S = 60  # same window as the checks' slot selection in src/database.py
 
 log = logging.getLogger(__name__)
@@ -265,11 +269,12 @@ def _columns(cur, table):
 
 
 def _read(cur):
+    """(now, node rows or None, slot rows, whether claimedBy exists, {hub instance: lastSeen} or None)."""
     cur.execute("SELECT " + _now_sql())
     now = _parse_time(cur.fetchone()[0])
     tables = _tables(cur)
     if not {"portstatus", "portusage"} <= tables:
-        return now, None, [], False
+        return now, None, [], False, None
     node_rows = []
     if "nodes" in tables:
         # ephemeral came later; databases created before it don't have the column.
@@ -287,7 +292,29 @@ def _read(cur):
         FROM portStatus ps JOIN portUsage pu ON ps.id = pu.id
         ORDER BY ps.PortServer, ps.PortNumber
     """.format(claimed_by))
-    return now, node_rows, cur.fetchall(), claimed_by != "NULL"
+    slot_rows = cur.fetchall()
+    hubs = None
+    if "hubs" in tables:
+        cur.execute("SELECT instance, lastSeen FROM hubs")
+        hubs = {str(instance): _parse_time(seen) for instance, seen in cur.fetchall()}
+    return now, node_rows, slot_rows, claimed_by != "NULL", hubs
+
+
+def _hub_alive(now, hubs, claimed_by):
+    """Whether the hub that made a 'hub:<instance>:<n>' claim still renews its lease; None when the
+    database can't say (no hubs table: a hub from before leases)."""
+    if hubs is None or not claimed_by:
+        return None
+    parts = str(claimed_by).split(":")
+    seen = hubs.get(parts[1]) if len(parts) >= 3 else None
+    return seen is not None and (now - seen).total_seconds() <= HUB_LEASE_S
+
+
+def _stale(duration_s, via_hub, hub_alive):
+    """A hub's claim is stale when its hub is gone; any other when it is older than GRID_STALE_AFTER."""
+    if via_hub and hub_alive is not None:
+        return not hub_alive
+    return duration_s is None or duration_s > STALE_AFTER_S
 
 
 def _claim(busy, claims_known, claimed_by):
@@ -314,9 +341,10 @@ def snapshot():
     ensure_schema()
     try:
         with _session() as cur:
-            now, node_rows, slot_rows, claims_known = _read(cur)
+            now, node_rows, slot_rows, claims_known, hubs = _read(cur)
     except _MissingTables:  # dropped or half-created between queries
-        now, node_rows, slot_rows, claims_known = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), None, [], False
+        now, node_rows, slot_rows, claims_known, hubs = \
+            datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), None, [], False, None
     initialised = node_rows is not None
 
     # Match slots to nodes the way the database compares names: MySQL's default collation
@@ -345,14 +373,16 @@ def snapshot():
         fails = fails or 0
         started = _parse_time(last_run)
         via_hub, claimed_by = _claim(busy, claims_known, claimed_by)
+        hub_alive = _hub_alive(now, hubs, claimed_by) if via_hub else None
         if not (host or "").strip():
             # Blank PortServer rows from old configs aren't real hosts and are never handed out.
             # One still marked in use can only be cleared by hand, so list it as a session.
             if busy:
                 duration_s = _age_s(now, started)
                 sessions.append({
-                    "slot_id": slot_id, "host": "", "port": port, "kind": "legacy", "via_hub": via_hub, "claimed_by": claimed_by, "started": _iso(started), "duration_s": duration_s,
-                    "stale": duration_s is None or duration_s > STALE_AFTER_S,
+                    "slot_id": slot_id, "host": "", "port": port, "kind": "legacy", "via_hub": via_hub, "claimed_by": claimed_by,
+                    "hub_alive": hub_alive, "started": _iso(started), "duration_s": duration_s,
+                    "stale": _stale(duration_s, via_hub, hub_alive),
                     "fails": fails, "node_online": None,
                 })
             continue
@@ -397,9 +427,10 @@ def snapshot():
                 "kind": node["kind"],
                 "via_hub": via_hub,
                 "claimed_by": claimed_by,
+                "hub_alive": hub_alive,
                 "started": _iso(started),
                 "duration_s": duration_s,
-                "stale": duration_s is None or duration_s > STALE_AFTER_S,
+                "stale": _stale(duration_s, via_hub, hub_alive),
                 "fails": fails,
                 "node_online": node["online"],
             })
@@ -433,6 +464,7 @@ def snapshot():
         "fail_threshold": FAIL_THRESHOLD,
         "fail_cooldown_s": FAIL_COOLDOWN_S,
         "stale_after_s": STALE_AFTER_S,
+        "hub_lease_s": HUB_LEASE_S,
         "online_window_s": ONLINE_WINDOW_S,
         "ready": available > 0,
         "totals": {
@@ -464,8 +496,9 @@ def _execute(sql, params):
 
 
 def _release_sql(cur):
-    """The SET clause that frees a slot. It also clears claimedBy, so a hub that held the claim
-    sees it was taken away and lets it go, instead of claiming the slot again."""
+    """The SET clause that frees a slot. It also clears claimedBy, as every release does. A hub whose
+    session still runs on the slot claims it again (it never hands a slot it pipes to a second
+    client); a claim left by a hub that is gone stays released."""
     clear = ", claimedBy = NULL" if "claimedby" in _columns(cur, "portUsage") else ""
     return "UPDATE portUsage SET inUse = 0, LastRunDate = {}{} WHERE id = ?".format(_now_sql(), clear)
 

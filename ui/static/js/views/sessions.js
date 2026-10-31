@@ -16,6 +16,9 @@ function subject(s) {
   return s.kind === "gateway" ? s.host + " / " + s.port : s.host + ":" + s.port;
 }
 
+// A session a running hub holds: it lasts as long as the client keeps it, with no stale limit.
+const heldByHub = (s) => !!(s.via_hub && s.hub_alive);
+
 function rowMarkup(s, staleAfter) {
   const started = parseTime(s.started), claim = claimWord(s);
   const state = s.kind === "gateway" && !s.node_online ? ["off", "Node offline"] : s.stale ? ["warn", "Stale"] : ["accent", "Running"];
@@ -24,7 +27,7 @@ function rowMarkup(s, staleAfter) {
       <small>${s.kind === "gateway" ? "Gateway node" : s.kind === "legacy" ? "Old config row" : "Static host"}</small></td>
     <td class="cell-time" data-label="Started"><span class="mono" title="${fullDate(started)}">${started != null ? clock(started) : "–"}</span></td>
     <td class="cell-duration" data-label="Running">
-      <div class="dur-bar" data-dur-bar="${s.started || ""}" data-stale="${staleAfter}" aria-hidden="true"><span class="dur-fill"></span><span class="dur-mark"></span></div>
+      <div class="dur-bar" data-dur-bar="${s.started || ""}" data-stale="${heldByHub(s) ? "none" : staleAfter}" aria-hidden="true"><span class="dur-fill"></span>${heldByHub(s) ? "" : html`<span class="dur-mark"></span>`}</div>
       <span class="mono dur-text" data-dur="${s.started || ""}"></span></td>
     <td class="cell-claim" data-label="Claimed by"><span class="${claim.dim ? "dim" : ""}" title="${claim.title}">${claim.word}</span></td>
     <td class="cell-state"><span class="pill p-${state[0]}"><span class="glyph g-${state[0]}" aria-hidden="true"></span>${state[1]}</span></td>

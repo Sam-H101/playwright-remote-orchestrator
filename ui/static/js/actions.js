@@ -52,9 +52,16 @@ export async function releaseSlot(id) {
   // dialog is open, the server refuses (409) instead of cutting off the new one.
   const claimedAt = (s && s.started) || f.slot.last_run;
   const held = started != null ? "Claimed " + clock(started, false) + ", running " + duration((app.now() - started) / 1000) + (s.stale ? " (stale)" : "") + ". " : "";
+  // Who holds it decides what releasing does: a running hub still pipes the session and claims the
+  // slot straight back; a hub that stopped left a claim nobody holds.
+  const why = s && s.via_hub && s.hub_alive
+    ? "The hub still has this session open. Releasing doesn't end it: the hub claims the slot again within 30 s and hands it to nobody else until the session ends. To end it, stop the client that holds it."
+    : s && s.via_hub && s.hub_alive === false
+      ? "The hub that claimed it has stopped, so no session holds this claim. Any running hub frees it within a minute; releasing frees it now."
+      : "If that check is still running, the next check can claim this slot and both will fail.";
   const ok = await confirm({
     title: "Release " + name + "?",
-    text: held + "If that check is still running, the next check can claim this slot and both will fail.",
+    text: held + why,
     ok: "Release slot",
   });
   if (!ok) return false;

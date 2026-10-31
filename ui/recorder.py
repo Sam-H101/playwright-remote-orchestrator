@@ -114,9 +114,10 @@ def diff(prev, nxt):
             add("f:{}:{}".format(slot_id, run), type="finished", kind="finish", approx=True, t=run, start=None, end=run,
                 dur=None, failed=failed_more)
         elif p.get("busy") and s.get("busy") and run is not None and run != prev_run:
-            # Released and claimed again in between: one run ended, roughly when the next began.
+            # Released and claimed again in between: one run ended, roughly when the next began. The hub
+            # hands a freed slot to a waiting client at once, so its length is known to within that gap.
             add("f:{}:{}".format(slot_id, run), type="finished", kind="finish", approx=True, t=run, start=prev_run, end=run,
-                dur=None, failed=failed_more)
+                dur=run - prev_run if prev_run is not None else None, failed=failed_more)
             add("c:{}:{}".format(slot_id, run), type="claimed", kind="claim", t=run, start=run, **by)
 
         if failed_more:

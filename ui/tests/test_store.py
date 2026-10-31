@@ -151,7 +151,7 @@ def test_forget_node(db):
 def test_schema_file_splits_into_statements():
     with open(SCHEMA_SQL) as f:
         statements = [s for s in store._schema_statements(f.read()) if "CREATE TABLE" in s]
-    assert len(statements) == 4
+    assert len(statements) == 5
 
 
 def test_api(db, monkeypatch):
@@ -193,7 +193,7 @@ def test_ensure_schema_runs_each_statement_once_on_mysql(monkeypatch):
     monkeypatch.setattr(store, "_session", contextlib.contextmanager(lambda: (yield Cursor())))
     store.ensure_schema()
     store.ensure_schema()
-    assert [s.split("(")[0].split()[-1] for s in executed] == ["portStatus", "portUsage", "nodes", "accessTokens"]
+    assert [s.split("(")[0].split()[-1] for s in executed] == ["portStatus", "portUsage", "nodes", "accessTokens", "hubs"]
     assert not any(line.strip().startswith("--") for s in executed for line in s.splitlines())
 
 
@@ -253,7 +253,7 @@ def test_mysql_matches_slots_to_nodes_ignoring_case(monkeypatch):
     monkeypatch.setattr(store, "DB_ENGINE", "mysql")
     monkeypatch.setattr(store, "_schema_attempted", True)
     monkeypatch.setattr(store, "_session", contextlib.contextmanager(lambda: (yield None)))
-    monkeypatch.setattr(store, "_read", lambda cur: (now, node_rows, slot_rows, True))
+    monkeypatch.setattr(store, "_read", lambda cur: (now, node_rows, slot_rows, True, None))
     snap = store.snapshot()
     assert [(n["host"], n["kind"], n["total"]) for n in snap["nodes"]] == [("Case-Node", "gateway", 2)]
     assert [(s["state"], s["selectable"]) for s in snap["nodes"][0]["slots"]] == [("free", True), ("unhealthy", False)]
@@ -383,12 +383,48 @@ def test_a_database_the_hub_has_not_upgraded_reports_claims_as_unknown(db):
     assert run(db, "SELECT inUse FROM portUsage") == [(0,)]
 
 
-def test_a_force_release_takes_the_claim_away_from_the_hub(db):
-    """Clearing claimedBy with inUse tells the hub its claim was taken: it lets the slot go instead of
-    claiming it back for the session it thinks is still running."""
+def test_a_force_release_clears_the_claim_with_the_slot(db):
+    """Releasing frees the slot and clears claimedBy, as every release does. (A hub whose session still
+    runs there claims it again; one that is gone left a claim nobody holds.)"""
     add_node(db, "gw", 1, 1, [(1, 30, 0), (1, 20, 0)])
     run(db, "UPDATE portUsage SET claimedBy = 'hub:5c1e09a2:' || id")
     assert store.release_slot(1) == 1
     started = next(s for s in store.snapshot()["sessions"] if s["slot_id"] == 2)["started"]
     assert store.release_claim(2, started) == ("released", 1)
     assert run(db, "SELECT inUse, claimedBy FROM portUsage ORDER BY id") == [(0, None), (0, None)]
+
+
+def test_a_hub_session_is_stale_only_once_its_hub_is_gone(db, monkeypatch):
+    """A /connect session may run for hours: while its hub renews its lease it is a running session (not a
+    problem to release); once the hub has stopped renewing it, nothing holds the claim. Other claims keep
+    the GRID_STALE_AFTER rule."""
+    monkeypatch.setattr(store, "STALE_AFTER_S", 3600)
+    monkeypatch.setattr(store, "HUB_LEASE_S", 90)
+    add_node(db, "gw", 1, 1, [(1, 5400, 0), (1, 5400, 0), (1, 5400, 0), (1, 60, 0)])
+    run(db, "UPDATE portUsage SET claimedBy = 'hub:aaaa0001:' || id WHERE id IN (1, 4)")
+    run(db, "UPDATE portUsage SET claimedBy = 'hub:dead0002:2' WHERE id = 2")  # slot 3: claimedBy NULL, another claimer
+    run(db, "INSERT INTO hubs (instance, host, port, lastSeen) VALUES ('aaaa0001', 'hub', 4500, ?), ('dead0002', 'old', 4500, ?)",
+        (ts(10), ts(400)))
+    snap = store.snapshot()
+    got = {s["slot_id"]: (s["via_hub"], s["hub_alive"], s["stale"]) for s in snap["sessions"]}
+    assert got == {1: (True, True, False), 2: (True, False, True), 3: (False, None, True), 4: (True, True, False)}
+    assert snap["totals"]["stale"] == 2 and snap["hub_lease_s"] == 90
+    # A hub with no row at all (it stopped and removed it, or crashed before leases existed) is gone too.
+    run(db, "DELETE FROM hubs WHERE instance = 'aaaa0001'")
+    got = {s["slot_id"]: (s["hub_alive"], s["stale"]) for s in store.snapshot()["sessions"]}
+    assert got[1] == (False, True) and got[4] == (False, True)
+    # A database without the hubs table (a hub from before leases): the age rule, as before.
+    run(db, "DROP TABLE hubs")
+    got = {s["slot_id"]: (s["hub_alive"], s["stale"]) for s in store.snapshot()["sessions"]}
+    assert got == {1: (None, True), 2: (None, True), 3: (None, True), 4: (None, False)}
+
+
+def test_the_demo_hub_renews_its_lease_so_its_sessions_are_running(tmp_path, monkeypatch):
+    path = str(tmp_path / "demo.db")
+    with sqlite3.connect(path) as con:
+        demo.seed(con)
+    monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
+    monkeypatch.setattr(store, "SQLITE_PATH", path)
+    sessions = store.snapshot()["sessions"]
+    assert all(s["hub_alive"] and not s["stale"] for s in sessions if s["via_hub"])
+    assert [s["host"] for s in sessions if s["stale"]] == ["pw-static.lab.local"]  # the claim from outside the hub

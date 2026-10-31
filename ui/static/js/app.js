@@ -1,5 +1,5 @@
 // Shared page context, filled in by main.js, so views don't import each other.
-import { publicHub, parseTime } from "./format.js";
+import { hubBase, publicHub, parseTime } from "./format.js";
 import { localStore } from "./storage.js";
 
 const HUB_KEY = "gridHub";
@@ -41,12 +41,14 @@ export const app = {
   // The hub address shown in every copyable command: the user's override, else the server's
   // public address, else one derived from this page's host.
   hub() {
-    const custom = (prefs.get(HUB_KEY, "") || "").trim();
+    const custom = hubBase(prefs.get(HUB_KEY, "") || "");
     return custom || publicHub(this.data(), location.hostname);
   },
-  hubIsCustom() { return !!(prefs.get(HUB_KEY, "") || "").trim(); },
+  hubIsCustom() { return !!hubBase(prefs.get(HUB_KEY, "") || ""); },
+  // A pasted /connect address (or one with a query) is cut back to the hub's base, which every
+  // command builds on.
   setHub(value) {
-    const v = String(value || "").trim().replace(/\/+$/, "");
+    const v = hubBase(value);
     prefs.set(HUB_KEY, v && v !== publicHub(this.data(), location.hostname) ? v : null);
     hubListeners.forEach((fn) => fn(this.hub()));
   },

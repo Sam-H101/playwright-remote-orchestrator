@@ -355,7 +355,13 @@ export function createInspector({ onClose }) {
     const cfg = app.cfg(), s = f.session, started = parseTime(s.started);
     part("head", slotHead(f, s.stale ? pill("warn", "Stale") : pill("accent", "Running")));
     part("sentence", html`${slotSentence(f.node, f.slot, Object.assign({ session: s }, cfg))}`);
-    part("bar", html`<div class="dur-bar big" data-dur-bar="${s.started || ""}" data-stale="${cfg.staleAfter}" role="img"
+    // A session a running hub holds has no stale limit: the hub frees the slot when it ends.
+    const hubHeld = !!(s.via_hub && s.hub_alive);
+    part("bar", hubHeld
+      ? html`<div class="dur-bar big" data-dur-bar="${s.started || ""}" data-stale="none" role="img"
+        aria-label="Running for ${duration(s.duration_s)}; held by the hub until the session ends"><span class="dur-fill"></span></div>
+      <div class="dur-legend mono"><span>Started ${clock(started)}</span><span data-dur="${s.started || ""}"></span><span>held by the hub</span></div>`
+      : html`<div class="dur-bar big" data-dur-bar="${s.started || ""}" data-stale="${cfg.staleAfter}" role="img"
         aria-label="Running for ${duration(s.duration_s)}; stale after ${duration(cfg.staleAfter)}"><span class="dur-fill"></span><span class="dur-mark" title="${duration(cfg.staleAfter)}"></span></div>
       <div class="dur-legend mono"><span>Started ${clock(started)}</span><span data-dur="${s.started || ""}"></span><span>stale at ${duration(cfg.staleAfter)}</span></div>`);
     part("facts", html`

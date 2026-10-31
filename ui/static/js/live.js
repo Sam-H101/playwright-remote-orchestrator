@@ -73,8 +73,10 @@ export function diff(prev, next, mine) {
       // Claimed and released between two polls: both stamp LastRunDate, so only the end is known.
       events.push(Object.assign({ id: "f:" + id + ":" + run, type: "finished", kind: "finish", approx: true, t: run, start: null, end: run, dur: null, failed: failedMore }, base));
     } else if (p.busy && s.busy && run != null && run !== prevRun) {
-      // Released and claimed again between polls: one run ended (roughly when the next began).
-      events.push(Object.assign({ id: "f:" + id + ":" + run, type: "finished", kind: "finish", approx: true, t: run, start: prevRun, end: run, dur: null, failed: failedMore }, base));
+      // Released and claimed again between polls: one run ended (roughly when the next began, which
+      // with the hub's queue is at once), so its length is known to within that gap.
+      events.push(Object.assign({ id: "f:" + id + ":" + run, type: "finished", kind: "finish", approx: true, t: run, start: prevRun, end: run,
+        dur: prevRun != null ? run - prevRun : null, failed: failedMore }, base));
       events.push(Object.assign({ id: "c:" + id + ":" + run, type: "claimed", kind: "claim", t: run, start: run }, by, base));
     }
 
@@ -137,7 +139,8 @@ export function describe(e) {
       if (e.kind === "admin") {
         return (who ? "released by " + who : "released from the Grid UI") + (e.dur != null ? " after " + runLength(e.dur) : "");
       }
-      return (e.approx ? "finished between updates (approx.)" : "finished in " + runLength(e.dur)) +
+      return (e.approx ? (e.dur != null ? "finished in about " + runLength(e.dur) + " (ended between updates)" : "finished between updates (approx.)")
+        : "finished in " + runLength(e.dur)) +
         (e.failed ? " · failures went up" : "");
     case "failure": return "connect failure #" + e.fails + (e.nowFailing ? " · now failing" : "");
     case "reset":

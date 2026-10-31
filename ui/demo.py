@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS nodes (
     ephemeral INTEGER NOT NULL DEFAULT 0,
     tokenId INTEGER NULL
 );
+CREATE TABLE IF NOT EXISTS hubs (
+    instance TEXT NOT NULL PRIMARY KEY,
+    host TEXT NULL,
+    port INTEGER NULL,
+    startedAt TEXT NULL,
+    lastSeen TEXT NULL
+);
 CREATE TABLE IF NOT EXISTS accessTokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -87,7 +94,8 @@ STATIC_HOSTS = [
 
 # The hub marks the claims it makes for /connect sessions; the demo's checks all come through it,
 # except the static host's oldest session, claimed by something else long ago.
-HUB_CLAIM = "hub:5c1e09a2:"
+HUB_INSTANCE = "5c1e09a2"
+HUB_CLAIM = "hub:" + HUB_INSTANCE + ":"
 DIRECT_CLAIMS = {("pw-static.lab.local", 3000)}
 
 DAY = 86400
@@ -143,6 +151,9 @@ def seed(con, now=None):
                     "(SELECT id FROM portStatus WHERE PortServer = ? AND PortNumber = ?)",
                     (_ts(now, seconds_ago), server, number))
     _add_slot(cur, "", 3000, 0, None, 0, now)  # a blank host from an old config; the UI must hide it
+    # The hub's lease, which --heartbeat keeps renewing like a running hub does.
+    cur.execute("INSERT INTO hubs (instance, host, port, startedAt, lastSeen) VALUES (?, 'hub', 4500, ?, ?)",
+                (HUB_INSTANCE, _ts(now, 2 * DAY), _ts(now, 0)))
     for name, kind, node_name, created, expires, used, revoked, users in TOKENS:
         token = ("pwga_" if kind == "agent" else "pwgc_") + secrets.token_urlsafe(32)  # thrown away: a demo
         cur.execute("""
@@ -192,6 +203,7 @@ def heartbeat(path, interval=5, activity=False, seed=None):
         with sqlite3.connect(path) as con:
             if now >= next_beat:
                 con.execute("UPDATE nodes SET lastSeen = datetime('now') WHERE online = 1")
+                con.execute("UPDATE hubs SET lastSeen = datetime('now')")
                 next_beat = now + interval
             if activity and running and now >= release_at:
                 finish(con, running, rng)

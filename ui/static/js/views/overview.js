@@ -48,7 +48,7 @@ export function attentionItems(data) {
     const subject = n ? slotName(n, { port: s.port }) : (s.host || "(blank host)") + ":" + s.port;
     items.push({
       key: "session-" + s.slot_id, sev: "stale", tone: "warn", subject, inspect: ["session", s.slot_id],
-      cause: html`held <span class="mono" data-dur="${s.started || ""}"></span> · stale`,
+      cause: html`held <span class="mono" data-dur="${s.started || ""}"></span> · ${s.via_hub && s.hub_alive === false ? "its hub stopped" : "stale"}`,
       ago: s.started, action: { act: "release", target: s.slot_id, label: "Release…", verb: "release " + subject, danger: true },
     });
   }

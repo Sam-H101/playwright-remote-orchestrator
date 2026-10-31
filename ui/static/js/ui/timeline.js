@@ -4,7 +4,7 @@
 // variables set with style.setProperty, never style attributes in markup (the CSP forbids them).
 import { app, prefs } from "../app.js";
 import { html, setHTML, setText, patchList } from "../html.js";
-import { clock, runLength, parseTime, plural, slotName } from "../format.js";
+import { clock, runLength, runText, parseTime, plural, slotName } from "../format.js";
 import { bursts, actor } from "../live.js";
 import { showTip, hideTip, tipLines } from "./toast.js";
 
@@ -268,7 +268,7 @@ export function createTimeline(root, { onOpen }) {
       <li data-key="${e.id}"><a href="#/slot/${e.slot}" class="tl-recent-row">
         <span class="dot ${e.failed ? "bad" : "accent"}" aria-hidden="true"></span>
         <span class="mono subject">${e.subject}</span>
-        <span class="mono meta">${e.approx ? "approx." : runLength(e.dur)}</span>
+        <span class="mono meta">${runText(e)}</span>
         <span class="mono meta">${clock(e.end)}</span></a></li>`);
   }
 
@@ -473,7 +473,7 @@ export function createTimeline(root, { onOpen }) {
       ["Start", r.start != null ? clock(r.start) : "unknown (between updates)"],
       ["End", r.running ? "still held" : clock(r.end) + (r.approx ? " (approx.)" : "")],
       ["Duration", r.running ? (r.start != null ? "so far " + runLength(lastNow - r.start) : "running")
-        : r.approx || r.start == null ? "approx." : runLength(r.end - r.start)],
+        : r.start == null ? "approx." : r.approx ? "about " + runLength(r.end - r.start) : runLength(r.end - r.start)],
       ["Result", result(r)],
     ]));
   };

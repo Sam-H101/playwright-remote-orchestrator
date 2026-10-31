@@ -53,6 +53,10 @@ UNIT = r"""async ([liveUrl, formatUrl]) => {
 
   const between = L.diff(snap(G0, [node("n", [slot(1, { last_run: T })])]), snap(G1, [node("n", [slot(1, { last_run: T4 })])]));
   out.between = between.map((e) => [e.type, e.approx, e.start, e.end === Date.parse(T4), L.describe(e)]);
+  // Released and claimed again between polls: the old run has a length, to within the gap.
+  const busy = (run) => slot(1, { busy: true, state: "busy", last_run: run });
+  const again = L.diff(snap(G0, [node("n", [busy(T)])]), snap(G1, [node("n", [busy(T4)])]));
+  out.again = again.map((e) => [e.type, !!e.approx, e.dur, L.describe(e), e.type === "finished" ? F.runText(e) : null]);
 
   const failed = L.diff(snap(G0, [node("n", [slot(1, { busy: true, state: "busy", last_run: T, fails: 2 })])]),
     snap(G1, [node("n", [slot(1, { last_run: T4, fails: 3, state: "failing", retry_at: "2026-10-31T10:05:04Z" })])]));
@@ -110,7 +114,12 @@ UNIT = r"""async ([liveUrl, formatUrl]) => {
     slotQuery: [F.parseSlotQuery("b81e04/3"), F.parseSlotQuery("b81e04 3"), F.parseSlotQuery("pw-static:3001"), F.parseSlotQuery("nothing")],
     hub: [F.publicHub({ gateway_url: "ws://hub:4500" }, "grid.lab"), F.publicHub({ gateway_url: "wss://hub" }, "::1"),
       F.publicHub({ gateway_url: "ws://hub:4500", public_gateway_url: "wss://grid.example.com/" }, "x")],
-    connect: [F.connectUrl("ws://grid.lab:4500/"), F.connectUrl("ws://grid.lab:4500", "Runner B")],
+    connect: [F.connectUrl("ws://grid.lab:4500/"), F.connectUrl("ws://grid.lab:4500", "Runner B"),
+      F.connectUrlForToken("ws://grid.lab:4500", "runner-7f3a9c"), F.connectUrlForToken("ws://grid.lab:4500/connect")],
+    // Whatever is pasted as the hub address, every address built on it ends in exactly one /connect.
+    hubBase: ["ws://10.0.0.5:4500/connect", "ws://10.0.0.5:4500/connect/", "ws://10.0.0.5:4500/connect?gateway_token=x&node=a",
+      "ws://10.0.0.5:4500/connect/runner-7f3a9c/3", " ws://10.0.0.5:4500/ ", "wss://grid.example.com/pw/connect", "ws://h:4500/connector"].map(F.hubBase),
+    pasted: F.connectSnippets("ws://10.0.0.5:4500/connect"),
     snippets: F.connectSnippets("ws://grid.lab:4500/"),
     pinned: F.connectSnippets("ws://grid.lab:4500", "runner-b81e04"),
     claim: [F.claimWord({ via_hub: true, claimed_by: "hub:5c1e09a2:7" }), F.claimWord({ via_hub: false }), F.claimWord({ via_hub: null })].map((c) => c.word),
@@ -122,6 +131,10 @@ UNIT = r"""async ([liveUrl, formatUrl]) => {
       { host: "s", kind: "static", browsers: [], slots: [{ selectable: true }, { selectable: true }] },
     ] }),
     agent: [F.agentCommand("windows", "ws://h:4500", "pwga_x", "win-02"), F.agentCommand("linux", "ws://h:4500", "pwga_x", "win-02")],
+    // A busy slot held for 2 h: by a running hub (a long session), by a hub that has stopped, by another claimer.
+    busy: [{ via_hub: true, hub_alive: true, stale: false }, { via_hub: true, hub_alive: false, stale: true }, { via_hub: false, hub_alive: null, stale: true }]
+      .map((session) => F.slotSentence({ host: "n", kind: "gateway" }, { state: "busy", fails: 0, healthy: true, last_run: "2026-10-31T08:00:00Z", port: 1 },
+        { now: Date.parse("2026-10-31T10:00:00Z"), threshold: 3, cooldown: 300, staleAfter: 3600, session })),
     sentence: F.slotSentence({ host: "runner-b81e04", kind: "gateway" },
       { state: "failing", fails: 4, healthy: true, last_run: "2026-10-31T10:47:00Z", retry_at: "2026-10-31T10:52:00Z", port: 3 },
       { now: Date.parse("2026-10-31T10:49:00Z"), threshold: 3, cooldown: 300, staleAfter: 3600 }),
@@ -140,6 +153,8 @@ def test_diff_and_formatters_are_pure_and_right(grid, page):
     assert out["claimBy"] == [[True, "claimed"], [False, "claimed outside the hub"]]
     assert out["finish"] == [["finished", 4000, False, False]]
     assert out["between"] == [["finished", True, None, True, "finished between updates (approx.)"]]
+    assert out["again"] == [["finished", True, 4000, "finished in about 4.0 s (ended between updates)", "≈ 4.0 s"],
+                            ["claimed", False, None, "claimed", None]]
     assert out["failed"] == [["finished", True, None, "finished in 4.0 s · failures went up"],
                              ["failure", False, 3, "connect failure #3 · now failing"]]
     assert out["reset"] == [["reset", "admin", 4, "you", "you reset failures (was 4)"]]
@@ -161,19 +176,33 @@ def test_diff_and_formatters_are_pure_and_right(grid, page):
     assert f["slotQuery"] == [{"node": "b81e04", "slot": "3"}, {"node": "b81e04", "slot": "3"}, {"node": "pw-static", "slot": "3001"}, None]
     assert f["hub"] == ["ws://grid.lab:4500", "wss://[::1]", "wss://grid.example.com"]
     # One address for every check (the owner's form); ?node= at most, never a slot.
-    assert f["connect"] == ["ws://grid.lab:4500/connect", "ws://grid.lab:4500/connect?node=Runner%20B"]
+    assert f["connect"] == ["ws://grid.lab:4500/connect", "ws://grid.lab:4500/connect?node=Runner%20B",
+                            "ws://grid.lab:4500/connect?node=runner-7f3a9c&gateway_token=", "ws://grid.lab:4500/connect?gateway_token="]
+    assert f["hubBase"] == ["ws://10.0.0.5:4500"] * 5 + ["wss://grid.example.com/pw", "ws://h:4500/connector"]
+    assert "const HUB = 'ws://10.0.0.5:4500';" in f["pasted"]["js"] and "/connect/connect" not in "".join(f["pasted"].values())
     r = f["snippets"]
     assert "const HUB = 'ws://grid.lab:4500';" in r["js"]
     assert "const browser = await chromium.connect(`${HUB}/connect?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`);" in r["js"]
+    assert "import { chromium } from 'playwright';" in r["js"] and "require(" not in r["js"]
+    assert r["js"].startswith("// connect.mjs") and r["js"].endswith("await browser.close();")
     assert "p.chromium.connect(f\"{HUB}/connect?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}\")" in r["python"]
-    assert r["powershell"] == "$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
-    assert r["bash"] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    assert r["python"].endswith("browser.close()")
+    # The shell ones only set PW_WS_ENDPOINT, and say what reads it.
+    assert r["powershell"].splitlines()[-1] == "$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
+    assert r["bash"].splitlines()[-1] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    for shell in ("powershell", "bash"):
+        note = r[shell].splitlines()[:-1]
+        assert note and all(line.startswith("# ") for line in note) and "full/example/example.py" in " ".join(note)
     p = f["pinned"]
     assert "chromium.connect(`${HUB}/connect?node=runner-b81e04&gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`)" in p["js"]
-    assert p["bash"] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    assert p["bash"].splitlines()[-1] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"'
     for snippets in (r, p):  # the token is read from the environment, never embedded; no slot in any address
         assert all("pwgc_" not in s and not re.search(r"/connect/[^?\s`'\"]", s) for s in snippets.values())
     assert f["claim"] == ["Hub", "Another client", "–"]
+    alive, gone, other = f["busy"]
+    assert "frees the slot the moment the session ends" in alive and "may have died" not in alive
+    assert "The hub that claimed it has stopped" in gone and "may have died" not in gone
+    assert "may have died without releasing it" in other
     # Routing as the hub sees it: Chromium channels count as chromium, offline nodes don't count, a node
     # that lists nothing and static hosts take any browser.
     rt = f["routing"]
@@ -325,15 +354,41 @@ def test_connect_snippets_follow_the_hub_address_and_can_stay_on_the_node(grid, 
     page.keyboard.press("ArrowRight")
     page.keyboard.press("ArrowRight")
     assert page.get_attribute("#repro-tab-powershell", "aria-selected") == "true"
-    assert page.text_content("#repro-code") == "$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
+    assert page.text_content("#repro-code").endswith("\n$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN")
     page.keyboard.press("ArrowRight")
-    assert page.text_content("#repro-code") == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    assert page.text_content("#repro-code").endswith('\nexport PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"')
     # Kept on the slot's node with ?node=; still no way to name the slot. The copy button follows.
     page.check("#repro-pin")
     page.wait_for_function("() => document.getElementById('repro-code').textContent.includes('node=runner-b81e04&')")
-    assert page.text_content("#repro-code") == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    assert page.text_content("#repro-code").endswith('\nexport PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"')
     assert page.get_attribute("#repro-copy", "data-copy") == page.text_content("#repro-code")
     assert "/connect/" not in page.text_content("#inspector")
+    # The panel's own /connect address pasted into the Hub address field: cut back to the hub's base.
+    page.fill("#inspector [data-hub-input]", "ws://10.0.0.5:4500/connect")
+    page.dispatch_event("#inspector [data-hub-input]", "change")
+    page.wait_for_function("() => document.getElementById('repro-code').textContent.includes('ws://10.0.0.5:4500/connect?node=')")
+    assert page.input_value("#inspector [data-hub-input]") == "ws://10.0.0.5:4500"
+    assert "/connect/connect" not in page.text_content("#inspector")
+
+
+def test_the_snippets_run_as_written(grid, page, tmp_path):
+    """The JS snippet is an ES module node accepts (import and top-level await, no require), and the
+    Python one compiles."""
+    import shutil
+    import subprocess
+    url, _ = grid
+    page.goto(url)
+    page.wait_for_selector(".mx-row[data-key]")
+    snippets = page.evaluate("async (u) => (await import(u)).connectSnippets('ws://192.168.112.184:4500', 'runner-7f3a9c')",
+                             url + "static/js/format.js")
+    compile(snippets["python"], "connect.py", "exec")
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    script = tmp_path / "connect.mjs"
+    script.write_text(snippets["js"], encoding="utf-8")
+    check = subprocess.run([node, "--check", str(script)], capture_output=True, text=True)
+    assert check.returncode == 0, check.stderr
 
 
 def test_the_connect_panel_shows_one_address_and_what_the_hub_can_route(grid, page):

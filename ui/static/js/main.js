@@ -7,7 +7,7 @@ import * as keys from "./keys.js";
 import { createLive } from "./live.js";
 import { localStore } from "./storage.js";
 import { html, icon, setHTML, setText } from "./html.js";
-import { age, ago, clock, connectUrl, duration, inTime, parseTime, plural, slotName, slotState, stateWord } from "./format.js";
+import { age, ago, clock, connectUrlForToken, duration, inTime, parseTime, plural, slotName, slotState, stateWord } from "./format.js";
 import { bindActions, forgetNode, resetNode } from "./actions.js";
 import { createInspector } from "./ui/inspector.js";
 import { createPalette } from "./ui/palette.js";
@@ -259,7 +259,7 @@ app.rowMenu = (host, btn) => {
   setHTML(rowMenu, html`
     <button type="button" role="menuitem" data-row-act="inspect">${icon("i-panel")}Inspect ${host}</button>
     <button type="button" role="menuitem" data-row-act="activity">${icon("i-activity")}Activity for this node</button>
-    <button type="button" role="menuitem" data-row-act="copy">${icon("i-copy")}Copy connect address for this node</button>
+    <button type="button" role="menuitem" data-row-act="copy">${icon("i-copy")}Copy connect URL for this node (add your token)</button>
     ${hasFails ? html`<button type="button" role="menuitem" data-row-act="reset"${locked ? html` aria-label="Sign in to reset node failures"` : ""}>${lock || icon("i-undo")}Reset node failures</button>` : ""}
     ${offline && !n.busy ? html`<button type="button" role="menuitem" class="destructive" data-row-act="forget"${locked ? html` aria-label="Sign in to forget ${host}"` : ""}>${lock || icon("i-trash")}Forget…</button>` : ""}`);
   rowMenu.dataset.host = host;
@@ -274,7 +274,8 @@ rowMenu.addEventListener("click", async (e) => {
     case "inspect": app.inspect("node", host, owner); break;
     case "activity": router.go(router.build("activity", { node: host })); break;
     case "copy":
-      copy(connectUrl(app.hub(), host), "the connect address for " + host);
+      // Ends in gateway_token=, so the client token goes straight on the end.
+      copy(connectUrlForToken(app.hub(), host), "the connect URL for " + host + ": add your client token at the end");
       if (owner) owner.focus();
       break;
     case "reset": await resetNode(host); if (owner && owner.isConnected) owner.focus(); break;
@@ -477,11 +478,12 @@ function tick() {
     } else setText(el, text);
   });
   document.querySelectorAll("[data-dur-bar]").forEach((el) => {
-    const s = since(el.dataset.durBar), stale = Number(el.dataset.stale) || 3600;
+    const s = since(el.dataset.durBar), limit = el.dataset.stale === "none" ? null : Number(el.dataset.stale) || 3600;
     if (s == null) return;
-    // The bar spans twice the stale threshold, so the threshold mark sits in the middle.
-    el.style.setProperty("--p", Math.min(1, s / (2 * stale)).toFixed(4));
-    el.classList.toggle("over", s > stale);
+    // The bar spans twice the stale threshold, so the threshold mark sits in the middle. A session the
+    // hub holds has no threshold (data-stale="none"): it fills on the default scale and never turns over.
+    el.style.setProperty("--p", Math.min(1, s / (2 * (limit || 3600))).toFixed(4));
+    el.classList.toggle("over", limit != null && s > limit);
   });
   document.querySelectorAll("[data-age-ms]").forEach((el) => setText(el, ago((Date.now() - Number(el.dataset.ageMs)) / 1000)));
   document.querySelectorAll("[data-next-poll]").forEach((el) => {
