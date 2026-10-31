@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS portUsage (
     portNumber INTEGER NOT NULL,
     inUse INTEGER NOT NULL DEFAULT 0,
     LastRunDate TEXT NULL,
-    failCount INTEGER NOT NULL DEFAULT 0
+    failCount INTEGER NOT NULL DEFAULT 0,
+    claimedBy TEXT NULL
 );
 CREATE TABLE IF NOT EXISTS nodes (
     name TEXT NOT NULL PRIMARY KEY,
@@ -84,6 +85,11 @@ STATIC_HOSTS = [
     ("pw-static.lab.local", 3000, [(7420, 0), (None, 3), (None, 0), (305, 1)]),
 ]
 
+# The hub marks the claims it makes for /connect sessions; the demo's checks all come through it,
+# except the static host's oldest session, claimed by something else long ago.
+HUB_CLAIM = "hub:5c1e09a2:"
+DIRECT_CLAIMS = {("pw-static.lab.local", 3000)}
+
 DAY = 86400
 # Managed access tokens: name, kind, bound node, created / expires / last used / revoked as
 # seconds ago (negative: in the future; None: never), nodes that last registered with it.
@@ -108,8 +114,10 @@ def create_schema(con):
 def _add_slot(cur, server, number, status, in_use_since, fails, now):
     cur.execute("INSERT INTO portStatus (PortNumber, PortStatus, PortServer, LastUpdateTime) VALUES (?, ?, ?, ?)",
                 (number, status, server, _ts(now, 0)))
-    cur.execute("INSERT INTO portUsage (id, portNumber, inUse, LastRunDate, failCount) VALUES (?, ?, ?, ?, ?)",
-                (cur.lastrowid, number, int(in_use_since is not None), _ts(now, in_use_since), fails))
+    slot_id = cur.lastrowid
+    claimed_by = None if in_use_since is None or (server, number) in DIRECT_CLAIMS else HUB_CLAIM + str(slot_id)
+    cur.execute("INSERT INTO portUsage (id, portNumber, inUse, LastRunDate, failCount, claimedBy) VALUES (?, ?, ?, ?, ?, ?)",
+                (slot_id, number, int(in_use_since is not None), _ts(now, in_use_since), fails, claimed_by))
 
 
 def seed(con, now=None):
@@ -155,22 +163,22 @@ def _selectable(con, fail_threshold=3):
 
 
 def burst(con, rng, now=None):
-    """Claim 3 to 7 selectable slots, the way set_in_use_port does. Returns the claimed ids."""
+    """Claim 3 to 7 selectable slots, the way the hub does for /connect sessions. Returns the claimed ids."""
     ids = _selectable(con)
     rng.shuffle(ids)
     claimed = ids[:rng.randint(3, 7)]
     stamp = _ts(now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), 0)
-    con.executemany("UPDATE portUsage SET inUse = 1, LastRunDate = ? WHERE id = ? AND inUse = 0",
-                    [(stamp, slot_id) for slot_id in claimed])
+    con.executemany("UPDATE portUsage SET inUse = 1, LastRunDate = ?, claimedBy = ? WHERE id = ? AND inUse = 0",
+                    [(stamp, HUB_CLAIM + str(slot_id), slot_id) for slot_id in claimed])
     return claimed
 
 
 def finish(con, slot_ids, rng, now=None):
-    """Release them like release_in_use_port; now and then a check couldn't connect first."""
+    """Release them like the hub does when a session ends; now and then a check couldn't connect first."""
     stamp = _ts(now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), 0)
     for slot_id in slot_ids:
         failed = rng.random() < 0.08
-        con.execute("UPDATE portUsage SET inUse = 0, LastRunDate = ?, failCount = {} WHERE id = ?".format(
+        con.execute("UPDATE portUsage SET inUse = 0, LastRunDate = ?, claimedBy = NULL, failCount = {} WHERE id = ?".format(
             "failCount + 1" if failed else "0"), (stamp, slot_id))
 
 

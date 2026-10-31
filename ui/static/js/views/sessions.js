@@ -1,7 +1,7 @@
 // Sessions: every claim in force, stale first, then oldest. Release lives in the inspector.
 import { app } from "../app.js";
-import { html, icon, patchList, setHTML, setText } from "../html.js";
-import { clock, connectUrl, duration, fullDate, parseTime, plural } from "../format.js";
+import { html, patchList, setHTML, setText } from "../html.js";
+import { claimWord, clock, duration, fullDate, parseTime, plural } from "../format.js";
 import * as router from "../router.js";
 
 const FILTERS = [["all", "All"], ["stale", "Stale"], ["offline", "On offline nodes"]];
@@ -16,14 +16,8 @@ function subject(s) {
   return s.kind === "gateway" ? s.host + " / " + s.port : s.host + ":" + s.port;
 }
 
-function endpointOf(s) {
-  if (!s.endpoint) return null;
-  if (s.kind !== "gateway") return s.endpoint;
-  return connectUrl(app.hub(), { host: s.host }, { port: s.port });
-}
-
 function rowMarkup(s, staleAfter) {
-  const started = parseTime(s.started), ep = endpointOf(s);
+  const started = parseTime(s.started), claim = claimWord(s);
   const state = s.kind === "gateway" && !s.node_online ? ["off", "Node offline"] : s.stale ? ["warn", "Stale"] : ["accent", "Running"];
   return html`<tr data-key="${s.slot_id}" data-fk="session-${s.slot_id}" data-jk tabindex="-1" data-inspect="session" data-id="${s.slot_id}" class="${s.stale ? "is-stale" : ""}">
     <td class="cell-subject"><a class="mono" href="#/session/${s.slot_id}" data-inspect="session" data-id="${s.slot_id}" tabindex="-1">${subject(s)}</a>
@@ -32,9 +26,7 @@ function rowMarkup(s, staleAfter) {
     <td class="cell-duration" data-label="Running">
       <div class="dur-bar" data-dur-bar="${s.started || ""}" data-stale="${staleAfter}" aria-hidden="true"><span class="dur-fill"></span><span class="dur-mark"></span></div>
       <span class="mono dur-text" data-dur="${s.started || ""}"></span></td>
-    <td class="cell-endpoint" data-label="Endpoint">${ep ? html`<span class="copyable"><code class="mono" title="${ep}">${ep}</code>
-      <button type="button" class="icon-btn tiny" data-copy="${ep}" data-copy-label="the endpoint" aria-label="Copy endpoint">${icon("i-copy")}</button></span>`
-      : html`<span class="dim" title="Never handed out to checks">–</span>`}</td>
+    <td class="cell-claim" data-label="Claimed by"><span class="${claim.dim ? "dim" : ""}" title="${claim.title}">${claim.word}</span></td>
     <td class="cell-state"><span class="pill p-${state[0]}"><span class="glyph g-${state[0]}" aria-hidden="true"></span>${state[1]}</span></td>
   </tr>`;
 }
@@ -56,7 +48,7 @@ export function createSessions(section) {
         <caption class="sr-only">Running sessions. Select a row to inspect it and release it.</caption>
         <thead><tr>
           <th scope="col">Node / slot</th><th scope="col">Started</th><th scope="col">Running <span class="dim">· stale at 1h</span></th>
-          <th scope="col">Endpoint</th><th scope="col">State</th>
+          <th scope="col">Claimed by</th><th scope="col">State</th>
         </tr></thead>
         <tbody id="session-rows"></tbody>
       </table>
@@ -99,7 +91,7 @@ export function createSessions(section) {
     empty.hidden = shown.length > 0;
     setHTML(empty, all.length
       ? html`<h2>No sessions match</h2><p>Nothing in this filter right now.</p><button type="button" class="btn small" data-filter-all>Show all sessions</button>`
-      : html`<h2>No sessions running</h2><p>A check claims a slot when it starts and frees it when it finishes. Running checks show up here, and finished ones in Activity.</p>`);
+      : html`<h2>No sessions running</h2><p>A check connects to the hub, which claims a free slot for it and frees it when the check finishes. Running checks show up here, and finished ones in Activity.</p>`);
   }
 
   section.addEventListener("click", (e) => {

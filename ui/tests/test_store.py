@@ -66,7 +66,7 @@ def test_legacy_db_without_nodes_table_shows_static_hosts(db):
         con.execute("INSERT INTO portUsage (id, portNumber) VALUES (?, 3000)", (cur.lastrowid,))
     n = node(store.snapshot(), "static1")
     assert n["kind"] == "static" and n["status"] == "UP"
-    assert n["slots"][0]["endpoint"] == "ws://static1:3000"
+    assert "endpoint" not in n["slots"][0] and n["slots"][0]["via_hub"] is None
 
 
 def test_missing_database_file_is_unavailable(db, monkeypatch):
@@ -105,7 +105,6 @@ def test_online_needs_flag_and_recent_heartbeat(db):
     assert fresh["online"] is True and fresh["status"] == "DEGRADED"
     assert [s["state"] for s in fresh["slots"]] == ["free", "unhealthy", "failing"]
     assert [s["selectable"] for s in fresh["slots"]] == [True, False, True]
-    assert fresh["slots"][0]["endpoint"] == "ws://hub:4500/connect/fresh/1"
     assert fresh["browsers"] == ["chromium", "firefox"]
 
     for name in ("stale", "down"):
@@ -123,7 +122,7 @@ def test_blank_hosts_are_hidden_and_names_are_quoted(db):
         con.execute("INSERT INTO portUsage (id, portNumber) VALUES (?, 3000)", (cur.lastrowid,))
     snap = store.snapshot()
     assert [n["host"] for n in snap["nodes"]] == ["a b"]
-    assert snap["nodes"][0]["slots"][0]["endpoint"] == "ws://hub:4500/connect/a%20b/1"
+    assert snap["nodes"][0]["host"] == "a b" and snap["connect_url"] == "ws://hub:4500/connect"
 
 
 def test_release_writes_a_utc_timestamp(db):
@@ -250,11 +249,11 @@ def test_mysql_matches_slots_to_nodes_ignoring_case(monkeypatch):
 
     now = utcnow()
     node_rows = [("Case-Node", 1, 1, "1.64.1", "1.0.0", "linux", "chromium", None, now, now, now, 0)]
-    slot_rows = [(1, "Case-Node", 1, 1, 0, None, 0), (2, "case-node", 3000, 0, 0, None, 0)]
+    slot_rows = [(1, "Case-Node", 1, 1, 0, None, 0, None), (2, "case-node", 3000, 0, 0, None, 0, None)]
     monkeypatch.setattr(store, "DB_ENGINE", "mysql")
     monkeypatch.setattr(store, "_schema_attempted", True)
     monkeypatch.setattr(store, "_session", contextlib.contextmanager(lambda: (yield None)))
-    monkeypatch.setattr(store, "_read", lambda cur: (now, node_rows, slot_rows))
+    monkeypatch.setattr(store, "_read", lambda cur: (now, node_rows, slot_rows, True))
     snap = store.snapshot()
     assert [(n["host"], n["kind"], n["total"]) for n in snap["nodes"]] == [("Case-Node", "gateway", 2)]
     assert [(s["state"], s["selectable"]) for s in snap["nodes"][0]["slots"]] == [("free", True), ("unhealthy", False)]
@@ -275,7 +274,7 @@ def test_blank_host_rows_still_in_use_can_be_released(db):
     assert [n["host"] for n in snap["nodes"]] == ["gw"]
     (legacy,) = snap["sessions"]
     assert legacy["kind"] == "legacy" and legacy["host"] == "" and legacy["port"] == 3000
-    assert legacy["endpoint"] is None and legacy["stale"] is True
+    assert legacy["via_hub"] is False and legacy["stale"] is True
     assert store.release_slot(legacy["slot_id"]) == 1
     assert store.snapshot()["sessions"] == []
 
@@ -344,3 +343,52 @@ def test_actions_only_from_the_grid_page(db, monkeypatch):
     monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
     r = client.post("/api/slots/1/release", json={}, headers={"X-Grid-Token": "nope"})
     assert r.status_code == 403 and r.get_json()["token_required"] is True
+
+
+def test_checks_connect_to_one_address_and_no_slot_has_its_own(db):
+    """The hub picks the slot: the API offers /connect and no per-slot address to copy."""
+    add_node(db, "gw", 1, 1, [(1, None, 0), (1, 30, 0)])
+    with sqlite3.connect(db) as con:
+        cur = con.execute("INSERT INTO portStatus (PortNumber, PortServer) VALUES (3000, 'static1')")
+        con.execute("INSERT INTO portUsage (id, portNumber, inUse, LastRunDate) VALUES (?, 3000, 1, ?)", (cur.lastrowid, ts(10)))
+    snap = store.snapshot()
+    assert snap["connect_url"] == "ws://hub:4500/connect"
+    text = repr(snap)
+    assert "/connect/" not in text and "ws://static1" not in text
+    for n in snap["nodes"]:
+        assert all("endpoint" not in s and "address" not in s for s in n["slots"])
+    assert all("endpoint" not in s for s in snap["sessions"])
+
+
+def test_claims_say_whether_the_hub_made_them(db):
+    add_node(db, "gw", 1, 1, [(1, 30, 0), (1, 20, 0), (1, None, 0)])
+    run(db, "UPDATE portUsage SET claimedBy = 'hub:5c1e09a2:7' WHERE id = 1")
+    run(db, "UPDATE portUsage SET claimedBy = 'hub:5c1e09a2:9' WHERE id = 3")  # a leftover on a free slot: not a claim
+    snap = store.snapshot()
+    by_slot = {s["slot_id"]: s for s in snap["sessions"]}
+    assert (by_slot[1]["via_hub"], by_slot[1]["claimed_by"]) == (True, "hub:5c1e09a2:7")
+    assert (by_slot[2]["via_hub"], by_slot[2]["claimed_by"]) == (False, None)  # claimedBy NULL: some other claimer
+    slots = {s["id"]: s for s in node(snap, "gw")["slots"]}
+    assert [slots[i]["via_hub"] for i in (1, 2, 3)] == [True, False, None]
+
+
+def test_a_database_the_hub_has_not_upgraded_reports_claims_as_unknown(db):
+    with sqlite3.connect(db) as con:
+        demo.create_schema(con)
+        con.execute("ALTER TABLE portUsage DROP COLUMN claimedBy")
+    add_node(db, "gw", 1, 1, [(1, 30, 0)])
+    (session,) = store.snapshot()["sessions"]
+    assert session["via_hub"] is None and session["claimed_by"] is None
+    assert store.release_slot(session["slot_id"]) == 1  # releasing doesn't need the column either
+    assert run(db, "SELECT inUse FROM portUsage") == [(0,)]
+
+
+def test_a_force_release_takes_the_claim_away_from_the_hub(db):
+    """Clearing claimedBy with inUse tells the hub its claim was taken: it lets the slot go instead of
+    claiming it back for the session it thinks is still running."""
+    add_node(db, "gw", 1, 1, [(1, 30, 0), (1, 20, 0)])
+    run(db, "UPDATE portUsage SET claimedBy = 'hub:5c1e09a2:' || id")
+    assert store.release_slot(1) == 1
+    started = next(s for s in store.snapshot()["sessions"] if s["slot_id"] == 2)["started"]
+    assert store.release_claim(2, started) == ("released", 1)
+    assert run(db, "SELECT inUse, claimedBy FROM portUsage ORDER BY id") == [(0, None), (0, None)]

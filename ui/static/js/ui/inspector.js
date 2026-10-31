@@ -1,10 +1,11 @@
-// The inspector: a non-modal panel on the right that explains one slot, node or session and
-// keeps updating while it's open. URL-addressable (#/slot/12, #/node/<name>, #/session/12).
+// The inspector: a non-modal panel on the right that explains one slot, node or session, or how
+// checks connect to the grid, and keeps updating while it's open. URL-addressable (#/slot/12,
+// #/node/<name>, #/session/12, #/connect).
 import { app, prefs } from "../app.js";
 import { html, icon, setHTML, patchList } from "../html.js";
 import {
-  age, clock, connectUrl, duration, endpointParts, fullDate, nodeSentence, parseTime, platformOf, plural, reproduce,
-  runLength, slotName, slotNameLong, slotSentence, slotState, stateWord,
+  age, claimWord, clock, connectSnippets, connectUrl, duration, endpointParts, fullDate, nodeSentence, parseTime, platformOf, plural,
+  routing, runLength, slotName, slotNameLong, slotSentence, slotState, stateWord,
 } from "../format.js";
 import { describe } from "../live.js";
 import { adminButton } from "../actions.js";
@@ -24,11 +25,14 @@ function eventRow(e) {
     <span class="ev-text">${describe(e)}</span></li>`;
 }
 
-// An endpoint breaks only after "/" (never inside a node name such as runner-b81e04).
+// An address breaks only after "/" (never inside a node name such as runner-b81e04).
 function copyable(text, label) {
   return html`<span class="copyable"><code class="mono endpoint">${endpointParts(text).map((p) => html`<span class="seg">${p}</span><wbr>`)}</code><button type="button" class="icon-btn tiny" data-copy="${text}"
     data-copy-label="${label}" aria-label="Copy ${label}">${icon("i-copy")}</button></span>`;
 }
+
+// A name the hub takes in ?node= (its node-name rule).
+const pinName = (name) => typeof name === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(name);
 
 // Where the events came from, said next to them.
 const reach = () => (app.live.recorder.source === "server" ? "· recorded by the Grid UI" : "· seen by this page");
@@ -79,7 +83,7 @@ export function createInspector({ onClose }) {
       openerKey = openerEl.dataset && openerEl.dataset.fk;
     }
     cur = { type, id };
-    if (!same) built = null;
+    if (!same) { built = null; pin = false; }
     const wasHidden = el.hidden;
     el.hidden = false;
     document.documentElement.classList.add("insp-open");
@@ -134,7 +138,7 @@ export function createInspector({ onClose }) {
   });
 
   // A press outside the panel (on nothing interactive) closes it. A drag that starts inside, such
-  // as selecting the endpoint text past its end, doesn't.
+  // as selecting snippet text past its end, doesn't.
   let downInside = false;
   document.addEventListener("pointerdown", (e) => { downInside = el.contains(e.target); }, true);
   document.addEventListener("click", (e) => {
@@ -144,8 +148,10 @@ export function createInspector({ onClose }) {
     onClose();
   });
 
-  // ---- reproduce -------------------------------------------------------------
-  let lang = prefs.get(TAB_KEY, "js");
+  // ---- connect -----------------------------------------------------------------
+  // The same snippets everywhere: checks connect to the hub, which picks the slot. On a node, slot
+  // or session they can be kept on that node (?node=); nothing can name a slot.
+  let lang = prefs.get(TAB_KEY, "js"), pin = false;
   if (!LANGS.some((l) => l[0] === lang)) lang = "js";
   function selectTab(next, focus) {
     lang = next;
@@ -160,22 +166,35 @@ export function createInspector({ onClose }) {
     if (panel) panel.setAttribute("aria-labelledby", "repro-tab-" + lang);
     updateSnippet();
   }
+  // The node a snippet can be kept on: the inspected node, or the slot's or session's node, if the
+  // hub would take its name in ?node=.
+  function pinnable() {
+    if (!cur || cur.type === "connect") return null;
+    const f = cur.type === "node" ? null : app.findSlot(cur.id);
+    const name = cur.type === "node" ? cur.id : f && f.node.host;
+    return pinName(name) ? name : null;
+  }
   function updateSnippet() {
     const code = el.querySelector("#repro-code");
     if (!code || !cur) return;
-    const f = cur.type === "node" ? null : app.findSlot(cur.id);
-    if (!f) return;
-    const text = reproduce(app.hub(), f.node, f.slot)[lang];
+    const text = connectSnippets(app.hub(), pin ? pinnable() : null)[lang];
     if (code.textContent !== text) code.textContent = text;
     const btn = el.querySelector("#repro-copy");
     if (btn) btn.dataset.copy = text;
   }
   app.onHub(() => { updateSnippet(); render(); });
+  el.addEventListener("change", (e) => {
+    if (e.target.id !== "repro-pin") return;
+    pin = e.target.checked;
+    updateSnippet();
+  });
 
-  function reproBlock(gateway) {
+  function connectBlock(node, label = "Connect to the grid") {
     return html`<section class="insp-section repro" aria-labelledby="repro-title">
-      <h3 class="section-label" id="repro-title">Reproduce</h3>
-      ${gateway ? hubField("Your checks' hub address. The client token is read from GATEWAY_CLIENT_TOKEN, never copied.") : html`<p class="hint">Static hosts take a plain run-server address; no token.</p>`}
+      <h3 class="section-label" id="repro-title">${label}</h3>
+      ${hubField("Your checks' hub address. The client token is read from GATEWAY_CLIENT_TOKEN, never copied.")}
+      ${pinName(node) ? html`<label class="check-line"><input type="checkbox" id="repro-pin"${pin ? html` checked` : ""}>
+        <span>Only on <span class="mono">${node}</span> <span class="dim">(?node=)</span></span></label>` : ""}
       <div class="tabs-row">
         <div class="tabs" role="tablist" aria-label="Snippet language">
           ${LANGS.map(([id, label]) => html`<button type="button" role="tab" id="repro-tab-${id}" data-lang="${id}" aria-controls="repro-panel"
@@ -186,11 +205,14 @@ export function createInspector({ onClose }) {
         <pre class="code" tabindex="0"><code id="repro-code" class="mono"></code></pre>
         <button type="button" class="icon-btn tiny copy-btn" id="repro-copy" data-copy="" data-copy-label="the snippet" aria-label="Copy the snippet" title="Copy">${icon("i-copy")}</button>
       </div>
+      <p class="hint">${pinName(node)
+        ? "The hub picks a free slot on a node that offers the browser the check connects with. A check can't ask for a slot."
+        : "One address for every browser: firefox.connect() and webkit.connect() use it too. To keep a check on one node, add ?node=<name>; each node's inspector has that variant."}</p>
     </section>`;
   }
 
   // ---- skeletons ---------------------------------------------------------------
-  function skeleton(type, gateway) {
+  function skeleton(type, node) {
     const sections = {
       slot: html`
         <header class="insp-head" data-part="head"></header>
@@ -198,7 +220,7 @@ export function createInspector({ onClose }) {
         <dl class="facts" data-part="facts"></dl>
         <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Recent events <span class="dim" data-part="reach"></span></h3>
           <ol class="ev-list" data-part="events"></ol></section>
-        ${reproBlock(gateway)}
+        ${connectBlock(node)}
         <div class="insp-actions" data-part="actions"></div>`,
       session: html`
         <header class="insp-head" data-part="head"></header>
@@ -207,7 +229,7 @@ export function createInspector({ onClose }) {
         <dl class="facts" data-part="facts"></dl>
         <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Recent events <span class="dim" data-part="reach"></span></h3>
           <ol class="ev-list" data-part="events"></ol></section>
-        ${reproBlock(gateway)}
+        ${connectBlock(node)}
         <div class="insp-actions" data-part="actions"></div>`,
       node: html`
         <header class="insp-head" data-part="head"></header>
@@ -218,7 +240,13 @@ export function createInspector({ onClose }) {
         <section class="insp-section" aria-labelledby="ev-title"><h3 class="section-label" id="ev-title">Runs and failures <span class="dim" data-part="reach"></span></h3>
           <p class="insp-stats" data-part="stats"></p>
           <ol class="ev-list" data-part="events"></ol></section>
+        ${connectBlock(node)}
         <div class="insp-actions" data-part="actions"></div>`,
+      connect: html`
+        <header class="insp-head" data-part="head"></header>
+        <p class="insp-sentence" data-part="sentence"></p>
+        <dl class="facts" data-part="facts"></dl>
+        ${connectBlock(null, "Snippets")}`,
       gone: html`<header class="insp-head" data-part="head"></header><p class="insp-sentence" data-part="sentence"></p>`,
     };
     setHTML(body, sections[type]);
@@ -236,17 +264,17 @@ export function createInspector({ onClose }) {
     if (!cur || el.hidden) return;
     const d = app.data();
     const kind = el.querySelector("#insp-kind");
-    kind.textContent = { slot: "Slot", node: "Node", session: "Session" }[cur.type];
+    kind.textContent = { slot: "Slot", node: "Node", session: "Session", connect: "Grid" }[cur.type];
     if (!d) {
       if (built !== "wait") { setHTML(body, html`<p class="insp-sentence">Loading…</p>`); built = "wait"; }
       return;
     }
     if (cur.type === "node") return renderNode(d);
+    if (cur.type === "connect") return renderConnect(d);
     const f = app.findSlot(cur.id);
     if (!f || (cur.type === "session" && !f.session)) return renderGone(f);
-    const gateway = f.node.kind === "gateway";
-    const key = cur.type + ":" + cur.id + ":" + gateway;
-    if (built !== key) { skeleton(cur.type, gateway); built = key; selectTab(lang, false); }
+    const key = cur.type + ":" + cur.id + ":" + f.node.host;
+    if (built !== key) { skeleton(cur.type, f.node.host); built = key; selectTab(lang, false); }
     if (cur.type === "slot") renderSlot(f); else renderSession(f);
     updateSnippet();
   }
@@ -262,12 +290,12 @@ export function createInspector({ onClose }) {
 
   function slotFacts(f) {
     const { node, slot } = f, cfg = app.cfg(), gateway = node.kind === "gateway";
-    const endpoint = gateway ? connectUrl(app.hub(), node, slot) : slot.endpoint;
     const retry = parseTime(slot.retry_at), run = parseTime(slot.last_run);
     const meter = Math.min(1, slot.fails / Math.max(1, cfg.threshold));
     return [
-      html`<dt>Endpoint</dt><dd>${copyable(endpoint, "the endpoint")}</dd>`,
-      html`<dt>Run-server</dt><dd>${gateway ? (slot.healthy ? html`<span class="ok-text">Passes health checks</span>` : html`<span class="warn-text">Not answering health checks</span>`) : html`<span class="dim">Not checked (static host)</span>`}</dd>`,
+      slot.busy ? claimFact(f.session || slot) : "",
+      html`<dt>Run-server</dt><dd>${gateway ? (slot.healthy ? html`<span class="ok-text">Passes health checks</span>` : html`<span class="warn-text">Not answering health checks</span>`)
+        : html`<span class="dim">Not health-checked ·</span> the hub dials <span class="mono">${node.host}:${slot.port}</span> itself`}</dd>`,
       html`<dt>Failures</dt><dd><span class="meter-wrap"><span class="meter${slot.fails >= cfg.threshold ? " over" : ""}" role="img"
         aria-label="${plural(slot.fails, "consecutive failure")}, limit ${cfg.threshold}"><span class="meter-fill" data-meter="${meter}"></span></span>
         <span><span class="mono">${slot.fails}</span> ${slot.fails === 1 ? "failure" : "failures"} · limit <span class="mono">${cfg.threshold}</span>${slot.fails >= cfg.threshold
@@ -278,6 +306,13 @@ export function createInspector({ onClose }) {
       gateway ? html`<dt>Node heartbeat</dt><dd><span data-seen="${node.host}"></span>${node.online ? "" : html` · <span class="warn-text">offline</span>`}</dd>`
         : html`<dt>Host</dt><dd class="mono">${node.host}</dd>`,
     ];
+  }
+
+  // Who holds a busy slot; said only when the database records it.
+  function claimFact(s) {
+    if (s.via_hub == null) return "";
+    const c = claimWord(s);
+    return html`<dt>Claimed by</dt><dd title="${c.title}">${c.long}${s.claimed_by ? html` <span class="dim mono">· ${s.claimed_by}</span>` : ""}</dd>`;
   }
 
   function eventsFor(filter, limit = 8) {
@@ -335,7 +370,7 @@ export function createInspector({ onClose }) {
   function renderNode(d) {
     const node = app.findNode(cur.id);
     if (!node) return renderGone(null);
-    if (built !== "node:" + node.host) { skeleton("node"); built = "node:" + node.host; }
+    if (built !== "node:" + node.host) { skeleton("node", node.host); built = "node:" + node.host; selectTab(lang, false); }
     const p = platformOf(node), gateway = node.kind === "gateway";
     part("head", html`<h2 id="insp-title" class="mono" tabindex="-1">${node.host}</h2>${pill(NODE_TONE[node.status] || "off", node.status.charAt(0) + node.status.slice(1).toLowerCase())}`);
     part("sentence", html`${nodeSentence(node, app.cfg())}`);
@@ -349,11 +384,11 @@ export function createInspector({ onClose }) {
         html`<dt>Playwright</dt><dd class="mono">${node.playwright_version || "–"}${node.agent_version ? html` <span class="dim">· agent ${node.agent_version}</span>` : ""}</dd>`,
         html`<dt>Browsers</dt><dd>${(node.browsers || []).join(", ") || "–"}</dd>`,
         html`<dt>Heartbeat</dt><dd><span data-seen="${node.host}"></span></dd>`,
-        html`<dt>Connected</dt><dd class="mono" title="${fullDate(parseTime(node.connected_at))}">${node.connected_at ? clock(parseTime(node.connected_at), false) + " · " + age((app.now() - parseTime(node.connected_at)) / 1000) + " ago" : "–"}</dd>`,
-        html`<dt>Endpoints</dt><dd>${copyable(app.hub() + "/connect/" + encodeURIComponent(node.host) + "/", "the endpoint prefix")}</dd>`);
+        html`<dt>Connected</dt><dd class="mono" title="${fullDate(parseTime(node.connected_at))}">${node.connected_at ? clock(parseTime(node.connected_at), false) + " · " + age((app.now() - parseTime(node.connected_at)) / 1000) + " ago" : "–"}</dd>`);
       if (node.ephemeral && !node.online) facts.push(html`<dt>Note</dt><dd>Ephemeral node: it and its slots are removed automatically.</dd>`);
     } else {
       facts.push(html`<dt>Ports</dt><dd class="mono">${node.slots.length ? node.slots[0].port + "–" + node.slots[node.slots.length - 1].port : "–"}</dd>`,
+        html`<dt>Browsers</dt><dd>Any <span class="dim">· it declares none, so the hub sends it any browser once no gateway node has a free slot</span></dd>`,
         html`<dt>Source</dt><dd>hosts: in database.yaml</dd>`);
     }
     part("facts", html`${facts}`);
@@ -370,6 +405,29 @@ export function createInspector({ onClose }) {
       ${gateway && !node.online ? (busy ? html`<p class="dim">Release its ${plural(node.busy, "slot")} in use before forgetting it.</p>`
         : adminButton({ label: "Forget…", verb: "forget " + node.host, attrs: html`data-act="forget" data-target="${node.host}"`, cls: "btn", danger: true })) : ""}
       ${!hasFails && !(gateway && !node.online) ? html`<p class="dim">No actions needed.</p>` : ""}`);
+  }
+
+  // #/connect: how a check reaches the grid, and what the hub can route right now.
+  function renderConnect(d) {
+    if (built !== "connect") { skeleton("connect", null); built = "connect"; selectTab(lang, false); }
+    const r = routing(d);
+    part("head", html`<h2 id="insp-title" tabindex="-1">Connect to the grid</h2>`);
+    part("sentence", html`Every check connects to one address. The hub hands it a free slot on a node that offers the browser it
+      connects with and runs the same Playwright version. When they're all busy, the check waits in the hub's queue for one.`);
+    const offered = r.browsers.map((b) => html`<li>${b.name === "*" ? "Any browser" : html`<span class="mono">${b.name}</span>`} · <span class="${b.free ? "" : "warn-text"}">${b.free} free</span>
+      <span class="dim">of ${plural(b.slots, "slot")} on ${plural(b.nodes, "node")}${b.name === "*" ? " that list no browsers" : ""}</span></li>`);
+    if (r.anyBrowser.nodes) {
+      offered.push(html`<li>Any browser · <span class="${r.anyBrowser.free ? "" : "warn-text"}">${r.anyBrowser.free} free</span>
+        <span class="dim">of ${plural(r.anyBrowser.slots, "slot")} on ${plural(r.anyBrowser.nodes, "static host")}, used once no gateway node has one</span></li>`);
+    }
+    part("facts", html`
+      <dt>Address</dt><dd>${copyable(connectUrl(app.hub()), "the connect address")}</dd>
+      <dt>Token</dt><dd><span class="mono">?gateway_token=</span> or an <span class="mono">x-gateway-token</span> header: GATEWAY_CLIENT_TOKEN,
+        or a client token from <a href="#/access">Access</a></dd>
+      <dt>Browsers now</dt><dd>${offered.length ? html`<ul class="plain-list">${offered}</ul>` : html`<span class="dim">No node is online.</span>`}</dd>
+      <dt>Playwright</dt><dd>${r.versions.length ? html`${r.versions.map((v, i) => html`${i ? " · " : ""}<span class="mono">${v.version}</span>${r.versions.length > 1
+        ? html` <span class="dim">(${plural(v.nodes, "node")})</span>` : ""}`)}<span class="dim"> · a check is only sent to a node with the same major.minor as its client</span>`
+        : html`<span class="dim">Not reported</span>`}</dd>`);
   }
 
   function meters() {

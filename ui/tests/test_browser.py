@@ -171,6 +171,10 @@ def test_sessions_have_no_per_row_release_and_rows_open_the_inspector(grid, page
     assert page.locator("#session-rows [data-act=release], #session-rows button:has-text('Release')").count() == 0
     rows = page.eval_on_selector_all("#session-rows tr", "rs => rs.map(r => r.querySelector('.cell-subject a').textContent)")
     assert rows[0] == "pw-static.lab.local:3000"  # stale first
+    # Who claimed each slot: the hub for /connect sessions; the demo's stale one came from elsewhere.
+    claims = page.eval_on_selector_all("#session-rows tr .cell-claim", "cs => cs.map(c => c.textContent.trim())")
+    assert claims[0] == "Another client" and set(claims[1:]) == {"Hub"}
+    assert page.text_content("#view-sessions thead").count("Claimed by") == 1
     page.click("#session-filters [data-filter=stale]")
     page.wait_for_function("() => location.hash.indexOf('filter=stale') !== -1")
     assert page.locator("#session-rows tr").count() == 1
@@ -220,6 +224,7 @@ def test_empty_grid_explains_how_to_add_nodes(tmp_path, monkeypatch, page):
     assert h1 == "No nodes yet"
     assert "docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml up -d --build --scale runner=2" in text
     assert "node gateway/agent.js --hub ws://127.0.0.1:4500 --slots 4" in text and "README" in text
+    assert "ws://127.0.0.1:4500/connect" in commands and "/connect/" not in panel  # checks: one address, no slot
     assert commands and not any("<" in c or ">" in c.replace(">>", "") for c in commands)  # runnable, no placeholders
     assert "Available 0" not in panel and "Ready for new checks" not in panel
 
@@ -257,7 +262,7 @@ def test_inspector_closes_on_outside_clicks_but_not_on_its_own_margin_or_a_drag(
     page.mouse.click(box["x"] + 10, box["y"] + box["height"] - 10)  # its own padding
     assert insp.is_visible()
 
-    code = page.locator("#insp-body .copyable code").first.bounding_box()  # drag-select the endpoint out past its end
+    code = page.locator("#repro-code").bounding_box()  # drag-select the snippet out past its end
     page.mouse.move(code["x"] + 2, code["y"] + code["height"] / 2)
     page.mouse.down()
     page.mouse.move(box["x"] - 200, code["y"] + code["height"] / 2)

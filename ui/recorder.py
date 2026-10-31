@@ -94,6 +94,8 @@ def diff(prev, nxt):
         run, prev_run = ms(s.get("last_run")), ms(p.get("last_run"))
         fails, prev_fails = s.get("fails") or 0, p.get("fails") or 0
         failed_more = fails > prev_fails
+        # Who claimed it (portUsage.claimedBy): the hub, or something that went around it.
+        by = {} if s.get("via_hub") is None else {"hub": bool(s["via_hub"])}
 
         def add(event_id, **fields):
             event = dict(base, id=event_id)
@@ -102,7 +104,7 @@ def diff(prev, nxt):
 
         if not p.get("busy") and s.get("busy"):
             start = run if run is not None else now
-            add("c:{}:{}".format(slot_id, start), type="claimed", kind="claim", t=start, start=start)
+            add("c:{}:{}".format(slot_id, start), type="claimed", kind="claim", t=start, start=start, **by)
         elif p.get("busy") and not s.get("busy"):
             end = run if run is not None else now
             add("f:{}:{}".format(slot_id, end), type="finished", kind="finish", t=end, start=prev_run, end=end,
@@ -115,7 +117,7 @@ def diff(prev, nxt):
             # Released and claimed again in between: one run ended, roughly when the next began.
             add("f:{}:{}".format(slot_id, run), type="finished", kind="finish", approx=True, t=run, start=prev_run, end=run,
                 dur=None, failed=failed_more)
-            add("c:{}:{}".format(slot_id, run), type="claimed", kind="claim", t=run, start=run)
+            add("c:{}:{}".format(slot_id, run), type="claimed", kind="claim", t=run, start=run, **by)
 
         if failed_more:
             add("x:{}:{}:{}".format(slot_id, fails, _key(run)), type="failure", kind="failure", t=now, fails=fails,

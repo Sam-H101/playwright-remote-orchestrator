@@ -184,6 +184,7 @@ def test_client_token_usage_and_the_first_token_notice(admin_grid, admin_page):
     assert re.fullmatch(r"pwgc_[A-Za-z0-9_-]{43}", token)
     usage = p.text_content(".usage")
     assert "GATEWAY_CLIENT_TOKEN=" + token in usage
+    assert "ws://grid-hub.example:4500/connect?gateway_token=" + token in usage and "/connect/" not in usage
     assert "<" not in usage and ">" not in usage  # real addresses, no placeholders
     p.click(".reveal [data-copy-label='the token']")
     p.click("[data-reveal-done]")

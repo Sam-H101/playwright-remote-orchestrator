@@ -90,6 +90,18 @@ def test_diff_names_every_change_with_an_id_made_of_database_values():
     assert beat == [] and recorder.diff(None, snap(G1, [])) == []
 
 
+def test_claims_record_whether_the_hub_made_them():
+    """portUsage.claimedBy: the event says hub or not, and keeps the id the page computes."""
+    for via_hub, want in ((True, {"hub": True}), (False, {"hub": False}), (None, {})):
+        (claim,) = recorder.diff(snap(G0, [node("n", [slot(1)])]),
+                                 snap(G1, [node("n", [slot(1, busy=True, state="busy", last_run=T, via_hub=via_hub)])]))
+        assert claim["id"] == "c:1:" + str(recorder.ms(T))
+        assert {k: v for k, v in claim.items() if k == "hub"} == want
+    again = recorder.diff(snap(G0, [node("n", [slot(1, busy=True, state="busy", last_run=T, via_hub=True)])]),
+                          snap(G1, [node("n", [slot(1, busy=True, state="busy", last_run=T4, via_hub=False)])]))
+    assert [(e["type"], e.get("hub")) for e in again] == [("finished", None), ("claimed", False)]
+
+
 def test_the_ring_merges_by_id_keeps_15_minutes_and_at_most_500_events():
     snaps = []
     rec = recorder.Recorder(lambda: snaps[-1], lambda: "db", interval_s=0)

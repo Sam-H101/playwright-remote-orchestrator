@@ -6,6 +6,11 @@ gateway node that registered itself with the hub (PortNumber is the slot
 index); one without is a legacy static host (PortNumber is the run-server
 port). A slot with inUse = 1 is a live session, started at LastRunDate.
 
+Checks don't connect to a slot: every one connects to the hub's /connect, and the hub claims a free
+slot that fits the browser it launches. portUsage.claimedBy says who holds a claim: 'hub:...' for a
+session the hub routed, NULL for any other claimer. Databases the hub hasn't upgraded yet have no
+such column; their claims are reported as of unknown origin.
+
 All DATETIME columns hold UTC. "Now" is read from the database so that
 online/stale decisions match the checks' slot selection, whatever the UI
 host's clock says.
@@ -208,10 +213,6 @@ def _age_s(now, then):
     return max(0, int((now - then).total_seconds())) if then else None
 
 
-def gateway_endpoint(name, slot):
-    return "{}/connect/{}/{}".format(GATEWAY_URL, urllib.parse.quote(str(name), safe=""), slot)
-
-
 def _schema_statements(text):
     statement = []
     for line in text.splitlines():
@@ -268,7 +269,7 @@ def _read(cur):
     now = _parse_time(cur.fetchone()[0])
     tables = _tables(cur)
     if not {"portstatus", "portusage"} <= tables:
-        return now, None, []
+        return now, None, [], False
     node_rows = []
     if "nodes" in tables:
         # ephemeral came later; databases created before it don't have the column.
@@ -279,12 +280,22 @@ def _read(cur):
             FROM nodes
         """.format(ephemeral))
         node_rows = cur.fetchall()
+    # claimedBy came with hub routing; the hub adds it to portUsage tables made before that.
+    claimed_by = "pu.claimedBy" if "claimedby" in _columns(cur, "portUsage") else "NULL"
     cur.execute("""
-        SELECT ps.id, ps.PortServer, ps.PortNumber, ps.PortStatus, pu.inUse, pu.LastRunDate, pu.failCount
+        SELECT ps.id, ps.PortServer, ps.PortNumber, ps.PortStatus, pu.inUse, pu.LastRunDate, pu.failCount, {}
         FROM portStatus ps JOIN portUsage pu ON ps.id = pu.id
         ORDER BY ps.PortServer, ps.PortNumber
-    """)
-    return now, node_rows, cur.fetchall()
+    """.format(claimed_by))
+    return now, node_rows, cur.fetchall(), claimed_by != "NULL"
+
+
+def _claim(busy, claims_known, claimed_by):
+    """(via_hub, claimed_by) of a slot: via_hub is None when free or when the database can't say."""
+    if not busy or not claims_known:
+        return None, None
+    claimed_by = claimed_by.decode() if isinstance(claimed_by, bytes) else claimed_by
+    return bool(claimed_by and str(claimed_by).startswith("hub:")), claimed_by or None
 
 
 def _new_node(host, kind):
@@ -303,9 +314,9 @@ def snapshot():
     ensure_schema()
     try:
         with _session() as cur:
-            now, node_rows, slot_rows = _read(cur)
+            now, node_rows, slot_rows, claims_known = _read(cur)
     except _MissingTables:  # dropped or half-created between queries
-        now, node_rows, slot_rows = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), None, []
+        now, node_rows, slot_rows, claims_known = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None), None, [], False
     initialised = node_rows is not None
 
     # Match slots to nodes the way the database compares names: MySQL's default collation
@@ -329,18 +340,18 @@ def snapshot():
         })
 
     sessions = []
-    for slot_id, host, port, port_status, in_use, last_run, fails in slot_rows:
+    for slot_id, host, port, port_status, in_use, last_run, fails, claimed_by in slot_rows:
         busy = bool(in_use)
         fails = fails or 0
         started = _parse_time(last_run)
+        via_hub, claimed_by = _claim(busy, claims_known, claimed_by)
         if not (host or "").strip():
             # Blank PortServer rows from old configs aren't real hosts and are never handed out.
             # One still marked in use can only be cleared by hand, so list it as a session.
             if busy:
                 duration_s = _age_s(now, started)
                 sessions.append({
-                    "slot_id": slot_id, "host": "", "port": port, "kind": "legacy", "endpoint": None,
-                    "started": _iso(started), "duration_s": duration_s,
+                    "slot_id": slot_id, "host": "", "port": port, "kind": "legacy", "via_hub": via_hub, "claimed_by": claimed_by, "started": _iso(started), "duration_s": duration_s,
                     "stale": duration_s is None or duration_s > STALE_AFTER_S,
                     "fails": fails, "node_online": None,
                 })
@@ -363,7 +374,6 @@ def snapshot():
         else:
             state = "free"
         selectable = not busy and not cooling and (not gateway or (node["online"] and healthy))
-        endpoint = gateway_endpoint(host, port) if gateway else "ws://{}:{}".format(host, port)
 
         node["total"] += 1
         node["busy"] += busy
@@ -375,7 +385,7 @@ def snapshot():
             node["last_activity"] = _iso(started)
         node["slots"].append({
             "id": slot_id, "port": port, "busy": busy, "fails": fails, "healthy": healthy,
-            "state": state, "selectable": selectable, "endpoint": endpoint,
+            "state": state, "selectable": selectable, "via_hub": via_hub,
             "last_run": _iso(started), "retry_at": _iso(retry_at) if cooling else None,
         })
         if busy:
@@ -385,7 +395,8 @@ def snapshot():
                 "host": host,
                 "port": port,
                 "kind": node["kind"],
-                "endpoint": endpoint,
+                "via_hub": via_hub,
+                "claimed_by": claimed_by,
                 "started": _iso(started),
                 "duration_s": duration_s,
                 "stale": duration_s is None or duration_s > STALE_AFTER_S,
@@ -417,6 +428,8 @@ def snapshot():
         "generated": _iso(now),
         "db": {"engine": DB_ENGINE, "initialised": initialised},
         "gateway_url": GATEWAY_URL,
+        # The one address every check connects to; the hub picks the slot.
+        "connect_url": GATEWAY_URL + "/connect",
         "fail_threshold": FAIL_THRESHOLD,
         "fail_cooldown_s": FAIL_COOLDOWN_S,
         "stale_after_s": STALE_AFTER_S,
@@ -450,10 +463,21 @@ def _execute(sql, params):
         return 0
 
 
+def _release_sql(cur):
+    """The SET clause that frees a slot. It also clears claimedBy, so a hub that held the claim
+    sees it was taken away and lets it go, instead of claiming the slot again."""
+    clear = ", claimedBy = NULL" if "claimedby" in _columns(cur, "portUsage") else ""
+    return "UPDATE portUsage SET inUse = 0, LastRunDate = {}{} WHERE id = ?".format(_now_sql(), clear)
+
+
 def release_slot(slot_id):
     """Force a stuck slot back to free."""
-    return _execute(
-        "UPDATE portUsage SET inUse = 0, LastRunDate = {} WHERE id = ?".format(_now_sql()), (slot_id,))
+    try:
+        with _session() as cur:
+            cur.execute(_sql(_release_sql(cur)), (slot_id,))
+            return cur.rowcount
+    except _MissingTables:
+        return 0
 
 
 def release_claim(slot_id, claimed_at):
@@ -477,7 +501,7 @@ def release_claim(slot_id, claimed_at):
                 return "free", 0
             if _iso(_parse_time(row[1])) != claimed_at:
                 return "reclaimed", 0
-            cur.execute(_sql("UPDATE portUsage SET inUse = 0, LastRunDate = {} WHERE id = ?".format(_now_sql())), (slot_id,))
+            cur.execute(_sql(_release_sql(cur)), (slot_id,))
             return "released", cur.rowcount
     except _MissingTables:
         return "not_found", 0

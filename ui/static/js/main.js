@@ -7,7 +7,7 @@ import * as keys from "./keys.js";
 import { createLive } from "./live.js";
 import { localStore } from "./storage.js";
 import { html, icon, setHTML, setText } from "./html.js";
-import { age, ago, clock, duration, inTime, parseTime, plural, slotName, slotState, stateWord } from "./format.js";
+import { age, ago, clock, connectUrl, duration, inTime, parseTime, plural, slotName, slotState, stateWord } from "./format.js";
 import { bindActions, forgetNode, resetNode } from "./actions.js";
 import { createInspector } from "./ui/inspector.js";
 import { createPalette } from "./ui/palette.js";
@@ -47,6 +47,8 @@ app.inspect = (type, id, opener) => {
   router.go(router.inspectHash(type, id), { replace: inspector.isOpen() && !!route.inspect });
 };
 app.closeInspector = closeInspector;
+// Nodes and the connect panel are addressed by name; slots and sessions by slot id.
+const inspectId = (type, id) => (type === "node" || type === "connect" ? id : Number(id));
 app.go = (hash) => router.go(hash);
 
 function showView(view) {
@@ -63,7 +65,7 @@ router.onRoute((r) => {
   route = r;
   showView(r.view);
   if (r.inspect) {
-    const type = r.inspect.type, id = type === "node" ? r.inspect.id : Number(r.inspect.id);
+    const type = r.inspect.type, id = inspectId(type, r.inspect.id);
     inspector.open(type, id, null);
   } else {
     inspector.close({ restore: !viewChanged });
@@ -257,7 +259,7 @@ app.rowMenu = (host, btn) => {
   setHTML(rowMenu, html`
     <button type="button" role="menuitem" data-row-act="inspect">${icon("i-panel")}Inspect ${host}</button>
     <button type="button" role="menuitem" data-row-act="activity">${icon("i-activity")}Activity for this node</button>
-    <button type="button" role="menuitem" data-row-act="copy">${icon("i-copy")}Copy endpoint prefix</button>
+    <button type="button" role="menuitem" data-row-act="copy">${icon("i-copy")}Copy connect address for this node</button>
     ${hasFails ? html`<button type="button" role="menuitem" data-row-act="reset"${locked ? html` aria-label="Sign in to reset node failures"` : ""}>${lock || icon("i-undo")}Reset node failures</button>` : ""}
     ${offline && !n.busy ? html`<button type="button" role="menuitem" class="destructive" data-row-act="forget"${locked ? html` aria-label="Sign in to forget ${host}"` : ""}>${lock || icon("i-trash")}Forget…</button>` : ""}`);
   rowMenu.dataset.host = host;
@@ -272,7 +274,7 @@ rowMenu.addEventListener("click", async (e) => {
     case "inspect": app.inspect("node", host, owner); break;
     case "activity": router.go(router.build("activity", { node: host })); break;
     case "copy":
-      copy(n && n.kind === "gateway" ? app.hub() + "/connect/" + encodeURIComponent(host) + "/" : "ws://" + host + ":", "the endpoint prefix");
+      copy(connectUrl(app.hub(), host), "the connect address for " + host);
       if (owner) owner.focus();
       break;
     case "reset": await resetNode(host); if (owner && owner.isConnected) owner.focus(); break;
@@ -318,6 +320,8 @@ const palette = createPalette({
     view("sessions", "Sessions", "#/sessions", "i-sessions");
     view("stale", "Stale sessions", "#/sessions?filter=stale", "i-sessions");
     view("access", "Access tokens", "#/access", "i-key");
+    out.push({ id: "connect", group: "View", label: "Connect to the grid", icon: "i-link", keywords: "connect hub address endpoint snippet token",
+      run: () => app.inspect("connect", "grid", null) });
     out.push({ id: "help", group: "View", label: "Keyboard shortcuts", icon: "i-keyboard", run: () => $("shortcuts-dialog").showModal() });
     for (const n of (d && d.nodes) || []) {
       out.push({ id: "node-" + n.host, group: "Nodes", label: n.host, mono: true, icon: "i-node", keywords: [n.platform, n.remote_address, n.status].join(" "),
@@ -381,7 +385,7 @@ document.addEventListener("click", (e) => {
   if (link && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.button === 0) {
     e.preventDefault();
     const opener = link.closest("[data-jk]") || link;
-    app.inspect(link.dataset.inspect, link.dataset.inspect === "node" ? link.dataset.id : Number(link.dataset.id), opener);
+    app.inspect(link.dataset.inspect, inspectId(link.dataset.inspect, link.dataset.id), opener);
     return;
   }
   // A whole row is the target (its chevron and hover say so), except its own buttons and links,
@@ -390,7 +394,7 @@ document.addEventListener("click", (e) => {
   if (!row || e.target.closest("a, button, input, select, textarea, label, [data-act]") || e.button !== 0) return;
   if (row.closest("#view-sessions")) return; // the sessions table opens its rows itself
   if (String(window.getSelection && window.getSelection()).length) return;
-  app.inspect(row.dataset.inspect, row.dataset.inspect === "node" ? row.dataset.id : Number(row.dataset.id), row);
+  app.inspect(row.dataset.inspect, inspectId(row.dataset.inspect, row.dataset.id), row);
 });
 
 // Admin controls anywhere on the page. After an action, focus lands somewhere sensible.

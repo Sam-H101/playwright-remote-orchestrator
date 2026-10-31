@@ -235,11 +235,11 @@ export function createAccess(section) {
         ["Docker runner: its environment, e.g. runner.env", "GATEWAY_AGENT_TOKEN=" + r.token + (r.nodeName ? "\nNODE_NAME=" + r.nodeName : "")],
       ];
     }
-    const d = app.data(), node = d && d.nodes.find((n) => n.kind === "gateway" && n.slots.length);
-    const out = [["Check containers: their environment (example_playwright in docker-compose.yaml)", "GATEWAY_CLIENT_TOKEN=" + r.token]];
-    if (node) out.push(["Other Playwright clients: on the endpoint (or as an x-gateway-token header), e.g. " + node.host + " slot " + node.slots[0].port,
-      connectUrl(hub, node, node.slots[0]) + "?gateway_token=" + r.token]);
-    return out;
+    return [
+      ["Check containers: their environment (example_playwright in docker-compose.yaml)", "GATEWAY_CLIENT_TOKEN=" + r.token],
+      ["Other Playwright clients: on the hub's one connect address (or as an x-gateway-token header); the hub picks the slot",
+        connectUrl(hub) + "?gateway_token=" + r.token],
+    ];
   }
 
   function waitLine() {
@@ -281,7 +281,7 @@ export function createAccess(section) {
         <button type="button" class="btn ${r.platform ? "" : "primary"} small" data-copy="${r.token}" data-copy-label="the token" data-fk="reveal-copy" aria-describedby="reveal-warn">${icon("i-copy")}Copy</button></div>
       <p class="reveal-warn" id="reveal-warn">${icon("i-alert")}<span>It won't be shown again. The grid keeps only a hash of it: if it's lost, revoke it and create another.</span></p>
       <div class="usage"><h3>${r.platform ? "The command" : "Use it"}</h3>
-        ${r.kind === "agent" || node0() ? hubField() : ""}
+        ${hubField()}
         <div class="usage-grid">${usages(r).map((u, i) => html`<div class="step"><div class="step-label">${u[0]}</div>
           <div class="snippet"><code class="mono" data-usage="${i}">${u[1]}</code><button type="button" class="${r.platform ? "btn primary small" : "icon-btn tiny"}" data-copy="${u[1]}" data-copy-label="the command"
             data-fk="reveal-use-${i}" aria-label="Copy the command for ${u[0].split(":")[0]}">${icon("i-copy")}${r.platform ? "Copy command" : ""}</button></div></div>`)}</div>
@@ -298,7 +298,6 @@ export function createAccess(section) {
       if (top < bar || top > innerHeight / 2) box.firstElementChild.scrollIntoView({ block: "start" });
     }
   }
-  const node0 = () => { const d = app.data(); return d && d.nodes.some((n) => n.kind === "gateway" && n.slots.length); };
   app.onHub(refreshUsages);
 
   function hideReveal() {

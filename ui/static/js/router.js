@@ -1,6 +1,7 @@
 // Hash routes. Every view, filter and object has an address, and back/forward walk through them.
 //   #/overview  #/activity?node=&slot=&kind=&range=  #/sessions?filter=  #/access
 //   #/slot/<id>  #/node/<name>  #/session/<slotId>     (the inspector, over the last view)
+//   #/connect                                         (how checks connect to the grid, in the inspector)
 export const VIEWS = ["overview", "activity", "sessions", "access"];
 const INSPECT = { slot: 1, node: 1, session: 1 };
 const LEGACY = { "#access": "#/access", "#sessions": "#/sessions", "#overview": "#/overview", "#activity": "#/activity" };
@@ -15,6 +16,7 @@ export function parse(hash) {
   });
   const params = {};
   new URLSearchParams(q === -1 ? "" : body.slice(q + 1)).forEach((v, k) => { params[k] = v; });
+  if (path[0] === "connect" && path.length === 1) return { view: null, params, inspect: { type: "connect", id: "grid" } };
   if (INSPECT[path[0]] && path.length > 1 && path[1] !== "") {
     return { view: null, params, inspect: { type: path[0], id: path.slice(1).join("/") } };
   }
@@ -29,6 +31,7 @@ export function build(view, params) {
 }
 
 export function inspectHash(type, id) {
+  if (type === "connect") return "#/connect";
   return "#/" + type + "/" + encodeURIComponent(id);
 }
 

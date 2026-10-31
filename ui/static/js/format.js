@@ -140,7 +140,7 @@ export function publicHub(status, pageHost) {
   return m[1].toLowerCase() + "://" + host + (m[3] ? ":" + m[3] : "");
 }
 
-// An endpoint split where a line may break: after "://" and each "/", never inside a node name.
+// An address split where a line may break: after "://" and each "/", never inside a node name.
 export function endpointParts(url) {
   const m = /^([a-z]+:\/\/)?(.*)$/i.exec(String(url || ""));
   const parts = m[2].split("/").map((p, i, all) => (i < all.length - 1 ? p + "/" : p)).filter(Boolean);
@@ -148,33 +148,73 @@ export function endpointParts(url) {
   return parts;
 }
 
-export function connectUrl(hub, node, slot) {
-  return hub.replace(/\/+$/, "") + "/connect/" + encodeURIComponent(node.host) + "/" + encodeURIComponent(slot.port);
+// The one address every check connects to: the hub picks a free slot for the browser the check
+// launches. node (optional) keeps the check on that node or static host. There is no way to name a
+// slot, and no per-slot address to show.
+export function connectUrl(hub, node) {
+  return hub.replace(/\/+$/, "") + "/connect" + (node ? "?node=" + encodeURIComponent(node) : "");
 }
 
 const psq = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 
-// Copy-to-reproduce snippets. Gateway slots read the client token from the environment and
-// never embed it; static hosts take no token.
-export function reproduce(hub, node, slot) {
-  if (node.kind !== "gateway") {
-    const ws = "ws://" + node.host + ":" + slot.port;
-    return {
-      js: "const { chromium } = require('playwright');\n\nconst browser = await chromium.connect(" + JSON.stringify(ws).replace(/"/g, "'") + ");",
-      python: "from playwright.sync_api import sync_playwright\n\nwith sync_playwright() as p:\n    browser = p.chromium.connect(" + JSON.stringify(ws) + ")",
-      powershell: "$env:PW_WS = " + psq(ws),
-      bash: "export PW_WS=" + JSON.stringify(ws),
-    };
-  }
-  const path = "/connect/" + encodeURIComponent(node.host) + "/" + encodeURIComponent(slot.port);
+// Copy-paste snippets that connect a check to the grid. They read the client token from the
+// environment and never embed it; PW_WS_ENDPOINT is what full/example/example.py reads.
+export function connectSnippets(hub, node) {
   const base = hub.replace(/\/+$/, "");
+  const path = "/connect?" + (node ? "node=" + encodeURIComponent(node) + "&" : "") + "gateway_token=";
   return {
     js: "const { chromium } = require('playwright');\n\nconst HUB = " + JSON.stringify(base).replace(/"/g, "'") + ";\n" +
-      "const browser = await chromium.connect(`${HUB}" + path + "?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`);",
+      "const browser = await chromium.connect(`${HUB}" + path + "${process.env.GATEWAY_CLIENT_TOKEN}`);",
     python: "import os\nfrom playwright.sync_api import sync_playwright\n\nHUB = " + JSON.stringify(base) + "\n" +
-      "with sync_playwright() as p:\n    browser = p.chromium.connect(f\"{HUB}" + path + "?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}\")",
-    powershell: "$env:PW_WS = " + psq(base + path + "?gateway_token=") + " + $env:GATEWAY_CLIENT_TOKEN",
-    bash: "export PW_WS=\"" + base + path + "?gateway_token=$GATEWAY_CLIENT_TOKEN\"",
+      "with sync_playwright() as p:\n    browser = p.chromium.connect(f\"{HUB}" + path + "{os.environ['GATEWAY_CLIENT_TOKEN']}\")",
+    powershell: "$env:PW_WS_ENDPOINT = " + psq(base + path) + " + $env:GATEWAY_CLIENT_TOKEN",
+    bash: "export PW_WS_ENDPOINT=\"" + base + path + "$GATEWAY_CLIENT_TOKEN\"",
+  };
+}
+
+// Who holds a busy slot, from portUsage.claimedBy: the hub, for a check that connected to /connect,
+// or a claimer that went around the hub. s: a session, or a slot (via_hub only).
+// -> { word, long, title, dim }
+export function claimWord(s) {
+  if (!s || s.via_hub == null) {
+    return { word: "–", long: "Unknown", title: "This database doesn't record who claims slots (no portUsage.claimedBy yet)", dim: true };
+  }
+  if (s.via_hub) {
+    return { word: "Hub", long: "The hub, for a check on /connect", title: s.claimed_by ? "claimedBy " + s.claimed_by : "", dim: false };
+  }
+  return { word: "Another client", long: "Another client, not through the hub", title: "claimedBy is empty: something other than the hub claimed it", dim: true };
+}
+
+// What the hub can route right now, per browser: the online gateway nodes that declare it (a
+// Chromium channel such as chrome or msedge counts as chromium, as the hub counts it) and their free
+// slots; a gateway node that lists none takes any browser (name "*"). Static hosts declare nothing
+// and take any browser, after the gateway nodes.
+// -> { browsers: [{ name, nodes, slots, free }], anyBrowser: { nodes, slots, free }, versions: [{ version, nodes }] }
+const CHROMIUM_FAMILY = /^(chromium|chrome|msedge)(-|$)/; // the hub's rule (gateway/lib/routing.js)
+export function routing(data) {
+  const browsers = new Map(), versions = new Map(), any = { nodes: 0, slots: 0, free: 0 };
+  for (const n of (data && data.nodes) || []) {
+    if (n.kind === "gateway" && !n.online) continue;
+    const free = n.slots.filter((s) => s.selectable).length;
+    if (n.kind !== "gateway") {
+      any.nodes++; any.slots += n.slots.length; any.free += free;
+    } else {
+      const offered = n.browsers || [];
+      const names = new Set(offered.length ? offered.map((b) => { b = String(b).toLowerCase(); return CHROMIUM_FAMILY.test(b) ? "chromium" : b; }) : ["*"]);
+      for (const name of names) {
+        const b = browsers.get(name) || { name, nodes: 0, slots: 0, free: 0 };
+        b.nodes++; b.slots += n.slots.length; b.free += free;
+        browsers.set(name, b);
+      }
+    }
+    const m = /^(\d+)\.(\d+)/.exec(n.playwright_version || "");
+    if (n.kind === "gateway" && m) versions.set(m[1] + "." + m[2], (versions.get(m[1] + "." + m[2]) || 0) + 1);
+  }
+  const order = { chromium: 0, firefox: 1, webkit: 2, "*": 10 };
+  return {
+    browsers: Array.from(browsers.values()).sort((a, b) => ((order[a.name] ?? 9) - (order[b.name] ?? 9)) || a.name.localeCompare(b.name)),
+    anyBrowser: any,
+    versions: Array.from(versions, ([version, nodes]) => ({ version, nodes })).sort((a, b) => b.nodes - a.nodes || a.version.localeCompare(b.version)),
   };
 }
 
@@ -239,7 +279,7 @@ export function slotSentence(node, slot, ctx) {
   if (slot.fails) {
     return "Free. " + plural(slot.fails, "connect failure") + " in a row so far (limit " + ctx.threshold + "): it's still handed out.";
   }
-  return "Free and ready: the next check can claim it.";
+  return "Free and ready: the hub can hand it to the next check that fits.";
 }
 
 export function nodeSentence(node, ctx) {

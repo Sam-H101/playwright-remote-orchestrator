@@ -57,10 +57,12 @@ export function diff(prev, next, mine) {
     const fails = s.fails || 0, prevFails = p.fails || 0;
     const failedMore = fails > prevFails;
     const released = mine.slots.get(id) === "release";
+    // Who claimed it (portUsage.claimedBy): the hub, or something that went around it.
+    const by = s.via_hub == null ? {} : { hub: !!s.via_hub };
 
     if (!p.busy && s.busy) {
       const start = run != null ? run : now;
-      events.push(Object.assign({ id: "c:" + id + ":" + start, type: "claimed", kind: "claim", t: start, start }, base));
+      events.push(Object.assign({ id: "c:" + id + ":" + start, type: "claimed", kind: "claim", t: start, start }, by, base));
     } else if (p.busy && !s.busy) {
       const end = run != null ? run : now;
       events.push(Object.assign({
@@ -73,7 +75,7 @@ export function diff(prev, next, mine) {
     } else if (p.busy && s.busy && run != null && run !== prevRun) {
       // Released and claimed again between polls: one run ended (roughly when the next began).
       events.push(Object.assign({ id: "f:" + id + ":" + run, type: "finished", kind: "finish", approx: true, t: run, start: prevRun, end: run, dur: null, failed: failedMore }, base));
-      events.push(Object.assign({ id: "c:" + id + ":" + run, type: "claimed", kind: "claim", t: run, start: run }, base));
+      events.push(Object.assign({ id: "c:" + id + ":" + run, type: "claimed", kind: "claim", t: run, start: run }, by, base));
     }
 
     if (failedMore) {
@@ -130,7 +132,7 @@ export function actor(e) {
 export function describe(e) {
   const who = e.kind === "admin" ? actor(e) : "";
   switch (e.type) {
-    case "claimed": return "claimed";
+    case "claimed": return e.hub === false ? "claimed outside the hub" : "claimed";
     case "finished":
       if (e.kind === "admin") {
         return (who ? "released by " + who : "released from the Grid UI") + (e.dur != null ? " after " + runLength(e.dur) : "");

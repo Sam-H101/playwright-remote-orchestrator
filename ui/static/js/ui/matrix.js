@@ -62,10 +62,12 @@ function row(node) {
     </div>`;
 }
 
-function groupHead(key, title, count, pattern) {
+// note: how checks reach the group. Every check connects to the hub's one address; no slot has
+// an address of its own.
+function groupHead(key, title, count, note) {
   return html`<div role="row" class="mx-group" data-key="group-${key}">
     <div role="columnheader" aria-colspan="10" class="mx-group-cell"><span class="mx-group-title">${title}</span>
-      <span class="mx-group-count mono">${count}</span><code class="mx-pattern">${pattern}</code></div></div>`;
+      <span class="mx-group-count mono">${count}</span><span class="mx-pattern">${note}</span></div></div>`;
 }
 
 export function createMatrix(root, { onOpen, onMenu, hub }) {
@@ -95,9 +97,9 @@ export function createMatrix(root, { onOpen, onMenu, hub }) {
     const gw = nodes.filter((n) => n.kind === "gateway"), st = nodes.filter((n) => n.kind !== "gateway");
     const h = hub();
     const items = [];
-    if (gw.length) items.push({ key: "group-gw", head: groupHead("gw", "Gateway nodes", gw.length, html`${h}/connect/<var>node</var>/<var>slot</var>`) });
+    if (gw.length) items.push({ key: "group-gw", head: groupHead("gw", "Gateway nodes", gw.length, html`checks connect to <code>${h}/connect</code>`) });
     gw.forEach((n) => items.push({ key: n.host, node: n }));
-    if (st.length) items.push({ key: "group-st", head: groupHead("st", "Static hosts", st.length, html`ws://<var>host</var>:<var>port</var>`) });
+    if (st.length) items.push({ key: "group-st", head: groupHead("st", "Static hosts", st.length, html`through the hub too · any browser, after the gateway nodes`) });
     st.forEach((n) => items.push({ key: n.host, node: n }));
     patchList(body, items, (it) => it.key, (it) => it.head || row(it.node));
     seen(data);

@@ -4,7 +4,7 @@ import * as api from "../api.js";
 import * as auth from "../auth.js";
 import { adminButton, ensureSignedIn, needsSignIn } from "../actions.js";
 import { html, icon, patchList, setHTML, setText } from "../html.js";
-import { agentCommand, duration, parseTime, plural, slotName } from "../format.js";
+import { agentCommand, connectUrl, duration, parseTime, plural, slotName } from "../format.js";
 import { createTimeline } from "../ui/timeline.js";
 import { createMatrix } from "../ui/matrix.js";
 import { hubField, wireHubFields } from "../ui/hub.js";
@@ -136,6 +136,7 @@ export function createOverview(section) {
             <li><span class="legend-n mono" aria-hidden="true">3</span>Slot number on gateway nodes, port on static hosts</li>
           </ul>
         </details>
+        <a class="btn ghost small mx-connect" href="#/connect" data-inspect="connect" data-id="grid">${icon("i-link")}Connect a check</a>
       </div>
       <div id="matrix-root"></div>
     </section>
@@ -193,6 +194,10 @@ export function createOverview(section) {
           : html`Give it an agent token in <code class="mono">GATEWAY_AGENT_TOKEN</code>. The README has the install steps for each platform.`}</div>
           <div class="snippet"><code class="mono" id="first-run-agent">${agent}</code>
           <button type="button" class="icon-btn tiny" data-copy="${agent}" data-copy-label="the command" aria-label="Copy the agent command">${icon("i-copy")}</button></div></li>
+        <li class="step"><div class="step-label">Then point every check at the hub, with a client token in <code class="mono">gateway_token</code>. The hub picks a free
+          slot that offers the browser the check launches; <a href="#/connect" data-inspect="connect" data-id="grid">Connect a check</a> has snippets.</div>
+          <div class="snippet"><code class="mono" id="first-run-connect">${connectUrl(app.hub())}</code>
+          <button type="button" class="icon-btn tiny" data-copy="${connectUrl(app.hub())}" data-copy-label="the connect address" aria-label="Copy the connect address">${icon("i-copy")}</button></div></li>
       </ol>
       ${token ? "" : s.adminConfigured
         ? html`<p class="first-run-actions"><button type="button" class="btn primary" data-first-token>${needsSignIn() ? icon("i-lock") : icon("i-plus")}Create agent token</button>
@@ -223,10 +228,12 @@ export function createOverview(section) {
     return token ? agentCommand("linux", hub, token, "") + " --slots 4" : "node gateway/agent.js --hub " + hub + " --slots 4";
   }
   app.onHub(() => {
-    const code = section.querySelector("#first-run-agent");
-    if (!code) return;
-    code.textContent = firstRunCommand();
-    code.parentElement.querySelector("[data-copy]").dataset.copy = code.textContent;
+    [["#first-run-agent", firstRunCommand()], ["#first-run-connect", connectUrl(app.hub())]].forEach(([sel, text]) => {
+      const code = section.querySelector(sel);
+      if (!code) return;
+      code.textContent = text;
+      code.parentElement.querySelector("[data-copy]").dataset.copy = text;
+    });
   });
 
   function update(msg) {

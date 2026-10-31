@@ -4,6 +4,7 @@ short runs between polls, bursts, the palette, keyboard, inspector snippets and 
 Skipped unless the playwright package and its Chromium are installed, like test_browser.py.
 """
 import datetime
+import re
 import sqlite3
 import time
 
@@ -43,6 +44,9 @@ UNIT = r"""async ([liveUrl, formatUrl]) => {
 
   const claim = L.diff(snap(G0, [node("n", [slot(1)])]), snap(G1, [node("n", [slot(1, { busy: true, state: "busy", last_run: T })])]));
   out.claim = claim.map((e) => [e.type, e.kind, e.subject, e.start === Date.parse(T)]);
+  // claimedBy: the hub's claims read as before; one that went around the hub says so.
+  out.claimBy = [true, false].map((hub) => L.diff(snap(G0, [node("n", [slot(1)])]),
+    snap(G1, [node("n", [slot(1, { busy: true, state: "busy", last_run: T, via_hub: hub })])]))).map((evs) => [evs[0].hub, L.describe(evs[0])]);
 
   const fin = L.diff(snap(G0, [node("n", [slot(1, { busy: true, state: "busy", last_run: T })])]), snap(G1, [node("n", [slot(1, { last_run: T4 })])]));
   out.finish = fin.map((e) => [e.type, e.dur, !!e.approx, !!e.failed]);
@@ -106,8 +110,17 @@ UNIT = r"""async ([liveUrl, formatUrl]) => {
     slotQuery: [F.parseSlotQuery("b81e04/3"), F.parseSlotQuery("b81e04 3"), F.parseSlotQuery("pw-static:3001"), F.parseSlotQuery("nothing")],
     hub: [F.publicHub({ gateway_url: "ws://hub:4500" }, "grid.lab"), F.publicHub({ gateway_url: "wss://hub" }, "::1"),
       F.publicHub({ gateway_url: "ws://hub:4500", public_gateway_url: "wss://grid.example.com/" }, "x")],
-    repro: F.reproduce("ws://grid.lab:4500", { host: "runner-b81e04", kind: "gateway" }, { port: 3 }),
-    reproStatic: F.reproduce("ws://grid.lab:4500", { host: "pw-static", kind: "static" }, { port: 3000 }),
+    connect: [F.connectUrl("ws://grid.lab:4500/"), F.connectUrl("ws://grid.lab:4500", "Runner B")],
+    snippets: F.connectSnippets("ws://grid.lab:4500/"),
+    pinned: F.connectSnippets("ws://grid.lab:4500", "runner-b81e04"),
+    claim: [F.claimWord({ via_hub: true, claimed_by: "hub:5c1e09a2:7" }), F.claimWord({ via_hub: false }), F.claimWord({ via_hub: null })].map((c) => c.word),
+    routing: F.routing({ nodes: [
+      { host: "a", kind: "gateway", online: true, browsers: ["chromium", "firefox"], playwright_version: "1.64.1", slots: [{ selectable: true }, { selectable: false }] },
+      { host: "b", kind: "gateway", online: true, browsers: ["msedge", "chrome-beta"], playwright_version: "1.64.0", slots: [{ selectable: true }] },
+      { host: "c", kind: "gateway", online: false, browsers: ["webkit"], playwright_version: "1.63.0", slots: [{ selectable: false }] },
+      { host: "d", kind: "gateway", online: true, browsers: [], playwright_version: "1.62.3", slots: [{ selectable: true }] },
+      { host: "s", kind: "static", browsers: [], slots: [{ selectable: true }, { selectable: true }] },
+    ] }),
     agent: [F.agentCommand("windows", "ws://h:4500", "pwga_x", "win-02"), F.agentCommand("linux", "ws://h:4500", "pwga_x", "win-02")],
     sentence: F.slotSentence({ host: "runner-b81e04", kind: "gateway" },
       { state: "failing", fails: 4, healthy: true, last_run: "2026-10-31T10:47:00Z", retry_at: "2026-10-31T10:52:00Z", port: 3 },
@@ -124,6 +137,7 @@ def test_diff_and_formatters_are_pure_and_right(grid, page):
     out = page.evaluate(UNIT, [url + "static/js/live.js", url + "static/js/format.js"])
 
     assert out["claim"] == [["claimed", "claim", "n / 1", True]]
+    assert out["claimBy"] == [[True, "claimed"], [False, "claimed outside the hub"]]
     assert out["finish"] == [["finished", 4000, False, False]]
     assert out["between"] == [["finished", True, None, True, "finished between updates (approx.)"]]
     assert out["failed"] == [["finished", True, None, "finished in 4.0 s · failures went up"],
@@ -146,13 +160,27 @@ def test_diff_and_formatters_are_pure_and_right(grid, page):
     assert f["inTime"] == ["in 3m", "in 42s", "now"]
     assert f["slotQuery"] == [{"node": "b81e04", "slot": "3"}, {"node": "b81e04", "slot": "3"}, {"node": "pw-static", "slot": "3001"}, None]
     assert f["hub"] == ["ws://grid.lab:4500", "wss://[::1]", "wss://grid.example.com"]
-    r = f["repro"]
-    assert "const browser = await chromium.connect(`${HUB}/connect/runner-b81e04/3?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`);" in r["js"]
+    # One address for every check (the owner's form); ?node= at most, never a slot.
+    assert f["connect"] == ["ws://grid.lab:4500/connect", "ws://grid.lab:4500/connect?node=Runner%20B"]
+    r = f["snippets"]
     assert "const HUB = 'ws://grid.lab:4500';" in r["js"]
-    assert "p.chromium.connect(f\"{HUB}/connect/runner-b81e04/3?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}\")" in r["python"]
-    assert r["powershell"] == "$env:PW_WS = 'ws://grid.lab:4500/connect/runner-b81e04/3?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
-    assert r["bash"] == 'export PW_WS="ws://grid.lab:4500/connect/runner-b81e04/3?gateway_token=$GATEWAY_CLIENT_TOKEN"'
-    assert f["reproStatic"]["bash"] == 'export PW_WS="ws://pw-static:3000"' and "token" not in str(f["reproStatic"])
+    assert "const browser = await chromium.connect(`${HUB}/connect?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`);" in r["js"]
+    assert "p.chromium.connect(f\"{HUB}/connect?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}\")" in r["python"]
+    assert r["powershell"] == "$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
+    assert r["bash"] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    p = f["pinned"]
+    assert "chromium.connect(`${HUB}/connect?node=runner-b81e04&gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`)" in p["js"]
+    assert p["bash"] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    for snippets in (r, p):  # the token is read from the environment, never embedded; no slot in any address
+        assert all("pwgc_" not in s and not re.search(r"/connect/[^?\s`'\"]", s) for s in snippets.values())
+    assert f["claim"] == ["Hub", "Another client", "–"]
+    # Routing as the hub sees it: Chromium channels count as chromium, offline nodes don't count, a node
+    # that lists nothing and static hosts take any browser.
+    rt = f["routing"]
+    assert rt["browsers"] == [{"name": "chromium", "nodes": 2, "slots": 3, "free": 2}, {"name": "firefox", "nodes": 1, "slots": 2, "free": 1},
+                              {"name": "*", "nodes": 1, "slots": 1, "free": 1}]
+    assert rt["anyBrowser"] == {"nodes": 1, "slots": 2, "free": 2}
+    assert rt["versions"] == [{"version": "1.64", "nodes": 2}, {"version": "1.62", "nodes": 1}]
     assert f["agent"] == [".\\install-backend.ps1 -HubUrl 'ws://h:4500' -AgentToken 'pwga_x' -NodeName 'win-02'",
                           "GATEWAY_AGENT_TOKEN=pwga_x node gateway/agent.js --hub ws://h:4500 --name win-02"]
     s = f["sentence"]
@@ -282,13 +310,14 @@ def test_the_matrix_is_one_tab_stop_with_arrow_keys(grid, page):
     page.wait_for_selector("#inspector:not([hidden])")
 
 
-def test_reproduce_snippets_follow_the_hub_address(grid, page):
+def test_connect_snippets_follow_the_hub_address_and_can_stay_on_the_node(grid, page):
     url, path = grid
     sid = run(path, "SELECT id FROM portStatus WHERE PortServer = 'runner-b81e04' AND PortNumber = 3")[0][0]
     page.goto(url + "#/slot/{}".format(sid))
     page.wait_for_selector("#repro-code")
+    assert page.text_content("#repro-title") == "Connect to the grid"
     code = page.text_content("#repro-code")
-    assert "chromium.connect(`${HUB}/connect/runner-b81e04/3?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`)" in code
+    assert "chromium.connect(`${HUB}/connect?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`)" in code
     assert "const HUB = 'ws://127.0.0.1:4500';" in code
     page.fill("#inspector [data-hub-input]", "ws://grid.lab:4500")
     page.wait_for_function("() => document.getElementById('repro-code').textContent.includes('ws://grid.lab:4500')")
@@ -296,11 +325,65 @@ def test_reproduce_snippets_follow_the_hub_address(grid, page):
     page.keyboard.press("ArrowRight")
     page.keyboard.press("ArrowRight")
     assert page.get_attribute("#repro-tab-powershell", "aria-selected") == "true"
-    assert page.text_content("#repro-code") == \
-        "$env:PW_WS = 'ws://grid.lab:4500/connect/runner-b81e04/3?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
+    assert page.text_content("#repro-code") == "$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
     page.keyboard.press("ArrowRight")
-    assert page.text_content("#repro-code") == 'export PW_WS="ws://grid.lab:4500/connect/runner-b81e04/3?gateway_token=$GATEWAY_CLIENT_TOKEN"'
-    assert "ws://grid.lab:4500/connect/runner-b81e04/3" in page.text_content("#insp-body .facts")
+    assert page.text_content("#repro-code") == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    # Kept on the slot's node with ?node=; still no way to name the slot. The copy button follows.
+    page.check("#repro-pin")
+    page.wait_for_function("() => document.getElementById('repro-code').textContent.includes('node=runner-b81e04&')")
+    assert page.text_content("#repro-code") == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    assert page.get_attribute("#repro-copy", "data-copy") == page.text_content("#repro-code")
+    assert "/connect/" not in page.text_content("#inspector")
+
+
+def test_the_connect_panel_shows_one_address_and_what_the_hub_can_route(grid, page):
+    url, _ = grid
+    page.goto(url)
+    page.wait_for_selector(".mx-row[data-key]")
+    page.click(".mx-connect")
+    page.wait_for_selector("#inspector:not([hidden]) #repro-code")
+    assert page.evaluate("location.hash") == "#/connect"
+    assert page.text_content("#insp-kind") == "Grid"
+    facts = page.text_content("#insp-body .facts")
+    assert "ws://127.0.0.1:4500/connect" in facts and "x-gateway-token" in facts
+    assert "chromium" in facts and "firefox" in facts and "Any browser" in facts  # the static host takes any
+    assert page.locator("#repro-pin").count() == 0  # nothing to keep it on here
+    page.keyboard.press("Escape")
+    page.wait_for_selector("#inspector", state="hidden")
+    # A deep link, and the palette entry.
+    page.goto(url + "#/connect")
+    page.wait_for_selector("#inspector:not([hidden]) #repro-code")
+    page.keyboard.press("Escape")
+    page.wait_for_selector("#inspector", state="hidden")
+    page.keyboard.press("/")
+    page.keyboard.type("Connect to the grid")
+    page.keyboard.press("Enter")
+    page.wait_for_function("location.hash === '#/connect'")
+
+
+def test_no_per_slot_endpoint_is_shown_or_copied_anywhere(grid, page):
+    """Checks connect to the hub's one address; no view, menu or snippet may offer /connect/<node>/<slot>."""
+    url, path = grid
+    per_slot = r"/connect/[^\s?`'\"]+/\d+"
+    page.goto(url)
+    page.wait_for_selector(".mx-row[data-key]")
+    sid = run(path, "SELECT id FROM portUsage WHERE inUse = 1 LIMIT 1")[0][0]
+    texts = []
+    for route in ["#/overview", "#/sessions", "#/activity", "#/access", "#/connect", "#/node/runner-b81e04",
+                  "#/slot/{}".format(sid), "#/session/{}".format(sid), "#/node/pw-static.lab.local"]:
+        page.goto(url + route)
+        page.wait_for_timeout(250)
+        texts.append(page.evaluate("""() => document.body.innerText + " " + Array.from(document.querySelectorAll('[data-copy]'))
+          .map((b) => b.dataset.copy).join(' ') + " " + Array.from(document.querySelectorAll('#repro-code')).map((c) => c.textContent).join(' ')"""))
+        assert "<var>slot</var>" not in page.content()
+    page.goto(url + "#/overview")
+    page.wait_for_selector(".mx-row[data-key='runner-b81e04'] [data-row-menu]")
+    page.click(".mx-row[data-key='runner-b81e04'] [data-row-menu]")
+    texts.append(page.text_content("#row-menu"))
+    text = " ".join(texts)
+    assert not re.search(per_slot, text), re.search(per_slot, text)
+    assert "Endpoint" not in text and "endpoint prefix" not in text
+    assert "ws://127.0.0.1:4500/connect" in text
 
 
 def test_signed_out_admin_controls_sign_in_first_then_confirm(grid, page, monkeypatch):
