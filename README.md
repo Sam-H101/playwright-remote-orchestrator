@@ -23,8 +23,25 @@
 
 ## Running a remote server
 
-1. Install playwright server on the remote executioner host. Can be found [here][l1]
-2. once installed, start the server by running `node_modules/.bin/playwright.cmd run-server --port <port number> --reuse-browser false`
+### Windows
+
+`installer/windows/install-backend.ps1` sets up a Windows host as a remote executioner. It needs Node.js 20+ (or pass `-InstallNode` to get it from winget) and an elevated PowerShell.
+
+```powershell
+.\installer\windows\install-backend.ps1 -PortStart 3000 -PortCount 4
+```
+
+* Installs `playwright-core` and only the browsers you list (`-Browsers chromium` by default) into `C:\PlaywrightBackend`. Re-running skips anything already at the right version, so upgrades only download what changed.
+* `-PlaywrightVersion` must match the major.minor of the Playwright client the checks use.
+* Runs one `run-server` per port under a supervisor (scheduled task `PlaywrightBackend`, runs as SYSTEM at startup) that restarts crashed servers, and opens the ports in Windows Firewall.
+* Health-checks every port before it exits and reports the result: a console summary with the entry to paste into `src/database.yaml`, `C:\PlaywrightBackend\status.json`, an optional JSON POST to `-ReportUrl`, and the exit code (`0` all ports healthy, `2` some ports unhealthy, `1` failed).
+* `C:\PlaywrightBackend\backend-status.ps1 [-Json] [-ReportUrl <url>]` checks the host later with the same exit codes. `uninstall-backend.ps1 [-RemoveFiles]` removes it.
+* Logs are in `C:\PlaywrightBackend\logs` (`install.log`, `supervisor.log`, `server-<port>.*.log`).
+
+### Other platforms
+
+1. Install Playwright on the remote executioner host. Can be found [here][l1]
+2. Start a server per port with `npx playwright run-server --port <port number> --host 0.0.0.0`
 
 ## Configuration
 
