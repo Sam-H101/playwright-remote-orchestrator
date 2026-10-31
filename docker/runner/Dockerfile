@@ -3,6 +3,7 @@
 # container ID (the host name) as an ephemeral node, so the hub forgets it EPHEMERAL_GRACE_S after it
 # goes away instead of keeping an offline node per recreated container. Build context is the
 # repo root. PLAYWRIGHT_VERSION must match the checks' Playwright version (same minor at least).
+# The Playwright image ships Chromium, Firefox and WebKit, so BROWSERS offers all three to the hub.
 ARG PLAYWRIGHT_VERSION=1.64.1
 FROM mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble
 ARG PLAYWRIGHT_VERSION
@@ -22,7 +23,7 @@ RUN mkdir -p /tmp/gateway-agent && chown pwuser:pwuser /tmp/gateway-agent
 ENV HUB_URL=ws://hub:4500 \
     SLOTS=4 \
     BASE_PORT=3100 \
-    BROWSERS=chromium \
+    BROWSERS=chromium,firefox,webkit \
     PLAYWRIGHT_CLI=/app/playwright/node_modules/playwright-core/cli.js \
     STATUS_FILE=/tmp/gateway-agent/status.json \
     EPHEMERAL=1

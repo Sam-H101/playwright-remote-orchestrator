@@ -474,8 +474,8 @@ if ($report.slots.Count) { Write-BackendSlots $report }
 if ($result -ne 'failed') {
     Write-Host ''
     Write-Host "Node '$NodeName' registers itself with the hub at $HubUrl (and again after any disconnect);"
-    Write-Host 'no database.yaml edit or inbound firewall port is needed. Clients reach slot N at'
-    Write-Host "  $HubUrl/connect/$([uri]::EscapeDataString($NodeName))/N   (N = 1..$Slots)"
+    Write-Host "no database.yaml edit or inbound firewall port is needed. Clients connect to $HubUrl/connect and the"
+    Write-Host "hub picks a free slot for their browser ($($Browsers -join ', ') here); add ?node=$([uri]::EscapeDataString($NodeName)) to stay on this node."
 }
 Write-Host ''
 if ($statusWritten) { Write-Host "Status written to $(Join-Path $InstallDir 'status.json')" }
