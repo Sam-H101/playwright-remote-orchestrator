@@ -1,0 +1,109 @@
+name: Windows backend installer
+
+on:
+  push:
+    paths:
+      - 'installer/windows/**'
+      - '.github/workflows/windows-backend-installer.yml'
+  pull_request:
+    paths:
+      - 'installer/windows/**'
+      - '.github/workflows/windows-backend-installer.yml'
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        # Windows PowerShell 5.1, which is what a fresh Windows host has.
+        shell: powershell
+    env:
+      INSTALL_DIR: C:\PlaywrightBackend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Parse scripts
+        run: |
+          $failed = $false
+          Get-ChildItem installer/windows -Include *.ps1, *.psm1 -Recurse | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "::error file=$($_.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Install
+        run: |
+          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -PortStart 3000 -PortCount 2
+          if ($LASTEXITCODE -ne 0) { Get-ChildItem "$env:INSTALL_DIR\logs" | ForEach-Object { Write-Host "--- $($_.Name)"; Get-Content $_.FullName -Tail 40 }; exit $LASTEXITCODE }
+          $status = Get-Content "$env:INSTALL_DIR\status.json" -Raw | ConvertFrom-Json
+          if ($status.result -ne 'success' -or $status.healthyPorts -ne 2) { throw "Unexpected status: $($status | ConvertTo-Json)" }
+
+      - name: Re-run install (should skip npm and browser downloads)
+        run: |
+          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -PortStart 3000 -PortCount 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:INSTALL_DIR\logs\install.log" -Pattern 'already installed, skipping npm' -Quiet)) { throw 'Second run did not skip npm install' }
+
+      - name: Connect a client to each port
+        run: |
+          $client = @'
+          const { chromium } = require(process.env.INSTALL_DIR + '\\app\\node_modules\\playwright-core');
+          (async () => {
+            for (const port of [3000, 3001]) {
+              const browser = await chromium.connect(`ws://127.0.0.1:${port}/`);
+              const page = await browser.newPage();
+              await page.setContent('<h1>ok</h1>');
+              const text = await page.textContent('h1');
+              await browser.close();
+              if (text !== 'ok') throw new Error(`port ${port}: got ${text}`);
+              console.log(`port ${port}: ok`);
+            }
+          })().catch(e => { console.error(e); process.exit(1); });
+          '@
+          Set-Content -Path client.js -Value $client
+          node client.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Supervisor restarts a killed server
+        run: |
+          $runtime = Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json
+          $victim = ($runtime.ports | Where-Object port -eq 3000).pid
+          Stop-Process -Id $victim -Force
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            Start-Sleep -Seconds 3
+            & "$env:INSTALL_DIR\backend-status.ps1" -Json | Out-Null
+            $ok = $LASTEXITCODE -eq 0
+          } until ($ok -or (Get-Date) -gt $deadline)
+          if (-not $ok) { Get-Content "$env:INSTALL_DIR\logs\supervisor.log"; throw 'Port 3000 did not come back' }
+          & "$env:INSTALL_DIR\backend-status.ps1"
+
+      - name: Status reports a stopped backend as degraded
+        run: |
+          Stop-ScheduledTask -TaskName PlaywrightBackend
+          Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object CommandLine -like '*PlaywrightBackend*' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+          & "$env:INSTALL_DIR\backend-status.ps1" -Json
+          if ($LASTEXITCODE -ne 2) { throw "Expected exit code 2, got $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+
+      - name: Uninstall
+        run: |
+          & "$env:INSTALL_DIR\uninstall-backend.ps1" -RemoveFiles
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Test-Path $env:INSTALL_DIR) { throw 'Install dir still exists' }
+          if (Get-ScheduledTask -TaskName PlaywrightBackend -ErrorAction SilentlyContinue) { throw 'Task still registered' }
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-logs
+          path: C:\PlaywrightBackend\logs
+          if-no-files-found: ignore
