@@ -70,15 +70,16 @@ function Test-BackendPort {
 }
 
 # Polls every port each round until all are healthy or the timeout expires.
-# Returns an ordered hashtable of port -> $true/$false.
+# Returns an ordered hashtable of port -> $true/$false. Keys are strings: an [ordered] dictionary
+# treats an [int] index as a position, not a key.
 function Wait-BackendPorts {
     param([string]$ProbeHost, [int[]]$Ports, [int]$TimeoutSec = 60)
     $state = [ordered]@{}
-    foreach ($p in $Ports) { $state[$p] = $false }
+    foreach ($p in $Ports) { $state["$p"] = $false }
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     do {
         foreach ($p in $Ports) {
-            if (-not $state[$p]) { $state[$p] = Test-BackendPort -ProbeHost $ProbeHost -Port $p }
+            if (-not $state["$p"]) { $state["$p"] = Test-BackendPort -ProbeHost $ProbeHost -Port $p }
         }
         if (-not ($state.Values -contains $false)) { break }
         Start-Sleep -Milliseconds 500

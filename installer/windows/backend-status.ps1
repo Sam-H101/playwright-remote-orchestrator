@@ -27,7 +27,7 @@ if (-not $config) {
 $started = Get-Date
 $probeHost = Get-ProbeHost $config.bindHost
 $state = [ordered]@{}
-foreach ($p in (Get-BackendPorts $config)) { $state[$p] = Test-BackendPort -ProbeHost $probeHost -Port $p }
+foreach ($p in (Get-BackendPorts $config)) { $state["$p"] = Test-BackendPort -ProbeHost $probeHost -Port $p }
 
 $down = @($state.Keys | Where-Object { -not $state[$_] })
 $result = if ($down.Count -eq 0) { 'success' } else { 'degraded' }

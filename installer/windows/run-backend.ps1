@@ -30,7 +30,8 @@ Stop-BackendServerProcesses -InstallDir $InstallDir
 
 $servers = [ordered]@{}
 foreach ($port in (Get-BackendPorts $config)) {
-    $servers[$port] = [pscustomobject]@{ Port = $port; Process = $null; Restarts = 0; FastFails = 0; LastStart = $null; NextStart = [datetime]::MinValue }
+    # String key: an [ordered] dictionary treats an [int] index as a position.
+    $servers["$port"] = [pscustomobject]@{ Port = $port; Process = $null; Restarts = 0; FastFails = 0; LastStart = $null; NextStart = [datetime]::MinValue }
 }
 
 function Start-Server {
