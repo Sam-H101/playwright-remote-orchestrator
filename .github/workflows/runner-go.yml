@@ -3,10 +3,16 @@ name: pwrunner (Go)
 on:
   push:
     branches: [master]
+    tags: ['pwrunner/v*']
     paths: ['runner/**', 'gateway/**', '.github/workflows/runner-go.yml']
   pull_request:
     paths: ['runner/**', 'gateway/**', '.github/workflows/runner-go.yml']
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: build every release artefact and upload them to the run instead of creating a release
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -76,19 +82,54 @@ jobs:
         with:
           path: runner/internal/runtime/files
           key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go') }}
-      - name: build
-        run: .\build\build.ps1 -Version "ci-${{ github.run_number }}"
-      - name: version of the embedded build
+      - name: version
+        id: version
         run: |
-          $exe = Get-ChildItem dist\pwrunner-*-windows-amd64.exe | Select-Object -First 1
-          $line = & $exe.FullName version
+          # A release tag pwrunner/v1.2.3 builds version 1.2.3; anything else a CI version.
+          $v = if ($env:GITHUB_REF -like 'refs/tags/pwrunner/v*') { $env:GITHUB_REF -replace '^refs/tags/pwrunner/v', '' } else { "ci-${{ github.run_number }}" }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+      - name: build
+        run: .\build\build.ps1 -Version "${{ steps.version.outputs.version }}"
+      - name: check the artefacts
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $want = "pwrunner-$v-windows-amd64.exe", "pwrunner-$v-windows-arm64.exe", "pwrunner-$v-windows-amd64-slim.exe",
+            "pwrunner-$v-linux-amd64", "pwrunner-$v-linux-arm64", "pwrunner-runtime-$v-windows-amd64.zip", 'SHA256SUMS.txt'
+          foreach ($f in $want) { if (-not (Test-Path "dist\$f")) { throw "missing dist\$f" } }
+          $line = & "dist\pwrunner-$v-windows-amd64.exe" version
           Write-Host $line
           if ($line -notmatch 'embedded=yes') { throw "embedded build does not report embedded=yes: $line" }
       - uses: actions/upload-artifact@v4
         with:
-          name: pwrunner-ci-${{ github.run_number }}
+          name: pwrunner-${{ steps.version.outputs.version }}
           path: runner/dist/*
           if-no-files-found: error
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  release:
+    name: GitHub release
+    # Only for a pwrunner/v* tag; a workflow_dispatch dry run stops at the uploaded build artefacts.
+    if: startsWith(github.ref, 'refs/tags/pwrunner/v')
+    runs-on: ubuntu-latest
+    needs: [build, contract]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pwrunner-${{ needs.build.outputs.version }}
+          path: dist
+      - name: create the release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum -c SHA256SUMS.txt
+          # Unsigned: there is no code-signing certificate yet. With one, sign the .exe files here
+          # (signtool sign /fd sha256 /tr <timestamp url> /td sha256 /f <cert> ...) and regenerate SHA256SUMS.txt.
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "pwrunner ${{ needs.build.outputs.version }}" \
+            --notes "Windows runner host for the Playwright gateway. Verify downloads against SHA256SUMS.txt." *
 
   contract:
     name: agent contract suite (${{ matrix.os }})
