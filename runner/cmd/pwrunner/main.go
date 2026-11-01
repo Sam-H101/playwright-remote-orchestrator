@@ -17,7 +17,10 @@ var version = "dev"
 const usage = `Usage: pwrunner <command> [options]
 
 Commands:
+  run         run the agent in the foreground (flags, then HUB_URL & co., then --config backend.json)
   version     print the version, Go toolchain and the pinned runtime
+
+Run "pwrunner <command> --help" for a command's options.
 `
 
 func main() {
@@ -30,6 +33,8 @@ func run(args []string) error {
 		return &cli.ExitError{Code: 2}
 	}
 	switch args[0] {
+	case "run":
+		return runAgent(args[1:])
 	case "version", "--version":
 		fmt.Println(versionLine())
 		return nil
