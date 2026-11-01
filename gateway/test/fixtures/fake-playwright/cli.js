@@ -1,8 +1,9 @@
 'use strict';
 
 // Stand-in for playwright-core's cli.js in tests: `cli.js run-server --port <p> --host <h>` starts a
-// WebSocket echo server. Text commands: "info" returns the upgrade url and headers, "lastclose" the
-// close code/reason of the previous connection, "close:<code>:<reason>" closes from the server side.
+// WebSocket echo server. Text commands: "info" returns the upgrade url and headers (and rawHeaders, so a
+// test can count repeated ones), "lastclose" the close code/reason of the previous connection,
+// "close:<code>:<reason>" closes from the server side.
 // A client sending x-fake-reject: <status> gets that HTTP status (428 when it names none), like run-server
 // refusing a client of another Playwright version (428), or a path or host it doesn't serve (400, 403).
 
@@ -29,7 +30,7 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.on('message', (data, isBinary) => {
       const text = isBinary ? null : data.toString();
-      if (text === 'info') return ws.send(JSON.stringify({ url: req.url, headers: req.headers }));
+      if (text === 'info') return ws.send(JSON.stringify({ url: req.url, headers: req.headers, rawHeaders: req.rawHeaders }));
       if (text === 'lastclose') return ws.send(JSON.stringify(lastClose));
       if (text && text.startsWith('close:')) {
         const [, code, reason] = text.split(':');

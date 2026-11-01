@@ -11,3 +11,9 @@ node_modules/
 logs/
 # Legacy sqlite slot DBs and Grid UI demo DBs
 *.db
+
+# pwrunner: the runtime archives fetched for the embedded build, and build output
+runner/internal/runtime/files/*
+!runner/internal/runtime/files/.gitignore
+runner/dist/
+dist/
