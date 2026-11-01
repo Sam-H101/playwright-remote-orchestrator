@@ -17,6 +17,12 @@ var version = "dev"
 const usage = `Usage: pwrunner <command> [options]
 
 Commands:
+  install     install or upgrade this host as a runner node (Windows service)
+  status      report the node's health (exit 0 healthy, 2 problem, 1 not installed)
+  uninstall   stop and remove the service (--remove-files: and the install folder)
+  start, stop, restart
+              control the installed service
+  token       set --stdin | set --file <path> | clear | show-prefix
   run         run the agent in the foreground (flags, then HUB_URL & co., then --config backend.json)
   fetch       download and verify the pinned Node and playwright-core into <install dir>\cache
   node        run the private node with the run-servers' environment: pwrunner node -- <args>
@@ -38,6 +44,18 @@ func run(args []string) error {
 	switch args[0] {
 	case "run":
 		return runAgent(args[1:])
+	case "install":
+		return installCmd(args[1:])
+	case "uninstall":
+		return uninstallCmd(args[1:])
+	case "status":
+		return statusCmd(args[1:])
+	case "start", "stop", "restart":
+		return controlCmd(args[0], args[1:])
+	case "token":
+		return tokenCmd(args[1:])
+	case "service":
+		return serviceCmd(args[1:])
 	case "fetch":
 		return fetchCmd(args[1:])
 	case "node":
