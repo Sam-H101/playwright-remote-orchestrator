@@ -131,70 +131,62 @@ func Download(ctx context.Context, url, dest string, v *Verifier) error {
 	return os.Rename(part, dest)
 }
 
-// obtain puts a verified copy of an artefact at <cacheDir>/<file>: an existing verified cache entry,
-// the embedded bytes, the offline folder, or a download, in that order.
-func obtain(ctx context.Context, cacheDir, file, url string, embedded []byte, newV func() (*Verifier, error), offlineDir string) (string, error) {
+// obtain puts a verified copy of an artefact at <cacheDir>/<file> and says where it came from: an
+// existing verified cache entry ("cache"), the embedded bytes ("embedded"), the offline folder
+// ("offline") or a download ("download"), tried in that order.
+func obtain(ctx context.Context, cacheDir, file, url string, embedded []byte, newV func() (*Verifier, error), offlineDir string) (string, string, error) {
 	dest := filepath.Join(cacheDir, file)
 	if _, err := os.Stat(dest); err == nil {
 		v, err := newV()
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		if VerifyFile(dest, v) == nil {
-			return dest, nil
+			return dest, "cache", nil
 		}
 		os.Remove(dest)
 	}
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		return "", err
+		return "", "", err
+	}
+	v, err := newV()
+	if err != nil {
+		return "", "", err
 	}
 	if embedded != nil {
-		v, err := newV()
-		if err != nil {
-			return "", err
-		}
 		if err := VerifyBytes(embedded, v, file+" (embedded)"); err != nil {
-			return "", err
+			return "", "", err
 		}
-		if err := writeAtomic(dest, embedded); err != nil {
-			return "", err
-		}
-		return dest, nil
+		return dest, "embedded", writeAtomic(dest, embedded)
 	}
 	if offlineDir != "" {
 		src := filepath.Join(offlineDir, file)
 		if _, err := os.Stat(src); err == nil {
-			v, err := newV()
-			if err != nil {
-				return "", err
-			}
 			if err := VerifyFile(src, v); err != nil {
-				return "", err
+				return "", "", err
 			}
-			if err := copyFile(src, dest); err != nil {
-				return "", err
-			}
-			return dest, nil
+			return dest, "offline", copyFile(src, dest)
 		}
 	}
-	v, err := newV()
-	if err != nil {
-		return "", err
-	}
 	if err := Download(ctx, url, dest, v); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return dest, nil
+	return dest, "download", nil
 }
 
 // FetchNode returns a verified Node archive in cacheDir.
 func FetchNode(ctx context.Context, cacheDir, version, goos, goarch string, src Source) (string, error) {
+	p, _, err := fetchNode(ctx, cacheDir, version, goos, goarch, src)
+	return p, err
+}
+
+func fetchNode(ctx context.Context, cacheDir, version, goos, goarch string, src Source) (string, string, error) {
 	pin, err := NodePin(version, goos, goarch, src.NodeMirror, src.NodeSHA256)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var embedded []byte
-	if nz, _, ok := Embedded(); ok && version == NodeVersion && goos == runtime.GOOS && goarch == runtime.GOARCH {
+	if nz, _, ok := Embedded(); ok && version == NodeVersion && goos == runtime.GOOS && goarch == runtime.GOARCH && strings.EqualFold(pin.SHA256, NodePins[goos+"/"+goarch].SHA256) {
 		embedded = nz
 	}
 	return obtain(ctx, cacheDir, pin.File(), pin.URL, embedded, func() (*Verifier, error) { return NewSHA256(pin.SHA256), nil }, src.OfflineDir)
@@ -202,9 +194,14 @@ func FetchNode(ctx context.Context, cacheDir, version, goos, goarch string, src 
 
 // FetchPlaywright returns a verified playwright-core tarball in cacheDir.
 func FetchPlaywright(ctx context.Context, cacheDir, version string, src Source) (string, error) {
+	p, _, err := fetchPlaywright(ctx, cacheDir, version, src)
+	return p, err
+}
+
+func fetchPlaywright(ctx context.Context, cacheDir, version string, src Source) (string, string, error) {
 	url, sri, err := PlaywrightPin(version, src.NPMRegistry, src.PlaywrightIntegrity)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var embedded []byte
 	if _, pt, ok := Embedded(); ok && version == PlaywrightVersion && sri == PlaywrightPins[version] {
