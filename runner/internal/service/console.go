@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+// Events is the service's Event Log source.
+type Events interface {
+	Info(eid uint32, msg string) error
+	Warning(eid uint32, msg string) error
+	Error(eid uint32, msg string) error
+	Close() error
+}
+
 // RunConsole runs fn until Ctrl-C, Ctrl-Break (Windows) or SIGTERM/SIGHUP, then cancels its context and
 // waits for it to return; a second signal or 10 s without returning exits the process.
 func RunConsole(fn func(ctx context.Context) error) error {
