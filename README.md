@@ -45,6 +45,27 @@ This starts MySQL, the hub on port 4500, two Linux runner containers (4 slots ea
 * Runner containers are **ephemeral** nodes named after their container ID: when one goes away (scaled down, recreated) the hub removes it and its slots after `EPHEMERAL_GRACE_S` (120 s), so recreated runners don't pile up as offline nodes.
 * To use an existing MySQL server instead, leave out `docker-compose.mysql.yaml` and set `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER` and `DB_PASSWORD` in `.env`. With `docker-compose.mysql.yaml` the `MYSQL_*` variables set the credentials (default `orchestrator` / `orchestrator`) and `DB_*` is ignored.
 * The hub, the checks and the UI all create the tables from `src/schema.sql` on startup; nothing has to be seeded.
+* To run the published images instead of building them, add `-f docker-compose.ghcr.yaml` and use `pull` + `up` without `--build` (see [Published images](#published-images)).
+
+## Published images
+
+CI builds every image and publishes it to GitHub Container Registry (`.github/workflows/docker-images.yml`):
+
+| Image | Is |
+| --- | --- |
+| `ghcr.io/sam-h101/playwright-remote-orchestrator/hub` | the gateway hub (amd64, arm64) |
+| `ghcr.io/sam-h101/playwright-remote-orchestrator/runner` | a Linux runner node: the agent and Chromium, Firefox and WebKit (amd64, arm64) |
+| `ghcr.io/sam-h101/playwright-remote-orchestrator/grid-ui` | the Grid UI (amd64, arm64) |
+| `ghcr.io/sam-h101/playwright-remote-orchestrator/checks` | the image `main.py` checks run in (amd64) |
+
+Tags: `latest` and a version such as `1.1.0` for each release (git tags `pwrunner/v*` or `v*`), `edge` and `sha-<commit>` for every change on master.
+
+```
+docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.ghcr.yaml pull
+docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.ghcr.yaml up -d --scale runner=2
+```
+
+`IMAGE_TAG` in `.env` pins the version (default `latest`).
 
 ## Connecting tests
 
@@ -112,16 +133,16 @@ To go back to the PowerShell installer, run `pwrunner uninstall`, then `installe
 
 ## Adding a Linux host with docker
 
-The runner image works on any docker host that can reach the hub's port:
+The published runner image works on any docker host that can reach the hub's port; nothing has to be checked out or built:
 
 ```
-git clone <this repo> && cd playwright-remote-orchestrator
-docker build -f docker/runner/Dockerfile -t playwright_orchestrator_runner .
-echo "GATEWAY_AGENT_TOKEN=<token>" > runner.env && chmod 600 runner.env
+read -rsp 'Agent token: ' T && printf 'GATEWAY_AGENT_TOKEN=%s\n' "$T" > runner.env && chmod 600 runner.env && unset T; echo
 docker run -d --name pw-runner --restart unless-stopped --init --shm-size 1g --env-file runner.env \
   -e HUB_URL=ws://<orchestrator-host>:4500 -e NODE_NAME=<stable-name> -e EPHEMERAL=0 -e SLOTS=4 \
-  playwright_orchestrator_runner
+  ghcr.io/sam-h101/playwright-remote-orchestrator/runner:latest
 ```
+
+Use a version tag (`:1.1.0`) instead of `:latest` to pin it; the runner's Playwright version must match your checks' minor version. To build it yourself instead: `docker build -f docker/runner/Dockerfile -t playwright_orchestrator_runner .` from a checkout, and run that image.
 
 `NODE_NAME` keeps the node's name when the container is recreated (the default is the container ID), and `EPHEMERAL=0` makes the hub show it OFFLINE while it is down instead of removing it. Keep `--init` (reaps browser processes) and `--shm-size` (Chromium crashes with docker's 64 MB `/dev/shm`).
 

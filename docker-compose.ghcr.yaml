@@ -1,0 +1,18 @@
+# Runs the stack from the images CI publishes to GitHub Container Registry instead of building them:
+#   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.ghcr.yaml pull
+#   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.ghcr.yaml up -d --scale runner=2
+# IMAGE_TAG (in .env or the shell) picks the version: a release such as 1.1.0, latest (the newest
+# release, the default) or edge (master). Leave this file out to build from the checkout as before.
+
+services:
+  hub:
+    image: ghcr.io/sam-h101/playwright-remote-orchestrator/hub:${IMAGE_TAG:-latest}
+  runner:
+    image: ghcr.io/sam-h101/playwright-remote-orchestrator/runner:${IMAGE_TAG:-latest}
+  web:
+    image: ghcr.io/sam-h101/playwright-remote-orchestrator/checks:${IMAGE_TAG:-latest}
+  example_playwright:
+    image: ghcr.io/sam-h101/playwright-remote-orchestrator/checks:${IMAGE_TAG:-latest}
+    pull_policy: missing
+  grid_ui:
+    image: ghcr.io/sam-h101/playwright-remote-orchestrator/grid-ui:${IMAGE_TAG:-latest}
