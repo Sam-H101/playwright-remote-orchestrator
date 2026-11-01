@@ -67,6 +67,7 @@ if (-not $InstallDir) { $InstallDir = if (Test-Path (Join-Path $PSScriptRoot 'ba
 $ProgressPreference = 'SilentlyContinue'   # Progress bars slow Invoke-WebRequest and friends a lot on 5.1.
 
 Import-Module (Join-Path $PSScriptRoot 'PlaywrightBackend.psm1') -Force
+Write-BackendLog 'install-backend.ps1 is deprecated: use pwrunner.exe install (see installer\windows\DEPRECATED.md).' 'WARN'
 
 $InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
 # Inside the Invoke-Step script blocks $PSBoundParameters is the block's own (empty) one.
