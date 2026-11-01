@@ -18,6 +18,9 @@ const usage = `Usage: pwrunner <command> [options]
 
 Commands:
   run         run the agent in the foreground (flags, then HUB_URL & co., then --config backend.json)
+  fetch       download and verify the pinned Node and playwright-core into <install dir>\cache
+  node        run the private node with the run-servers' environment: pwrunner node -- <args>
+  selfcheck   check an install (--quick: no network)
   version     print the version, Go toolchain and the pinned runtime
 
 Run "pwrunner <command> --help" for a command's options.
@@ -35,6 +38,12 @@ func run(args []string) error {
 	switch args[0] {
 	case "run":
 		return runAgent(args[1:])
+	case "fetch":
+		return fetchCmd(args[1:])
+	case "node":
+		return nodeCmd(args[1:])
+	case "selfcheck":
+		return selfcheckCmd(args[1:])
 	case "version", "--version":
 		fmt.Println(versionLine())
 		return nil
