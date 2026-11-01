@@ -123,8 +123,10 @@ func TestBackpressure(t *testing.T) {
 			}
 		}
 	}()
+	// Stalled for longer than the websocket library's 5 s control-frame timeout while the hub pings the
+	// data channel every 2 s: the session must survive (see pipe.Writes).
 	var peak int64
-	end := time.Now().Add(4 * time.Second)
+	end := time.Now().Add(8 * time.Second)
 	for time.Now().Before(end) {
 		if rss, err := RSS(a.PID()); err == nil && rss > peak {
 			peak = rss
