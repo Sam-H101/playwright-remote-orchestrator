@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coder/websocket"
 
@@ -24,8 +25,11 @@ type Result struct {
 // same code and reason (made sendable). Frame types are preserved and frames are streamed, never
 // buffered whole: a direction reads its next frame only once the previous one is fully written, so a
 // slow reader pushes back on the sender through TCP instead of growing memory.
-func Run(ctx context.Context, a, b *websocket.Conn) (closeA, closeB Result) {
+//
+// wa and wb (either may be nil) record the frames being written to a and b; see Writes.
+func Run(ctx context.Context, a, b *websocket.Conn, wa, wb *Writes) (closeA, closeB Result) {
 	conns := [2]*websocket.Conn{a, b}
+	writes := [2]*Writes{wa, wb}
 	type end struct {
 		from      int
 		srcClosed bool
@@ -34,7 +38,7 @@ func Run(ctx context.Context, a, b *websocket.Conn) (closeA, closeB Result) {
 	ends := make(chan end, 2)
 	for i := range conns {
 		go func(i int) {
-			closed, res := copyFrames(ctx, conns[i], conns[1-i])
+			closed, res := copyFrames(ctx, conns[i], conns[1-i], writes[1-i])
 			ends <- end{i, closed, res}
 		}(i)
 	}
@@ -70,17 +74,52 @@ func Run(ctx context.Context, a, b *websocket.Conn) (closeA, closeB Result) {
 	return *results[0], *results[1]
 }
 
-func copyFrames(ctx context.Context, src, dst *websocket.Conn) (srcClosed bool, res Result) {
+// Writes records whether a frame is being written to a connection. While a peer that stopped reading
+// keeps such a write blocked, a pong queued behind it would hit the websocket library's 5 s
+// control-frame timeout, and the library closes the connection when that fires. So a connection with
+// a write in progress answers no pings (the pong could not get through the full socket anyway; the hub
+// allows 60 s without one, as it does for agent.js, whose pongs queue behind the same stall).
+type Writes struct{ active atomic.Int32 }
+
+// InProgress reports whether a write is under way. A nil Writes is never busy.
+func (w *Writes) InProgress() bool { return w != nil && w.active.Load() > 0 }
+
+// trackedWriter marks every Write and the final Close as a write in progress.
+type trackedWriter struct {
+	w io.WriteCloser
+	t *Writes
+}
+
+func (tw trackedWriter) Write(p []byte) (int, error) {
+	if tw.t == nil {
+		return tw.w.Write(p)
+	}
+	tw.t.active.Add(1)
+	defer tw.t.active.Add(-1)
+	return tw.w.Write(p)
+}
+
+func (tw trackedWriter) Close() error {
+	if tw.t == nil {
+		return tw.w.Close()
+	}
+	tw.t.active.Add(1)
+	defer tw.t.active.Add(-1)
+	return tw.w.Close()
+}
+
+func copyFrames(ctx context.Context, src, dst *websocket.Conn, wdst *Writes) (srcClosed bool, res Result) {
 	buf := make([]byte, 64<<10)
 	for {
 		typ, r, err := src.Reader(ctx)
 		if err != nil {
 			return true, result(err)
 		}
-		w, err := dst.Writer(ctx, typ)
+		raw, err := dst.Writer(ctx, typ)
 		if err != nil {
 			return false, Result{Err: err}
 		}
+		w := trackedWriter{raw, wdst}
 		er := &errReader{r: r}
 		_, err = io.CopyBuffer(w, er, buf)
 		if er.err != nil {

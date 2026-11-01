@@ -36,6 +36,7 @@ type session struct {
 	slot     int
 	upstream *websocket.Conn
 	data     *websocket.Conn
+	toData   *pipe.Writes // frames being written to the data channel
 	last     atomic.Int64 // unix nanos of the last frame, ping or pong on the data channel
 }
 
@@ -98,9 +99,11 @@ func (m *Manager) HandleOpen(ctx context.Context, f protocol.Open) {
 	dialCtx, cancel := context.WithTimeout(ctx, openDeadline)
 	defer cancel()
 	upCtx, upCancel := context.WithTimeout(dialCtx, 10*time.Second)
+	toUpstream, toData := &pipe.Writes{}, &pipe.Writes{}
 	upstream, resp, err := websocket.Dial(upCtx, fmt.Sprintf("ws://127.0.0.1:%d%s%s", port, path, query), &websocket.DialOptions{
-		HTTPHeader: headers,
-		HTTPClient: noProxy,
+		HTTPHeader:     headers,
+		HTTPClient:     noProxy,
+		OnPingReceived: func(context.Context, []byte) bool { return !toUpstream.InProgress() },
 	})
 	upCancel()
 	if err != nil {
@@ -123,7 +126,7 @@ func (m *Manager) HandleOpen(ctx context.Context, f protocol.Open) {
 	if d := m.o.Timings.OpenDelayMs; d > 0 {
 		time.Sleep(time.Duration(d) * time.Millisecond)
 	}
-	s := &session{id: f.ID, slot: index, upstream: upstream}
+	s := &session{id: f.ID, slot: index, upstream: upstream, toData: toData}
 	s.seen()
 	header := http.Header{}
 	if m.o.Token != "" {
@@ -133,7 +136,7 @@ func (m *Manager) HandleOpen(ctx context.Context, f protocol.Open) {
 	data, _, err := websocket.Dial(dataCtx, fmt.Sprintf("%s/agent/data/%s", m.o.HubURL, f.ID), &websocket.DialOptions{
 		HTTPHeader:     header,
 		HTTPClient:     noProxy,
-		OnPingReceived: func(context.Context, []byte) bool { s.seen(); return true },
+		OnPingReceived: func(context.Context, []byte) bool { s.seen(); return !toData.InProgress() },
 		OnPongReceived: func(context.Context, []byte) { s.seen() },
 	})
 	dataCancel()
@@ -150,7 +153,7 @@ func (m *Manager) HandleOpen(ctx context.Context, f protocol.Open) {
 	m.sessions[s] = struct{}{}
 	m.mu.Unlock()
 	log.Infof("session %s on slot %d opened", f.ID, index)
-	up, dn := pipe.Run(ctx, upstream, data)
+	up, dn := pipe.Run(ctx, upstream, data, toUpstream, toData)
 	m.mu.Lock()
 	delete(m.sessions, s)
 	m.mu.Unlock()
@@ -218,6 +221,9 @@ func (m *Manager) Tick(now time.Time) {
 			s.data.CloseNow()
 			s.upstream.CloseNow()
 			continue
+		}
+		if s.toData.InProgress() {
+			continue // a ping behind a blocked write would time out and drop the connection (see pipe.Writes)
 		}
 		go func(c *websocket.Conn) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
