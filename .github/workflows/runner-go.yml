@@ -1,0 +1,111 @@
+name: pwrunner (Go)
+
+on:
+  push:
+    branches: [master]
+    paths: ['runner/**', 'gateway/**', '.github/workflows/runner-go.yml']
+  pull_request:
+    paths: ['runner/**', 'gateway/**', '.github/workflows/runner-go.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet, lint and unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: runner
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: runner/go.mod
+          cache-dependency-path: runner/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gateway/package-lock.json
+      - name: gateway dependencies (the fake run-server needs ws)
+        working-directory: gateway
+        run: npm ci
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: unit tests (race detector on Linux, where cgo is available)
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then go test -race ./...; else go test ./...; fi
+
+  build:
+    name: build matrix
+    runs-on: windows-latest
+    needs: test
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: runner
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: runner/go.mod
+          cache-dependency-path: runner/go.sum
+      - uses: actions/cache@v4
+        with:
+          path: runner/internal/runtime/files
+          key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go') }}
+      - name: build
+        run: .\build\build.ps1 -Version "ci-${{ github.run_number }}"
+      - name: version of the embedded build
+        run: |
+          $exe = Get-ChildItem dist\pwrunner-*-windows-amd64.exe | Select-Object -First 1
+          $line = & $exe.FullName version
+          Write-Host $line
+          if ($line -notmatch 'embedded=yes') { throw "embedded build does not report embedded=yes: $line" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pwrunner-ci-${{ github.run_number }}
+          path: runner/dist/*
+          if-no-files-found: error
+
+  contract:
+    name: agent contract suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: runner/go.mod
+          cache-dependency-path: runner/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gateway/package-lock.json
+      - name: contract suite against agent.js
+        working-directory: gateway
+        run: npm ci && node --test test/agent-contract.test.js
