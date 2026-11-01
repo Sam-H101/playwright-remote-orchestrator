@@ -54,6 +54,8 @@ jobs:
       - name: unit tests (race detector on Linux, where cgo is available)
         run: |
           if [ "$RUNNER_OS" = Linux ]; then go test -race ./...; else go test ./...; fi
+      - name: integration tests against the Node hub
+        run: go test -tags integration -count=1 ./test/integration/...
 
   build:
     name: build matrix
@@ -111,6 +113,12 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: gateway/package-lock.json
+      - name: build pwrunner
+        working-directory: runner
+        run: go build -ldflags "-X main.version=contract" -o "$RUNNER_TEMP/pwrunner$( [ "$RUNNER_OS" = Windows ] && echo .exe )" ./cmd/pwrunner
       - name: contract suite against agent.js
         working-directory: gateway
         run: npm ci && node --test test/agent-contract.test.js
+      - name: contract suite against pwrunner
+        working-directory: gateway
+        run: AGENT_CMD="$RUNNER_TEMP/pwrunner run" AGENT_VERSION=contract node --test test/agent-contract.test.js
