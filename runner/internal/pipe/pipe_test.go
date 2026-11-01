@@ -20,16 +20,18 @@ import (
 type setup struct {
 	ca, sb *websocket.Conn
 	done   chan [2]Result
+	toSA   *Writes // frames being written to sa, the agent's side of ca
 }
 
 func newSetup(t *testing.T) *setup {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	accepted := func() (*httptest.Server, chan *websocket.Conn) {
+	toSA := &Writes{}
+	accepted := func(opts *websocket.AcceptOptions) (*httptest.Server, chan *websocket.Conn) {
 		ch := make(chan *websocket.Conn, 1)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			c, err := websocket.Accept(w, r, nil)
+			c, err := websocket.Accept(w, r, opts)
 			if err != nil {
 				return
 			}
@@ -40,8 +42,9 @@ func newSetup(t *testing.T) *setup {
 		t.Cleanup(srv.Close)
 		return srv, ch
 	}
-	s1, s1c := accepted()
-	s2, s2c := accepted()
+	// sa answers pings as the session code configures it: not while a write to it is in progress.
+	s1, s1c := accepted(&websocket.AcceptOptions{OnPingReceived: func(context.Context, []byte) bool { return !toSA.InProgress() }})
+	s2, s2c := accepted(nil)
 	dial := func(url string) *websocket.Conn {
 		c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(url, "http"), nil)
 		if err != nil {
@@ -50,13 +53,13 @@ func newSetup(t *testing.T) *setup {
 		c.SetReadLimit(protocol.MaxPayload)
 		return c
 	}
-	s := &setup{done: make(chan [2]Result, 1)}
+	s := &setup{done: make(chan [2]Result, 1), toSA: toSA}
 	s.ca = dial(s1.URL)
 	sa := <-s1c
 	cb := dial(s2.URL)
 	s.sb = <-s2c
 	go func() {
-		a, b := Run(ctx, sa, cb)
+		a, b := Run(ctx, sa, cb, toSA, nil)
 		s.done <- [2]Result{a, b}
 	}()
 	t.Cleanup(func() { s.ca.CloseNow(); s.sb.CloseNow() })
@@ -173,6 +176,41 @@ func TestBackpressure(t *testing.T) {
 	for i := 0; i < frames; i++ {
 		if _, b, err := read(t, s.ca); err != nil || len(b) != len(frame) {
 			t.Fatalf("frame %d: %d bytes, %v", i, len(b), err)
+		}
+	}
+}
+
+// A peer that stops reading for longer than the websocket library's 5 s control-frame timeout, and pings
+// meanwhile, must not lose the connection: the pong would queue behind the blocked write and the
+// library would close the connection when its timeout fired.
+func TestPingDuringStallKeepsConnection(t *testing.T) {
+	s := newSetup(t)
+	frame := bytes.Repeat([]byte{1}, 1<<20)
+	const frames = 48
+	go func() {
+		for i := 0; i < frames; i++ {
+			if s.sb.Write(context.Background(), websocket.MessageBinary, frame) != nil {
+				return
+			}
+		}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for !s.toSA.InProgress() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !s.toSA.InProgress() {
+		t.Fatal("the write toward the stalled reader never blocked")
+	}
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		s.ca.Ping(ctx) // no pong expected while the write is blocked
+		cancel()
+		time.Sleep(500 * time.Millisecond)
+	}
+	time.Sleep(4 * time.Second) // well past the library's 5 s timeout since the first ping
+	for i := 0; i < frames; i++ {
+		if _, b, err := read(t, s.ca); err != nil || len(b) != len(frame) {
+			t.Fatalf("frame %d after the stall: %d bytes, %v", i, len(b), err)
 		}
 	}
 }
