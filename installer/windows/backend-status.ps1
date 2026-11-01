@@ -22,6 +22,9 @@ param(
 $ErrorActionPreference = 'Stop'
 # Not a param default: Windows PowerShell 5.1 leaves $PSScriptRoot empty there when run with -File.
 if (-not $InstallDir) { $InstallDir = if (Test-Path (Join-Path $PSScriptRoot 'backend.json')) { $PSScriptRoot } else { 'C:\PlaywrightBackend' } }
+# Deprecated (see DEPRECATED.md): a pwrunner.exe install answers for itself with the same report and exit codes.
+$pwrunner = Join-Path $InstallDir 'pwrunner.exe'
+if (Test-Path $pwrunner) { & $pwrunner status --install-dir $InstallDir $(if ($Json) { '--json' }) $(if ($ReportUrl) { '--report-url', $ReportUrl }) --health-timeout $HealthTimeoutSec; exit $LASTEXITCODE }
 Import-Module (Join-Path $PSScriptRoot 'PlaywrightBackend.psm1') -Force
 
 $config = Get-BackendConfig -InstallDir $InstallDir

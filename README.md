@@ -80,22 +80,35 @@ The same URL works for `chromium`, `firefox` and `webkit`: launch the browser yo
 
 ## Adding a Windows host
 
-`installer/windows/install-backend.ps1` turns a Windows machine into a runner node. Run it from a checkout of this repo in an elevated PowerShell. It needs Node.js 20+ (or pass `-InstallNode` to get it from winget).
+`pwrunner.exe` turns a Windows machine into a runner node. It is one file: it carries a private Node 22 and `playwright-core` (hash-pinned), installs itself as a Windows service, and needs no Node, npm, winget or repository checkout on the host. Download `pwrunner-<version>-windows-amd64.exe` (or `-arm64`) from the [releases](../../releases) and check it against `SHA256SUMS.txt`, then in an elevated PowerShell:
 
 ```powershell
-.\installer\windows\install-backend.ps1 -HubUrl ws://<orchestrator-host>:4500 -AgentToken <agent token> -Slots 4
+Get-Content .\agent-token.txt | .\pwrunner.exe install --hub-url ws://<orchestrator-host>:4500 --token-stdin --name win-07 --slots 4
 ```
 
-The agent token is one made for this host on the Grid UI's Access page (see [Access tokens](#access-tokens)), or `GATEWAY_AGENT_TOKEN`.
+The agent token is one made for this host on the Grid UI's Access page (see [Access tokens](#access-tokens)), or `GATEWAY_AGENT_TOKEN`. `--token-file <path>` works too; `--token <value>` is accepted but puts the token on a command line.
 
-* The host only needs outbound access to the hub's port. No firewall rule, no inbound port and no `database.yaml` entry: the node registers itself as `-NodeName` (default: the DNS host name).
-* Installs `playwright-core`, the agent and only the browsers you list (`-Browsers chromium` by default) into `C:\PlaywrightBackend`. Keep `-InstallDir` short: Windows can't start a browser whose path is over 260 characters.
-* Re-running keeps the installed settings (hub, token, node name, slots, base port, browsers, report URL, task name) unless you pass them again, and skips anything already at the right version. To rotate the token, re-run with only `-AgentToken <new token>`. `-PlaywrightVersion` is not kept, so a newer installer upgrades. If a re-run fails before the new backend starts, the previous one is restarted.
-* Runs the agent under a supervisor (scheduled task `PlaywrightBackend`, runs as SYSTEM at startup) that restarts it if it exits. `-NoService` runs it for the current session instead and needs no elevation.
-* Elevated, the install folder is writable only by SYSTEM and Administrators. A folder other users could change (for example from the older installer) gets a fresh `app\` and `browsers\`. The token is stored in `C:\PlaywrightBackend\agent.token`, readable only by SYSTEM and Administrators, and never appears on a command line or in a log.
-* Waits for the node to register and reports the result: a console summary, `status.json`, an optional JSON POST to `-ReportUrl`, and the exit code (`0` registered and every slot healthy, `2` not registered or some slots unhealthy, `1` failed).
-* `C:\PlaywrightBackend\backend-status.ps1 [-Json] [-ReportUrl <url>] [-HealthTimeoutSec N]` checks the node later with the same exit codes. `uninstall-backend.ps1 [-RemoveFiles]` removes it.
-* Logs are in `C:\PlaywrightBackend\logs` (`install.log`, `supervisor.log`, `agent.log`, `slot-<i>.log`).
+* The host only needs outbound access to the hub's port. No firewall rule, no inbound port and no `database.yaml` entry: the node registers itself as `--name` (default: the host name).
+* Installs into `C:\PlaywrightBackend` (`--install-dir`): `pwrunner.exe`, the private Node in `runtime\`, `playwright-core` in `app\`, and only the browsers you list (`--browsers chromium` by default) in `browsers\`. Keep the folder short: Windows can't start a browser whose path is over 260 characters. `--offline-dir <dir>` installs from the release's `pwrunner-runtime-<version>-windows-amd64.zip` contents without downloading; `--browsers-from <dir>` copies browsers instead of downloading them.
+* Runs the agent as the Windows service `PlaywrightBackend` (`--service-name`), LocalSystem, automatic start, restarted by the service manager if it exits. `--no-service` runs it in the background for the current session instead and needs no elevation.
+* Re-running keeps the installed settings (hub, token, node name, slots, base port, browsers, report URL, service name) unless you pass them again, and skips the runtime when it is already at the pinned version. `C:\PlaywrightBackend\pwrunner.exe install` with no flags re-applies the install. `--playwright-version` is not kept, so a newer exe upgrades. If an upgrade fails, `app\` and `runtime\` are rolled back and the previous backend is restarted.
+* Elevated, the install folder is writable only by SYSTEM and Administrators. A folder other users could change (for example from the older installer) is reset and gets a fresh `app\` and `browsers\`. The token is stored in `agent.token`, readable only by SYSTEM and Administrators, and never appears on a command line, in a log or in a JSON file.
+* An install made by the older PowerShell installer is migrated in place: its scheduled task and supervisor are removed and its scripts are moved to `C:\PlaywrightBackend\legacy\`.
+* Waits for the node to register and reports the result: a console summary, `status.json`, an optional JSON POST to `--report-url`, and the exit code (`0` registered and every slot healthy, `2` not registered or some slots unhealthy, `1` failed).
+
+Afterwards:
+
+| Command | Does |
+| --- | --- |
+| `pwrunner status [--json] [--report-url <url>] [--health-timeout <sec>]` | Node health with the same exit codes (`1` = not installed) |
+| `pwrunner start` / `stop` / `restart` | Controls the service |
+| `pwrunner token set --stdin` / `set --file <path>` / `clear` / `show-prefix` | Rotates the token and restarts the service; `show-prefix` prints only a managed token's 12-character label |
+| `pwrunner selfcheck [--quick]` | Checks the folder and token permissions, the runtime, the slot ports, the hub and the Node end-of-life date |
+| `pwrunner uninstall [--remove-files] [--yes]` | Removes the service; `--remove-files` also deletes the folder, browsers included |
+
+Logs are in `C:\PlaywrightBackend\logs` (`install.log`, `service.log`, `agent.log`, rotated at 10 MiB, and `slot-<i>.log`); the service also writes start, stop and repeated-crash events to the Windows Event Log under `PlaywrightBackend`.
+
+To go back to the PowerShell installer, run `pwrunner uninstall`, then `installer\windows\install-backend.ps1` from a checkout as before (see `installer/windows/DEPRECATED.md`).
 
 ## Adding a Linux host with docker
 
@@ -289,6 +302,16 @@ Flags override the environment variables.
 
 `PLAYWRIGHT_BROWSERS_PATH` is passed through to the run-servers.
 
+`pwrunner run` (the Go agent) takes the same flags and variables, plus:
+
+| Flag | Variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `--node` | `PWRUNNER_NODE` | `runtime\node\node.exe` next to the exe, else `node` on PATH | Node binary for the run-servers |
+| `--watchdog` | `PWRUNNER_WATCHDOG` | built-in copy | `parent-watchdog.js` preloaded into each run-server |
+| `--config` | | unset | Read defaults from an install's `backend.json` (flags, then variables, then the file) |
+
+Its run-servers get an allow-listed environment (system paths, `TEMP`, proxy variables, `PLAYWRIGHT_BROWSERS_PATH`, `PLAYWRIGHT_DOWNLOAD_HOST`), never the agent token or a machine-wide `NODE_OPTIONS`. The Windows service reads only `backend.json` and `agent.token`, never these variables.
+
 When the hub turns the agent away, it logs why and keeps retrying (1 s doubling to 30 s): 4401 missing, bad, revoked or expired token; 4403 token bound to another node name, or the name is reserved for another token; 1013 the hub can't check the token right now. 4409 (replaced by another agent with the same name) waits 30 s first. The status file's `lastError` shows the close code.
 
 ### Checks (`example_playwright` and other `main.py` containers)
@@ -339,7 +362,7 @@ The checks' client and every run-server must be on the same minor version (1.64.
 
 * `PLAYWRIGHT_VERSION` in `docker/python/Dockerfile` and `playwright==` in `docker/python/requirements.txt` (checks)
 * `PLAYWRIGHT_VERSION` in `docker/runner/Dockerfile` (runner containers: base image and `playwright-core`), then rebuild every runner image
-* the default `-PlaywrightVersion` in `installer/windows/install-backend.ps1`, then re-run the installer on every Windows host (or pass `-PlaywrightVersion <new>`)
+* the pins in `runner/internal/runtime/pins.go` (`go run ./tools/updatepins --node <v> --playwright <new>` prints them; also update the file names in `embed_windows_*.go`), release a new `pwrunner.exe`, and re-run `pwrunner install` on every Windows host (or pass `--playwright-version <new> --playwright-integrity <sha512-...>` to an existing exe)
 * `npm install --prefix /opt/playwright-core playwright-core@<new>` and the browser install on every Linux/macOS agent host
 * the `run-server` install on any legacy static host
 
@@ -347,7 +370,7 @@ The hub itself needs no upgrade: it passes frames through without reading them. 
 
 ## Migrating from the per-port setup
 
-* **Windows hosts**: delete the host from `hosts:` in `src/database.yaml`, then re-run the new installer with `-HubUrl` and `-AgentToken`. It stops the old run-servers on ports 3000+ and removes the old `Playwright Backend (<TaskName>)` inbound firewall rule.
+* **Windows hosts**: delete the host from `hosts:` in `src/database.yaml`, then run `pwrunner install --hub-url ... --token-stdin`. It stops the old run-servers, removes the old scheduled task and the `Playwright Backend (<TaskName>)` inbound firewall rule, and moves the PowerShell scripts to `legacy\`.
 * `main.py` removes idle static slots that are no longer listed under `hosts:` when it starts. If the node registers under the old entry's name it takes over those rows instead (see [Node names](#node-names)).
 * **Static hosts** still work: list them under `hosts:` in `src/database.yaml` (`server`, `port_start`, `port_end`; `port_end` is exclusive) and run `npx playwright run-server --port <port> --host 0.0.0.0` on each port. `/connect` clients reach them through the hub, which dials `ws://<server>:<port>` itself (with the client's headers, minus the gateway token), so those ports must be open to the hub. A static host lists no browsers or version, so it takes any client, but nodes come first; the hub can't tell whether it is up until a connect fails. Prefer the agent.
 * `full/example/example.py` reads `PW_WS_ENDPOINT`. Older checks that build `ws://$host:$port` or `/connect/<node>/<slot>` themselves must be changed to use it, and a `GATEWAY_URL` that holds a slot address must go back to the hub's address (`main.py` refuses to run with one).
@@ -358,8 +381,10 @@ The hub itself needs no upgrade: it passes frames through without reading them. 
 
 * Gateway: `cd gateway && npm ci && npm test`. `GATEWAY_TEST_MYSQL=1` plus `DB_*` also runs the MySQL registry tests; they drop the gateway tables in `DB_NAME`, so point it at a scratch database.
 * Orchestrator and Grid UI: `pip install -r ui/requirements.txt pytest && python -m pytest tests ui/tests`. The example-check and browser tests run when the `playwright` package is installed; the MySQL tests run when `ORCHESTRATOR_TEST_DB` (plus `DB_*`) points at a scratch database.
-* Windows installer: `.github/workflows/windows-backend-installer.yml` installs a node against a hub on a Windows runner and connects Playwright through it.
+* Agent contract: `cd gateway && node --test test/agent-contract.test.js` runs any agent as a child process against an in-process hub (`AGENT_CMD`, default `node agent.js`; `AGENT_CMD="..\dist\pwrunner.exe run"` for the Go agent).
+* Go runner: `cd runner && go test ./...`, and `go test -tags integration ./test/integration/...` against the real hub (needs `gateway/node_modules`). See `runner/README.md`.
+* Windows install: `.github/workflows/windows-backend-installer.yml` migrates a PowerShell install to `pwrunner.exe` against a hub on a Windows runner and connects Playwright through it.
 
-None of these need docker.
+None of these need docker (the Go tests need Go 1.26 or newer).
 
 [l1]: https://playwright.dev/docs/intro

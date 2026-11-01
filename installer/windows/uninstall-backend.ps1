@@ -18,6 +18,9 @@ param(
 $ErrorActionPreference = 'Stop'
 # Not a param default: Windows PowerShell 5.1 leaves $PSScriptRoot empty there when run with -File.
 if (-not $InstallDir) { $InstallDir = if (Test-Path (Join-Path $PSScriptRoot 'backend.json')) { $PSScriptRoot } else { 'C:\PlaywrightBackend' } }
+# Deprecated (see DEPRECATED.md): a pwrunner.exe install is removed by pwrunner.exe itself.
+$pwrunner = Join-Path $InstallDir 'pwrunner.exe'
+if (Test-Path $pwrunner) { & $pwrunner uninstall --install-dir $InstallDir --yes $(if ($RemoveFiles) { '--remove-files' }); exit $LASTEXITCODE }
 # Load the module from memory: with -RemoveFiles this script deletes the folder it may be running from.
 $moduleText = Get-Content (Join-Path $PSScriptRoot 'PlaywrightBackend.psm1') -Raw
 New-Module -Name PlaywrightBackend -ScriptBlock ([scriptblock]::Create($moduleText)) | Import-Module -Force
