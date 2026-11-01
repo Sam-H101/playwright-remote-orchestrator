@@ -5,11 +5,13 @@ on:
     paths:
       - 'installer/windows/**'
       - 'gateway/**'
+      - 'runner/**'
       - '.github/workflows/windows-backend-installer.yml'
   pull_request:
     paths:
       - 'installer/windows/**'
       - 'gateway/**'
+      - 'runner/**'
       - '.github/workflows/windows-backend-installer.yml'
   workflow_dispatch:
 
@@ -24,6 +26,7 @@ jobs:
     env:
       INSTALL_DIR: C:\PlaywrightBackend
       HUB_HTTP: http://127.0.0.1:4500
+      PWRUNNER: C:\pwbuild\pwrunner.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +35,11 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: gateway/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: runner/go.mod
+          cache-dependency-path: runner/go.sum
 
       - name: Parse scripts
         run: |
@@ -43,12 +51,44 @@ jobs:
           }
           if ($failed) { exit 1 }
 
-      - name: Gateway unit tests
+      - name: Go vet and unit tests
+        working-directory: runner
+        run: |
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/cache@v4
+        with:
+          path: runner/internal/runtime/files
+          key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go') }}
+
+      - name: Build pwrunner with the runtime embedded
+        working-directory: runner
+        run: |
+          go run ./tools/fetchbundle --out .\internal\runtime\files
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build -tags embedruntime -ldflags "-s -w -X main.version=ci" -o $env:PWRUNNER ./cmd/pwrunner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $line = & $env:PWRUNNER version
+          Write-Host $line
+          if ($line -notmatch 'embedded=yes') { throw "not an embedded build: $line" }
+
+      - name: Gateway unit tests and the agent contract suite (agent.js and pwrunner)
         working-directory: gateway
         run: |
           npm ci --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test test/agent-contract.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:AGENT_CMD = "$env:PWRUNNER run"
+          $env:AGENT_VERSION = 'ci'
+          node --test test/agent-contract.test.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Start hub
@@ -67,29 +107,43 @@ jobs:
           } until ($health.ok -or (Get-Date) -gt $deadline)
           if (-not $health.ok) { Get-Content "$env:RUNNER_TEMP\hub*.log"; throw 'The hub did not come up' }
 
-      - name: Plant files in the install folder, as other users could under the older installer
+      - name: Legacy install with the PowerShell installer
         run: |
-          # The folder inherits Modify for Authenticated Users from C:\, and users own what they put in it.
+          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -HubUrl ws://127.0.0.1:4500 -AgentToken ci-token -NodeName ci-node-07 -Slots 2
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { exit $LASTEXITCODE }
+          if (-not (Get-ScheduledTask -TaskName PlaywrightBackend -ErrorAction SilentlyContinue)) { throw 'The legacy install registered no scheduled task' }
+          $global:LASTEXITCODE = 0
+
+      - name: Plant files in the install folder, as other users could
+        run: |
+          # After the legacy install, so the reset below is pwrunner's own. agent.token stays: its content is carried over.
           New-Item -ItemType Directory "$env:INSTALL_DIR\app\node_modules\planted" -Force | Out-Null
           Set-Content "$env:INSTALL_DIR\app\node_modules\planted\index.js" 'planted'
           Set-Content "$env:INSTALL_DIR\planted.cmd" 'planted'
-          Set-Content "$env:INSTALL_DIR\agent.token" 'planted'
           icacls $env:INSTALL_DIR /setowner '*S-1-5-32-545' /T /C /Q
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Install
+      - name: Migrate to pwrunner
         run: |
-          # The hub must have outlived the step that started it.
           if (-not (Invoke-RestMethod "$env:HUB_HTTP/healthz").ok) { throw 'The hub is not running' }
-          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -HubUrl ws://127.0.0.1:4500 -AgentToken ci-token -NodeName ci-node-07 -Slots 2
+          Set-Content "$env:RUNNER_TEMP\ci-token.txt" 'ci-token' -NoNewline
+          & $env:PWRUNNER install --install-dir $env:INSTALL_DIR --hub-url ws://127.0.0.1:4500 --token-file "$env:RUNNER_TEMP\ci-token.txt" --name ci-node-07 --slots 2 --offline-dir runner\internal\runtime\files
           if ($LASTEXITCODE -ne 0) { Get-ChildItem "$env:INSTALL_DIR\logs" | ForEach-Object { Write-Host "--- $($_.Name)"; Get-Content $_.FullName -Tail 40 }; exit $LASTEXITCODE }
           $status = Get-Content "$env:INSTALL_DIR\status.json" -Raw | ConvertFrom-Json
           if ($status.result -ne 'success' -or -not $status.registered -or $status.healthySlots -ne 2) { throw "Unexpected status: $($status | ConvertTo-Json)" }
           $node = (Invoke-RestMethod "$env:HUB_HTTP/api/nodes").nodes | Where-Object name -eq $status.node
-          if (-not $node -or $node.slots -ne 2 -or $node.healthySlots -ne 2) { throw "Hub does not list $($status.node) with 2 healthy slots: $($node | ConvertTo-Json)" }
-          Write-Host "Node $($status.node) registered with 2 healthy slots"
+          if (-not $node -or $node.slots -ne 2 -or $node.healthySlots -ne 2 -or $node.agentVersion -ne 'ci') { throw "Hub does not list $($status.node) as a pwrunner node with 2 healthy slots: $($node | ConvertTo-Json)" }
           foreach ($f in "$env:INSTALL_DIR\planted.cmd", "$env:INSTALL_DIR\app\node_modules\planted") { if (Test-Path $f) { throw "$f survived the install" } }
-          if (-not (Select-String -Path "$env:INSTALL_DIR\logs\install.log" -Pattern 'from scratch' -SimpleMatch -Quiet)) { throw 'The planted folder was not reinstalled from scratch' }
+          $log = "$env:INSTALL_DIR\logs\install.log"
+          foreach ($p in 'from scratch', 'Moved the PowerShell installer files to legacy\') {
+            if (-not (Select-String -Path $log -Pattern $p -SimpleMatch -Quiet)) { throw "install.log lacks '$p'" }
+          }
+          if (Test-Path "$env:INSTALL_DIR\install-backend.ps1") { throw 'install-backend.ps1 was not moved to legacy\' }
+          if (-not (Test-Path "$env:INSTALL_DIR\legacy\install-backend.ps1")) { throw 'legacy\install-backend.ps1 is missing' }
+          if (Get-ScheduledTask -TaskName PlaywrightBackend -ErrorAction SilentlyContinue) { throw 'The legacy scheduled task still exists' }
+          if ((Get-Service PlaywrightBackend).Status -ne 'Running') { throw 'The PlaywrightBackend service is not running' }
+          if (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*run-backend.ps1*' }) { throw 'A legacy supervisor still runs' }
+          Write-Host "Node $($status.node) migrated: 2 healthy slots, service running"
           Add-Content -Path $env:GITHUB_ENV -Value "CI_NODE=$($status.node)" -Encoding ASCII
 
       - name: Token is not exposed and the install is not writable by users
@@ -98,13 +152,13 @@ jobs:
           $sids = $acl.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
           $extra = @($sids | Where-Object { $_ -ne 'S-1-5-18' -and $_ -ne 'S-1-5-32-544' })
           if (-not $acl.AreAccessRulesProtected -or $extra.Count) { throw "agent.token is readable by more than SYSTEM and Administrators: $($acl.AccessToString)" }
-          # The task runs these as SYSTEM, so only SYSTEM and Administrators may change them. That includes owning
-          # them: an owner can always grant itself write access again.
-          foreach ($f in $env:INSTALL_DIR, "$env:INSTALL_DIR\agent.token", "$env:INSTALL_DIR\run-backend.ps1", "$env:INSTALL_DIR\app\gateway\agent.js", "$env:INSTALL_DIR\app\node_modules\playwright-core\cli.js") {
+          # The service runs these as SYSTEM, so only SYSTEM and Administrators may change them, owning included.
+          $runs = "$env:INSTALL_DIR\pwrunner.exe", "$env:INSTALL_DIR\app\node_modules\playwright-core\cli.js", "$env:INSTALL_DIR\runtime\node\node.exe"
+          foreach ($f in @($env:INSTALL_DIR, "$env:INSTALL_DIR\agent.token") + $runs) {
             $owner = (Get-Acl $f).GetOwner([Security.Principal.SecurityIdentifier]).Value
             if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') { throw "$f is owned by $((Get-Acl $f).Owner)" }
           }
-          foreach ($f in $env:INSTALL_DIR, "$env:INSTALL_DIR\run-backend.ps1", "$env:INSTALL_DIR\app\gateway\agent.js") {
+          foreach ($f in @($env:INSTALL_DIR) + $runs) {
             $writers = @((Get-Acl $f).Access | Where-Object {
               $sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
               $sid -ne 'S-1-5-18' -and $sid -ne 'S-1-5-32-544' -and ([int]$_.FileSystemRights -band 0x40000116)   # GENERIC_WRITE or any of the Write rights
@@ -117,23 +171,24 @@ jobs:
             if (Select-String -Path $f.FullName -Pattern 'ci-token' -SimpleMatch -Quiet) { throw "Token written to $($f.FullName)" }
           }
 
-      - name: Re-run the installed copy (keeps every setting, skips npm and browser downloads)
+      - name: Re-run the installed copy (keeps every setting, skips the runtime)
         run: |
-          # No parameters: InstallDir is the script's folder; hub, token, name and slots come from the install.
-          powershell -NoProfile -ExecutionPolicy Bypass -File "$env:INSTALL_DIR\install-backend.ps1"
+          & "$env:INSTALL_DIR\pwrunner.exe" install
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Select-String -Path "$env:INSTALL_DIR\logs\install.log" -Pattern 'already installed, skipping npm' -Quiet)) { throw 'Second run did not skip npm install' }
+          if (-not (Select-String -Path "$env:INSTALL_DIR\logs\install.log" -Pattern 'already installed, skipping npm' -Quiet)) { throw 'The re-run did not skip the runtime' }
           $cfg = Get-Content "$env:INSTALL_DIR\backend.json" -Raw | ConvertFrom-Json
           if ($cfg.nodeName -ne $env:CI_NODE -or $cfg.slots -ne 2) { throw "The re-run changed the settings: $($cfg | ConvertTo-Json)" }
 
       - name: A failed upgrade restarts the previous install
         run: |
-          .\installer\windows\install-backend.ps1 -InstallDir $env:INSTALL_DIR -PlaywrightVersion 0.0.0-does-not-exist
+          & $env:PWRUNNER install --install-dir $env:INSTALL_DIR --playwright-version 0.0.0-does-not-exist --playwright-integrity sha512-AAAA
           if ($LASTEXITCODE -ne 1) { throw "Expected exit code 1, got $LASTEXITCODE" }
           $status = Get-Content "$env:INSTALL_DIR\status.json" -Raw | ConvertFrom-Json
           if ($status.failedStep -ne 'install node packages' -or -not $status.restartedPrevious) { throw "Unexpected status: $($status | ConvertTo-Json)" }
-          & "$env:INSTALL_DIR\backend-status.ps1" -HealthTimeoutSec 90
+          & $env:PWRUNNER status --install-dir $env:INSTALL_DIR --health-timeout 90
           if ($LASTEXITCODE -ne 0) { throw 'The previous install did not come back' }
+          $manifest = Get-Content "$env:INSTALL_DIR\manifest.json" -Raw | ConvertFrom-Json
+          if ($manifest.playwrightVersion -ne '1.64.1') { throw "app\ changed: $($manifest | ConvertTo-Json)" }
 
       - name: Connect clients through the hub
         run: |
@@ -156,37 +211,36 @@ jobs:
           Set-Content -Path "$env:RUNNER_TEMP\client.js" -Value $client
           node "$env:RUNNER_TEMP\client.js"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$env:INSTALL_DIR\backend-status.ps1"
+          & $env:PWRUNNER status --install-dir $env:INSTALL_DIR
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Supervisor restarts a killed agent
+      - name: The service restarts a killed agent
         run: |
           $old = (Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json).pid
           Stop-Process -Id $old -Force
           Start-Sleep -Seconds 1
-          & "$env:INSTALL_DIR\backend-status.ps1" -HealthTimeoutSec 90
-          if ($LASTEXITCODE -ne 0) { Get-Content "$env:INSTALL_DIR\logs\supervisor.log"; throw 'The agent did not come back' }
+          & $env:PWRUNNER status --install-dir $env:INSTALL_DIR --health-timeout 90
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:INSTALL_DIR\logs\service.log"; throw 'The agent did not come back' }
           $new = (Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json).pid
           if ($new -eq $old) { throw "runtime.json still names the killed agent ($old)" }
 
-      - name: Stopping the task stops the agent and reports degraded
+      - name: Stopping the service stops the agent and reports degraded
         run: |
-          Stop-ScheduledTask -TaskName PlaywrightBackend
+          Stop-Service PlaywrightBackend
           Start-Sleep -Seconds 5
-          # The supervisor's kill-on-close job takes the agent, run-servers and browsers down with it.
-          $left = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object CommandLine -like "*$env:INSTALL_DIR\app\*")
-          if ($left.Count) { throw "Still running after Stop-ScheduledTask: $($left.CommandLine -join '; ')" }
+          $left = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object ExecutablePath -like "$env:INSTALL_DIR\runtime\*")
+          if ($left.Count) { throw "Still running after Stop-Service: $($left.ProcessId -join ', ')" }
           if ((Invoke-RestMethod "$env:HUB_HTTP/api/nodes").nodes | Where-Object name -eq $env:CI_NODE) { throw 'Hub still lists the node' }
-          & "$env:INSTALL_DIR\backend-status.ps1" -Json
+          & $env:PWRUNNER status --install-dir $env:INSTALL_DIR --json
           if ($LASTEXITCODE -ne 2) { throw "Expected exit code 2, got $LASTEXITCODE" }
           $global:LASTEXITCODE = 0
 
       - name: Uninstall
         run: |
-          & "$env:INSTALL_DIR\uninstall-backend.ps1" -RemoveFiles
+          & $env:PWRUNNER uninstall --install-dir $env:INSTALL_DIR --remove-files --yes
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Test-Path $env:INSTALL_DIR) { throw 'Install dir still exists' }
-          if (Get-ScheduledTask -TaskName PlaywrightBackend -ErrorAction SilentlyContinue) { throw 'Task still registered' }
+          if (Get-Service PlaywrightBackend -ErrorAction SilentlyContinue) { throw 'Service still registered' }
 
       - name: Upload logs
         if: failure()
