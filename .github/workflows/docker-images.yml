@@ -1,0 +1,116 @@
+name: Docker images
+
+# Builds the hub, runner, Grid UI and checks images and publishes them to GitHub Container Registry as
+# ghcr.io/<owner>/playwright-remote-orchestrator/<name>:
+#   master                    -> :edge and :sha-<short sha>
+#   tag pwrunner/v1.2.3 or v1.2.3 -> :1.2.3, :1.2 and :latest
+#   workflow_dispatch         -> builds `ref` and tags it `version` (+ :latest), e.g. for a tag pushed
+#                                before this workflow existed
+# Pull requests only build (amd64), to catch a broken Dockerfile before it merges.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*', 'pwrunner/v*']
+    paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', '.github/workflows/docker-images.yml']
+  pull_request:
+    paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', '.github/workflows/docker-images.yml']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: git ref to build, e.g. pwrunner/v1.1.0 (empty = the branch the workflow runs on)
+        default: ''
+      version:
+        description: image tag for that ref, e.g. 1.1.0 (empty = edge)
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: hub
+            file: docker/hub/Dockerfile
+            context: .
+            platforms: linux/amd64,linux/arm64
+          - name: runner
+            file: docker/runner/Dockerfile
+            context: .
+            platforms: linux/amd64,linux/arm64
+          - name: grid-ui
+            file: docker/ui/Dockerfile
+            context: .
+            platforms: linux/amd64,linux/arm64
+          # The image main.py checks run in (compose service web / example_playwright). amd64 only:
+          # its trust-store fix links the x86_64 p11-kit library by path.
+          - name: checks
+            file: docker/python/Dockerfile
+            context: docker/python
+            platforms: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: image name
+        id: name
+        # Registry paths must be lower-case; the owner is Sam-H101.
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+
+      - name: tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=match,pattern=pwrunner/v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=pwrunner/v(\d+\.\d+)\.\d+,group=1
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') || inputs.version != '' }}
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' && inputs.version == '' }}
+            type=sha,format=short,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+            type=ref,event=pr
+
+      - uses: docker/setup-qemu-action@v3
+        if: github.event_name != 'pull_request' && contains(matrix.platforms, 'arm64')
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build${{ github.event_name != 'pull_request' && ' and push' || '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || matrix.platforms }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: summary
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "### ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
