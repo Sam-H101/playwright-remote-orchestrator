@@ -1,8 +1,8 @@
 // Hash routes. Every view, filter and object has an address, and back/forward walk through them.
-//   #/overview  #/activity?node=&slot=&kind=&range=  #/sessions?filter=  #/access
+//   #/overview  #/activity?node=&slot=&kind=&range=  #/sessions?filter=  #/access  #/mfa
 //   #/slot/<id>  #/node/<name>  #/session/<slotId>     (the inspector, over the last view)
 //   #/connect                                         (how checks connect to the grid, in the inspector)
-export const VIEWS = ["overview", "activity", "sessions", "access"];
+export const VIEWS = ["overview", "activity", "sessions", "access", "mfa"];
 const INSPECT = { slot: 1, node: 1, session: 1 };
 const LEGACY = { "#access": "#/access", "#sessions": "#/sessions", "#overview": "#/overview", "#activity": "#/activity" };
 

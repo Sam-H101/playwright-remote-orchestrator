@@ -192,7 +192,7 @@ WantedBy=multi-user.target
 
 Agents need an **agent token** to register and checks need a **client token** to open a session. The hub accepts two sources for each:
 
-* **Bootstrap tokens**: `GATEWAY_AGENT_TOKEN` and `GATEWAY_CLIENT_TOKEN` on the hub. They work even while MySQL is down, and the compose runners and example check use them, so compose requires both. They can't be revoked from the UI: to rotate one, change it in `.env` and run the same `docker compose ... up -d` again, which recreates the hub, the runners and the checks with the new value. A hub run outside compose may leave them unset and use managed tokens only.
+* **Bootstrap tokens**: `GATEWAY_AGENT_TOKEN` and `GATEWAY_CLIENT_TOKEN` on the hub. They work even while MySQL is down, and the compose runners and example check use them, so compose requires both. They can't be revoked from the UI: to rotate one, change it in `.env` and run the same `docker compose ... up -d` again, which recreates the hub, the runners, the checks and the Grid UI (which takes `GATEWAY_CLIENT_TOKEN` for [MFA codes](#mfa-secrets) and [saved sign-ins](#saved-sign-ins)) with the new value. A hub run outside compose may leave them unset and use managed tokens only.
 * **Managed tokens**: made on the Grid UI's **Access** page, which needs [`GRID_ADMIN_TOKEN`](#security). Agent tokens start with `pwga_`, client tokens with `pwgc_`. MySQL only keeps their sha256 and first 12 characters, so the token is shown once, when it is created, with ready-to-paste commands for that kind. Use it like the env token: `-AgentToken`, `GATEWAY_AGENT_TOKEN` or `--token` for an agent, `GATEWAY_CLIENT_TOKEN` for a check.
 
 On the Access page:
@@ -225,6 +225,8 @@ Run-servers on agent hosts only listen on 127.0.0.1.
 * The hub port speaks plain `ws://` (tokens included). Across any network you don't trust, put a TLS-terminating reverse proxy (nginx, Caddy, Traefik, ...) in front of it, use `wss://` URLs for the agents and `GATEWAY_URL`, and allow WebSocket upgrades and long-lived connections (the agent reconnects if it hears nothing for 45 s). Where you can, also limit the hub port to your runner hosts' addresses.
 * `GET /healthz` and `GET /api/nodes` on the hub need no token; they show node names, versions and IP addresses.
 * The Grid UI is published on 127.0.0.1 only, and without `GRID_ADMIN_TOKEN` anyone who can open it can release slots and forget nodes. Set `GRID_ADMIN_TOKEN` (the admin sign-in) before exposing it more widely. The Access page needs it in any case: without it the UI refuses to list, create or revoke tokens. Whoever has it can create agent tokens, so guard it like `GATEWAY_AGENT_TOKEN`. Compose passes it to the UI but doesn't require it, because the rest of the UI works without it and the Access page stays locked rather than open. The UI refuses cross-site actions, and accepts actions only through an IP address, `localhost`, the machine's own host names or a name in `GRID_UI_ALLOWED_HOSTS`: list the DNS alias or reverse-proxy name you reach it by.
+* [MFA secrets](#mfa-secrets) go into the Grid UI and never come out: the seeds are stored encrypted under `GRID_SECRETS_KEY`, and the UI answers with codes and metadata only, never cached, and logs neither seeds nor codes. Any client token (and the admin token) can get a code for any stored secret, so a client token also works as the second factor of those accounts: store only the accounts your checks sign in with, and treat client tokens accordingly. Keep `GRID_SECRETS_KEY` out of the database's backups; a dump without it holds no usable seed. `POST /api/mfa/code` is the one action exempt from the cross-site and host-name rules: it takes nothing but a client token in the `Authorization` header, which a page on another site can't send, and checks reach the UI by its compose name.
+* [Saved sign-ins](#saved-sign-ins) are kept the same way and are more sensitive still: a saved state is the account's live session cookies, so a check that holds one is signed in as the account with no password and no code. They are encrypted under `GRID_SECRETS_KEY`, an admin sees only the cookies' domains and counts (never a value), and any client token can check out any saved sign-in, as it can get any MFA code — so the same caution applies, more so. The checks' `POST /api/signins/checkout`, `/api/signins/save` and `/api/signins/release` are exempt from the cross-site and host-name rules like `/api/mfa/code`, and for the same reason. **Forget** a sign-in on the MFA page to stop checks reusing it. Forget only drops the grid's copy and doesn't sign the cookies out: to cut off a copy already checked out (after a client token leaked, say), revoke the account's sessions at the site (in Entra ID, **Revoke sessions** on the user) or reset its password.
 
 ## Grid UI
 
@@ -234,6 +236,7 @@ A management console lives in `ui/` (Flask, plain ES modules, no build step). It
 * **Activity**: every change recorded in the last 15 minutes, filterable by node, slot, kind and time; **Copy as JSON** copies the filtered events. An admin action is one row: the change it caused, with who did it.
 * **Sessions**: running claims, stale first; release one from its inspector. A session the hub routed is stale only once that hub has stopped renewing its lease (nothing holds the claim then); while the hub runs it is a running session however long it lasts, and releasing it doesn't end it (the hub claims the slot again). Any other claim is stale after `GRID_STALE_AFTER`.
 * **Access**: the hub's managed [access tokens](#access-tokens), plus **Add a host**, which makes an agent token bound to a node name, shows the one install command for the chosen platform and waits for the host to register. It warns before making a second token for a node that already has one.
+* **MFA & sign-ins**: the authenticator seeds checks get sign-in codes from (see [MFA secrets](#mfa-secrets)), with the codes handed out recently and to whom, and the [saved sign-ins](#saved-sign-ins) checks reuse so most runs skip the prompt, with **Forget** to make the next run sign in again.
 * Every view, filter and object has an address (`#/activity?node=...`, `#/slot/12`, `#/node/<name>`, `#/session/12`). Press `/` or Ctrl K to jump to anything, `?` for the other shortcuts.
 
 **What the activity can and can't see.** The Grid UI server records it (`ui/recorder.py`): it compares snapshots of the database, on every page poll and, when no page is open, every `GRID_RECORDER_INTERVAL` seconds (2 by default; 0 turns the background recording off), and keeps the last 15 minutes (at most 500 events) in memory. A tab opened after a failed CI run therefore still shows the runs and failures before it; the recording starts when the UI server does, and the page says since when. Claim and release both stamp `LastRunDate`, so a run that starts and ends between two snapshots still shows, as *finished between updates* with its end time but no start (drawn as "approx."). It also sees connect failures, failure resets, health changes and nodes coming and going. It can't see which check ran or why a connection failed (no error text is stored). Admin actions are attributed to who signed in, and to "you" in the tab that did them. With several workers (gunicorn) each keeps its own recording; events are identified by database values, so the page merges them. Visible pages poll `/api/status` every `GRID_UI_POLL_MS` (1500 by default; every 12 s in a background tab) and never hold a connection open, so it is safe behind gunicorn's sync workers.
@@ -247,8 +250,81 @@ A management console lives in `ui/` (Flask, plain ES modules, no build step). It
 * `GET /status` (or `/api/status`): the same data as JSON, plus a `ready` flag (at least one slot can be picked), `grid_name`, `public_gateway_url` and `poll_ms`. `?soft=1` reports a database outage as `{"unavailable": true, "error": ...}` with HTTP 200 instead of a 503 (the page uses it). `?events=<epoch ms>` adds the recorded `events` observed since then and the `recorder`'s start, drops and capacity samples (`0`: all 15 minutes); `GET /api/events?since=` returns the same on its own. `POST /api/slots/<id>/release {"claimed_at": "<the session's started>"}` releases only that claim. `POST /api/nodes/forget {"host": "<name>"}` forgets a node (409 while it is online or in use).
 * `GET /api/session`: `{signedIn, name, method, adminConfigured, providers}` for the credentials sent.
 * `GET /api/tokens`, `POST /api/tokens {"name", "kind", "nodeName"?, "expiresInDays"?}` (answers the token once), `POST /api/tokens/<id>/revoke` and `POST /api/tokens/<id>/delete` (409 while active). All of them need an admin (`X-Grid-Token` today).
+* `GET /api/mfa` (secrets and the last 100 hand-outs, never a seed), `POST /api/mfa {"name", "secret", "issuer"?, "account"?, "algorithm"?, "digits"?, "period"?}`, `POST /api/mfa/<id>/delete`, `GET /api/mfa/<id>/code` (the current code, using nothing up) and `POST /api/mfa/<id>/use` (a code handed out like a check's) need an admin. `POST /api/mfa/code` is the checks' (see [MFA secrets](#mfa-secrets)).
+* `GET /api/signins` (saved sign-ins and who used them, never a cookie), `POST /api/signins/<id>/forget` (drop the state so the next run signs in again) and `POST /api/signins/<id>/delete` need an admin. The checks' routes are `POST /api/signins/checkout`, `POST /api/signins/save` and `POST /api/signins/release` (see [Saved sign-ins](#saved-sign-ins)).
 * With docker it is the `grid_ui` service. Locally: `pip install -r ui/requirements.txt`, set the `DB_*` variables, then `python -m ui.app` from the repo root.
 * Demo without MySQL: `python -m ui.demo demo.db --heartbeat` (add `--activity`, or `GRID_DEMO_ACTIVITY=1`, to run short bursts of checks every few seconds), then `GRID_DB_ENGINE=sqlite GRID_DB_PATH=demo.db python -m ui.app` (add `GRID_ADMIN_TOKEN=<anything>` to see the demo's tokens).
+
+## MFA secrets
+
+Checks that sign in to a site with two-step verification get authenticator (TOTP, RFC 6238) codes from the Grid UI instead of holding the seed themselves. An admin stores the account's enrolment once; a check asks for a code while the site's prompt is on screen and types it. The seed stays in the Grid UI: the check, the runner and the browser only ever see 6 digits.
+
+* **Storing a secret.** On the Grid UI's **MFA** page (an admin's, locked until `GRID_SECRETS_KEY` is set), add a secret with a name (1-64 letters, digits, `.`, `_` and `-`; checks ask for codes by it) and either the `otpauth://totp/...` URI in the site's enrolment QR code or the base32 seed the site shows instead of the QR code (any case, spaces and dashes allowed). A URI also brings the issuer, account, algorithm, digits and period; a bare seed gets SHA-1, 6 digits and 30 s, which nearly every site uses. Scan the same QR code with a phone too if people also sign in as that account. To change a seed, delete the secret and add it again. An admin can look at the current code (which uses nothing up, and says whether a check already had it) or take one to type by hand, handed out like a check's.
+* **Getting a code.** `src/mfa.py` needs only the standard library. The checks `main.py` runs have `src` at `/app/src` and run from `/app`, so:
+
+  ```python
+  from src import mfa
+
+  page.get_by_label("Code").fill(mfa.code("intranet", label="nightly login check",
+                                          sleep=lambda s: page.wait_for_timeout(s * 1000)))
+  ```
+
+  `mfa.code(name)` returns a code that works now, with at least `min_valid_s` (5) of its window left, after waiting for its window if it comes from the next one. Pass a `sleep` that keeps the page served, as above, if the check answers requests with `page.route`. `mfa.issue(name)` asks once without waiting and returns the UI's answer. Both raise `mfa.MfaError` saying why there is no code (unknown secret, wrong token, unreachable UI, key changed); it never holds the token. Over HTTP it is `POST /api/mfa/code` with `Authorization: Bearer <client token>` and `{"name", "label"?, "minValidS"?}`. `full/poc/poc_totp_login.py` signs in to a fake intranet this way.
+* **Once per window.** Sites accept each code once, so the UI hands out each 30 s window of a secret once. When the current window is taken, or has less than `minValidS` left, the answer is the next free window's code, before that window opens: `waitS` is how long to wait before typing it (`mfa.code()` waits), `validForS` how long it works from now. Two checks that sign in to the same account at once get different codes, the second about one window later. Codes are handed out at most two windows past the current one; beyond that the UI answers 429 with `retry_after_s`, and `mfa.code()` waits and asks again for up to `max_wait_s` (120 s). The UI logs each hand-out (window, time, token name and the check's `label`) for 7 days; codes themselves are never stored.
+* **Who may ask.** A check asks with its client token: a managed client token from the Access page, or the bootstrap `GATEWAY_CLIENT_TOKEN`, which compose passes to the UI for this (the UI ignores a value shorter than 16 characters). `mfa.code()` sends `GRID_MFA_TOKEN`, else `GATEWAY_CLIENT_TOKEN`, so compose checks need nothing extra. Wrong tokens count towards the admin sign-in limit (429 after 20 from one address in 5 minutes). Any valid client token gets codes for every secret.
+* **Clock.** Codes are computed from the Grid UI host's clock, and checked by the site against its own: keep the Grid UI host in sync (NTP). Most sites also accept the window before and after.
+* **Encryption.** Seeds are stored in `mfaSecrets` encrypted with AES-256-GCM under a key derived from `GRID_SECRETS_KEY` (HKDF-SHA256), bound to the secret's name. If the key changes, the stored seeds no longer decrypt: code requests get 409 saying so, and nothing is used up. Set the old key again, or delete the secrets and add them again from their enrolments (if you no longer have one, enrol the account again on its site). Without the key (or with one under 16 characters) the MFA page stays locked and code requests get 503.
+
+Checks outside compose reach the UI at `GRID_UI_URL`; compose publishes it on 127.0.0.1 only (see [Security](#security) before exposing it).
+
+## Saved sign-ins
+
+A check that signs in to a site can save the browser's signed-in state (Playwright's `storage_state`: cookies and local storage) in the Grid UI and reuse it on later runs, so most runs skip the sign-in and its MFA prompt. It matters most against Microsoft Entra ID: signing in on every run types an authenticator code each time and looks, to Microsoft's risk checks, like one account signing in over and over from server addresses, which Microsoft may answer by challenging, flagging or blocking the account. One saved sign-in, reused until Microsoft asks again, is the single sign-in a person's "stay signed in" would have made.
+
+* **How a check uses it.** `src/signin.py` needs only the standard library and reaches the Grid UI with the same settings as `src/mfa.py` (`GRID_UI_URL`, and `GRID_MFA_TOKEN` or `GATEWAY_CLIENT_TOKEN`). `signin.reuse()` checks out the saved state, opens a context with it and asks the check whether the app is signed in; only when nothing is saved, or the site asks again, does it sign in and save the new state. One check signs in at a time (it holds a lease) and the others wait for the state it saves, so a burst of runs still makes one sign-in. On a clean exit it saves the state again, since sites roll their cookies as they are used.
+
+  ```python
+  import os, re
+  from playwright.sync_api import expect
+  from src import mfa, signin
+
+  APP = "https://contoso.sharepoint.com/sites/ops"
+
+  def signed_in(page):    # open the app: still signed in, or did Microsoft ask again?
+      page.goto(APP)
+      home = page.get_by_role("heading", name="Operations")
+      asked = page.get_by_role("heading", name=re.compile(r"^(Sign in|Enter password|Pick an account)$"))
+      expect(home.or_(asked)).to_be_visible()
+      return home.is_visible()
+
+  def sign_in(page):      # the whole sign-in, on the page reuse() opens for it
+      page.goto(APP)
+      page.get_by_role("textbox", name=re.compile("email|someone", re.I)).fill("monitor@contoso.com")
+      page.get_by_role("button", name="Next").click()
+      page.get_by_placeholder("Password").fill(os.environ["MONITOR_PASSWORD"])
+      page.get_by_role("button", name="Sign in").click()
+      # Push ("Approve sign-in request") is the default for many accounts and needs a phone; switch to the code.
+      switch = page.get_by_role("button", name="Sign in another way")
+      if switch.is_visible():
+          switch.click()
+          page.get_by_role("button", name=re.compile("verification code", re.I)).click()
+      page.get_by_role("textbox", name=re.compile("code", re.I)).fill(mfa.code("contoso-monitor"))
+      page.get_by_role("button", name=re.compile(r"^(Verify|Next|Sign in)$")).click()
+      page.get_by_role("button", name="Yes").click()   # "Stay signed in?": the cookies that last
+
+  with signin.reuse(browser, "contoso-monitor", sign_in=sign_in, signed_in=signed_in) as s:
+      expect(s.page.get_by_role("link", name="Runbooks")).to_be_visible()
+  ```
+
+  This Microsoft flow is written from the screens Microsoft shows and is **not verified against a live tenant**; the headings, button text and the push-to-code switch change between tenants and over time, so match on text with the account you have, keep the locators forgiving, and set the authenticator up so a **verification code** is offered (not only push). The MFA code comes from the Grid UI ([MFA secrets](#mfa-secrets)); the account's password is the check's to supply (here from the environment).
+
+* **What `storage_state` captures.** Cookies and `localStorage`, which is what keeps a browser signed in. It does **not** capture `sessionStorage`, which a new context starts empty. An MSAL single-page app caches its access tokens in `sessionStorage`, so the first load after a reuse finds none and bounces to `login.microsoftonline.com` — where the saved Microsoft cookie signs it back in with no prompt, then returns to the app. So the reuse still works, through that cookie, but `signed_in()` must wait for the app's own content and tolerate the brief sign-in redirect rather than fail on it.
+
+* **Where it is kept.** Each saved sign-in is a row in `savedSignins`, the state encrypted with AES-256-GCM under a key derived from `GRID_SECRETS_KEY` (HKDF-SHA256) and bound to the sign-in's name — the same scheme as an MFA seed but under its own key, so stored seeds are unaffected. The **MFA & sign-ins** page lists each one for an admin with the cookies' domains, counts and who used it, never a cookie value; **Forget** drops the state (and bumps its version, so a check still holding the old one can't save it back) and the next run signs in again. **Delete** removes the row; a check that uses the name again adds a new one under a new id, which checks send with the version they save, so a check still holding the deleted state can't save it back either. The checks use `POST /api/signins/checkout`, `/api/signins/save` and `/api/signins/release` with `Authorization: Bearer <client token>`; an admin uses `GET /api/signins`, `POST /api/signins/<id>/forget` and `POST /api/signins/<id>/delete`.
+
+* **Treat a saved sign-in as a credential.** It is the account's live session, so any client token can check it out and be signed in as the account without the password or a code, just as a client token can get any MFA code (see [Security](#security)). Save only the accounts your checks sign in with, keep `GRID_SECRETS_KEY` out of the database's backups (a dump without it holds no usable cookie), and **Forget** a sign-in to stop checks reusing it (it doesn't sign the cookies out; see [Security](#security)). Without the key, or with one under 16 characters, checkout and save get 503 (the page still lists the sign-ins, and Forget and Delete work). If the key changes, the saved states no longer decrypt, and each check's next run signs in again.
+
+* `full/poc/poc_signin_reuse.py` proves the whole cycle against a fake app behind a Microsoft-style identity provider: reuse with no MFA, a revocation that forces one fresh sign-in, silent renewal after the app's own cookie expires, the lease that serialises concurrent runs, and the refresh-save. Its rounds count on having their saved sign-in (`POC_SIGNIN_NAME`) to themselves, so `full/poc/run_poc.sh` keeps its own, `poc-idp-session-manual`, apart from the scheduled `poc_signin_reuse`'s `poc-idp-session`.
 
 ## Slot failures
 
@@ -276,6 +352,7 @@ A management console lives in `ui/` (Flask, plain ES modules, no build step). It
 | `SLOT_FAIL_THRESHOLD`, `SLOT_FAIL_COOLDOWN_S` | `3`, `300` | [Slot failures](#slot-failures), for the hub and the UI |
 | `GRID_ADMIN_TOKEN` | unset | Token for the UI's management actions. The Access page needs it |
 | `GRID_UI_ALLOWED_HOSTS` | unset | Extra host names the UI accepts actions through |
+| `GRID_SECRETS_KEY` | unset | Key the UI encrypts [MFA secrets](#mfa-secrets) and [saved sign-ins](#saved-sign-ins) with. The MFA page needs it, and so do checks to use saved sign-ins |
 | `MYSQL_ROOT_PASSWORD`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD` | see `.env.example` | MySQL service credentials (`docker-compose.mysql.yaml`) |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `mysql`, `3306`, `orchestrator` x3 | An existing MySQL server, without `docker-compose.mysql.yaml` |
 | `HUB_DB` | `mysql` | `memory` runs the hub without a database (testing only) |
@@ -343,6 +420,8 @@ When the hub turns the agent away, it logs why and keeps retrying (1 s doubling 
 | `GATEWAY_URL` | `ws://hub:4500` | The hub. The check gets `<GATEWAY_URL>/connect` as `PW_WS_ENDPOINT`; a `/connect/<node>/<slot>` address is refused |
 | `GATEWAY_CLIENT_TOKEN` | unset | Client token (bootstrap or managed), appended as `?gateway_token=` |
 | `GATEWAY_NODE` | unset | Keep the check on this node or static host, appended as `?node=`. The hub still picks the slot |
+| `GRID_UI_URL` | `http://grid_ui:4444` | The Grid UI, as the check reaches it, for [MFA codes](#mfa-secrets) (`src/mfa.py`) and [saved sign-ins](#saved-sign-ins) (`src/signin.py`) |
+| `GRID_MFA_TOKEN` | `GATEWAY_CLIENT_TOKEN` | Client token `src/mfa.py` asks for MFA codes with, and `src/signin.py` checks out and saves sign-ins with |
 | `ORCHESTRATOR_CONFIG` | `src/database.yaml` | Config file (`mysql:`, optional `gateway:` with `url`, `client_token` and `node`, and `hosts:`) |
 | `CHECK_TIMEOUT_S` | `1800` | Kill a check that runs longer; its browser connection closes and the hub frees the slot |
 | `PW_CONNECT_TIMEOUT_S` | `180` | How long the example check waits for the hub to hand it a browser |
@@ -363,7 +442,9 @@ When the hub turns the agent away, it logs why and keeps retrying (1 s doubling 
 | `GRID_STALE_AFTER` | `3600` | Seconds after which a session not claimed by the hub is flagged as stale |
 | `GATEWAY_HUB_LEASE_S` | `90` | The hub's value: a session the hub routed is flagged as stale once its hub hasn't renewed its lease for this long |
 | `GRID_ADMIN_TOKEN` | unset | If set, management actions need this token. Unset, the Access page is locked |
-| `GATEWAY_AGENT_TOKEN`, `GATEWAY_CLIENT_TOKEN` | unset | Only whether they are set is read: the Access page then knows the hub has a bootstrap token and doesn't warn that creating or revoking a token changes who gets in. Compose passes `set`, not the value |
+| `GATEWAY_AGENT_TOKEN` | unset | Only whether it is set is read: the Access page then knows the hub has a bootstrap agent token and doesn't warn that creating or revoking a token changes who gets in. Compose passes `set`, not the value |
+| `GATEWAY_CLIENT_TOKEN` | unset | The hub's bootstrap client token. Tells the Access page the same for client tokens, and lets checks that connect with it ask for [MFA codes](#mfa-secrets) and use [saved sign-ins](#saved-sign-ins) with it too (only a value of 16 characters or more). Compose passes the value |
+| `GRID_SECRETS_KEY` | unset | Encrypts the [MFA secrets](#mfa-secrets)' seeds and the [saved sign-ins](#saved-sign-ins)' states (AES-256-GCM, key derived with HKDF); at least 16 characters, e.g. `openssl rand -hex 32`. Unset, the MFA page is locked and checks can't check out or save sign-ins (the page still lists them). Changing it makes the stored seeds and states unreadable until the old key is back: codes are refused, and every check signs in again |
 | `GRID_UI_ALLOWED_HOSTS` | unset | Comma list of extra host names actions are accepted through (`*` for any) |
 | `GRID_DB_ENGINE`, `GRID_DB_PATH` | `mysql` | `sqlite` plus a path reads a sqlite DB instead (demo) |
 | `GRID_SCHEMA_PATH` | `src/schema.sql` | Schema the UI runs at startup (MySQL only) |

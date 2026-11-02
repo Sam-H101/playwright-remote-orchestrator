@@ -126,9 +126,15 @@ services:
       # Optional: the rest of the UI works without it, and the Access page stays locked until it is set.
       GRID_ADMIN_TOKEN: ${GRID_ADMIN_TOKEN:-}
       GRID_UI_ALLOWED_HOSTS: ${GRID_UI_ALLOWED_HOSTS:-}
-      # Only tells the Access page that the hub has bootstrap tokens ("set"), never their values.
+      # Encrypts the seeds on the MFA page and the sign-ins checks save there. Until it is set the page
+      # takes no seeds and gives no codes, and checks can't save or reuse sign-ins. Seeds and sign-ins stored
+      # under one key don't decrypt under another.
+      GRID_SECRETS_KEY: ${GRID_SECRETS_KEY:-}
+      # The agent token only tells the Access page that the hub has one ("set"), never its value. The
+      # client token's value lets checks that connect with it also ask for MFA codes and use saved sign-ins
+      # (the UI can make client tokens anyway, so knowing this one gives it no access it lacked).
       GATEWAY_AGENT_TOKEN: ${GATEWAY_AGENT_TOKEN:+set}
-      GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:+set}
+      GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:-}
     volumes:
       - ./src/database.yaml:/app/src/database.yaml:ro
 

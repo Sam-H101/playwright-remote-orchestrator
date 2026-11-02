@@ -69,6 +69,52 @@ CREATE TABLE IF NOT EXISTS accessTokens (
     lastUsedAt TEXT NULL,
     revokedAt TEXT NULL
 );
+CREATE TABLE IF NOT EXISTS mfaSecrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    issuer TEXT NULL,
+    account TEXT NULL,
+    algorithm TEXT NOT NULL DEFAULT 'SHA1',
+    digits INTEGER NOT NULL DEFAULT 6,
+    period INTEGER NOT NULL DEFAULT 30,
+    seedCipher TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    lastStep INTEGER NULL,
+    lastIssuedAt TEXT NULL,
+    lastIssuedTo TEXT NULL,
+    issuedCount INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS mfaIssues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    secretId INTEGER NOT NULL,
+    step INTEGER NOT NULL,
+    issuedAt TEXT NOT NULL,
+    issuedTo TEXT NOT NULL,
+    label TEXT NULL
+);
+CREATE TABLE IF NOT EXISTS savedSignins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    stateCipher TEXT NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    domains TEXT NULL,
+    cookieCount INTEGER NOT NULL DEFAULT 0,
+    originCount INTEGER NOT NULL DEFAULT 0,
+    savedAt TEXT NULL,
+    savedBy TEXT NULL,
+    expiresAt TEXT NULL,
+    signInCount INTEGER NOT NULL DEFAULT 0,
+    refreshCount INTEGER NOT NULL DEFAULT 0,
+    useCount INTEGER NOT NULL DEFAULT 0,
+    lastUsedAt TEXT NULL,
+    lastUsedBy TEXT NULL,
+    rejectedCount INTEGER NOT NULL DEFAULT 0,
+    lastRejectedAt TEXT NULL,
+    leaseHash TEXT NULL,
+    leaseUntil TEXT NULL,
+    leaseHolder TEXT NULL,
+    createdAt TEXT NOT NULL
+);
 """
 
 # name, online, platform, browsers, address, last seen (s ago), connected (s ago),

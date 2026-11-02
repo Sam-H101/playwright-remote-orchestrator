@@ -6,6 +6,7 @@ export const SHORTCUTS = [
   ["g a", "Activity"],
   ["g s", "Sessions"],
   ["g t", "Access tokens"],
+  ["g m", "MFA & sign-ins"],
   ["j / k", "Next / previous row"],
   ["Enter", "Open the inspector for the row"],
   ["Esc", "Close the inspector, then the palette"],
@@ -38,7 +39,7 @@ export function bind(handlers) {
     if (typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
     if (chord && Date.now() - chord < 1200) {
       chord = 0;
-      const view = { o: "overview", a: "activity", s: "sessions", t: "access" }[e.key];
+      const view = { o: "overview", a: "activity", s: "sessions", t: "access", m: "mfa" }[e.key];
       if (view) { e.preventDefault(); handlers.view(view); }
       return;
     }

@@ -493,7 +493,7 @@ def test_no_console_errors_or_csp_violations_across_views(grid, browser):
         p.on("pageerror", lambda e: errors.append(str(e)))
         p.goto(url)
         p.wait_for_selector(".mx-row[data-key]")
-        for hash_ in ("#/activity", "#/sessions", "#/access", "#/node/WIN-BUILD-01", "#/overview"):
+        for hash_ in ("#/activity", "#/sessions", "#/access", "#/mfa", "#/node/WIN-BUILD-01", "#/overview"):
             p.goto(url + hash_)
             p.wait_for_timeout(250)
             assert p.evaluate("document.documentElement.scrollWidth <= innerWidth"), (width, hash_)

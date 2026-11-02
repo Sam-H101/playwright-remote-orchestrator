@@ -7,11 +7,12 @@ import logging
 import mimetypes
 import os
 import socket
+import time
 import urllib.parse
 
 from flask import Flask, abort, g, jsonify, render_template, request
 
-from . import auth, recorder, store
+from . import auth, mfa, recorder, store
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,17 @@ except ValueError:
 # machine's names), comma separated; "*" allows any. Guards the actions against DNS rebinding.
 ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("GRID_UI_ALLOWED_HOSTS", "").split(",") if h.strip()}
 
+# Where checks ask for MFA codes and saved sign-ins (with their client token rather than the admin's).
+CHECK_CODE_PATH = "/api/mfa/code"
+CHECK_CHECKOUT_PATH = "/api/signins/checkout"
+CHECK_SAVE_PATH = "/api/signins/save"
+CHECK_RELEASE_PATH = "/api/signins/release"
+CHECK_PATHS = {CHECK_CODE_PATH, CHECK_CHECKOUT_PATH, CHECK_SAVE_PATH, CHECK_RELEASE_PATH}
+
 app = Flask(__name__)
+# How far any request body is read, chunked ones too (they have no Content-Length to refuse them by): one
+# byte past the largest a request may send, a saved sign-in's, so a body cut off here tells from one that fits.
+app.config["MAX_CONTENT_LENGTH"] = store.SIGNIN_MAX_BODY_BYTES + 1
 # Read at call time, so the setting can change while the app runs (the tests rely on it).
 auth.configure(lambda: ADMIN_TOKEN)
 # One per process. Every status poll feeds it the snapshot it reads anyway; a background thread
@@ -90,6 +101,11 @@ def _same_origin_actions_only():
 
     Stops cross-site form posts (which need no CORS preflight) and DNS rebinding."""
     if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if request.path in CHECK_PATHS:
+        # Checks, not browsers: these routes take nothing but a client token in the Authorization header,
+        # which a page on another site can't send without a CORS preflight (never approved here). Checks
+        # reach the UI by its compose name (grid_ui), which the host rule below would refuse.
         return None
     host = _hostname(request.host)
     if not _host_allowed(host):
@@ -163,6 +179,27 @@ def tokens_unavailable(error):
 @app.errorhandler(store.DatabasePermissionDenied)
 def database_permission_denied(error):
     return jsonify(error=_db_error_text(error)), 403
+
+
+@app.errorhandler(store.MfaUnavailable)
+def mfa_unavailable(error):
+    return jsonify(error=str(error)), 503
+
+
+@app.errorhandler(store.SigninsUnavailable)
+def signins_unavailable(error):
+    return jsonify(error=str(error)), 503
+
+
+@app.errorhandler(mfa.SecretsKeyMissing)
+def secrets_key_missing(error):
+    # secrets_key_unset: the page explains the setting instead of offering a form that can't work.
+    return jsonify(error=str(error), secrets_key_unset=True), 503
+
+
+@app.errorhandler(mfa.CannotDecrypt)
+def cannot_decrypt(error):
+    return jsonify(error=str(error), cannot_decrypt=True), 409
 
 
 @app.get("/")
@@ -331,6 +368,231 @@ def delete_token(token_id):
     if result == "active":
         return jsonify(error="This token is still active. Revoke it before deleting it."), 409
     return _private(jsonify(deleted=True, id=token_id))
+
+
+# ---- MFA secrets ----------------------------------------------------------------------
+#
+# Admins store authenticator seeds here; checks ask for codes with their client token. Seeds go in and
+# never come out: every answer carries codes or metadata only, and none is cached.
+
+@app.after_request
+def _mfa_never_cached(response):
+    # Refusals and errors too (the admin gate's, the guessing limit's, the error handlers'), not only codes.
+    if request.path == "/api/mfa" or request.path.startswith("/api/mfa/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _mfa_busy(error):
+    response = jsonify(error=str(error), retry_after_s=round(error.retry_after_s, 1))
+    response.headers["Retry-After"] = str(max(1, int(error.retry_after_s + 0.999)))
+    return _private(response, 429)
+
+
+@app.get("/api/mfa")
+@auth.admin_required(refuse_when_unconfigured=True)
+def list_mfa():
+    result = store.list_mfa()
+    result["keyProblem"] = mfa.key_problem()
+    # The page counts down to the next code by this clock, not the viewer's.
+    result["serverTime"] = time.time()
+    return _private(jsonify(result))
+
+
+@app.post("/api/mfa")
+@auth.admin_required(refuse_when_unconfigured=True)
+def create_mfa():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="Send the secret as a JSON object."), 400
+    try:
+        secret = store.create_mfa(body.get("name"), body.get("secret"), body.get("issuer"), body.get("account"),
+                                  body.get("algorithm"), body.get("digits"), body.get("period"))
+    except mfa.InvalidSecret as e:
+        return _private(jsonify(error=str(e)), 400)
+    log.info("mfa secret %r added by %s", secret["name"], g.principal.name if g.principal else "an open grid")
+    return _private(jsonify(secret), 201)
+
+
+@app.post("/api/mfa/<int:secret_id>/delete")
+@auth.admin_required(refuse_when_unconfigured=True)
+def delete_mfa(secret_id):
+    if not store.delete_mfa(secret_id):
+        return jsonify(error="There is no MFA secret {}.".format(secret_id)), 404
+    log.info("mfa secret %d deleted by %s", secret_id, g.principal.name if g.principal else "an open grid")
+    return _private(jsonify(deleted=True, id=secret_id))
+
+
+@app.get("/api/mfa/<int:secret_id>/code")
+@auth.admin_required(refuse_when_unconfigured=True)
+def peek_mfa_code(secret_id):
+    """The current code, for an admin to read; hands nothing out."""
+    code = store.peek_mfa_code(secret_id)
+    if code is None:
+        return jsonify(error="There is no MFA secret {}.".format(secret_id)), 404
+    return _private(jsonify(code))
+
+
+@app.post("/api/mfa/<int:secret_id>/use")
+@auth.admin_required(refuse_when_unconfigured=True)
+def use_mfa_code(secret_id):
+    """A code for an admin to type somewhere, handed out like a check's so no check gets the same one."""
+    try:
+        code = store.issue_mfa_code(g.principal.name if g.principal else "Admin", secret_id=secret_id, label="Grid UI")
+    except store.MfaBusy as e:
+        return _mfa_busy(e)
+    if code is None:
+        return jsonify(error="There is no MFA secret {}.".format(secret_id)), 404
+    return _private(jsonify(code))
+
+
+@app.post(CHECK_CODE_PATH)
+def check_mfa_code():
+    """A code for a check, which sends its client token and {"name", "label"?, "minValidS"?}.
+
+    The answer's waitS is how long to wait before typing the code (when it comes from the next window)
+    and validForS how long it works from now."""
+    principal = auth.check_principal(store.client_token_name)
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("name"), str) or not body["name"].strip():
+        return _private(jsonify(error='Send {"name": "<secret name>"} as JSON.'), 400)
+    min_valid = body.get("minValidS")
+    if min_valid is not None and (isinstance(min_valid, bool) or not isinstance(min_valid, (int, float)) or min_valid < 0):
+        return _private(jsonify(error="minValidS is a number of seconds, 0 or more."), 400)
+    try:
+        code = store.issue_mfa_code(principal.name, name=body["name"].strip(), label=body.get("label"),
+                                    min_valid_s=min_valid)
+    except mfa.InvalidSecret as e:
+        return _private(jsonify(error=str(e)), 400)
+    except store.MfaBusy as e:
+        return _mfa_busy(e)
+    if code is None:
+        return _private(jsonify(error="There is no MFA secret called {!r}.".format(body["name"].strip())), 404)
+    return _private(jsonify(code))
+
+
+# ---- saved sign-ins -------------------------------------------------------------------
+#
+# Checks keep the browser state of a sign-in here and reuse it on later runs, so most runs skip the sign-in
+# and its MFA prompt. States go in and out with the checks' client tokens only: admins see what is saved
+# and who used it, never a cookie, and no answer is cached.
+
+@app.after_request
+def _signins_never_cached(response):
+    # Refusals and errors too, not only states.
+    if request.path == "/api/signins" or request.path.startswith("/api/signins/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _too_large(message):
+    # error is a code here, as with lease_lost: checks tell these apart from mistakes in the request.
+    return _private(jsonify(error="too_large", message=message), 413)
+
+
+@app.errorhandler(store.InvalidSignin)
+def invalid_signin(error):
+    return jsonify(error=str(error)), 400
+
+
+@app.errorhandler(store.SigninTooLarge)
+def signin_too_large(error):
+    return _too_large(str(error))
+
+
+@app.errorhandler(413)
+def request_too_large(error):
+    # A Content-Length past MAX_CONTENT_LENGTH, refused before the body is read.
+    return _too_large("The request is over {} bytes.".format(store.SIGNIN_MAX_BODY_BYTES))
+
+
+@app.errorhandler(store.LeaseLost)
+def lease_lost(error):
+    return jsonify(error="lease_lost", message=str(error)), 409
+
+
+@app.errorhandler(store.SigninsFull)
+def signins_full(error):
+    return jsonify(error=str(error), signins_full=True), 409
+
+
+def _check_signin_request():
+    """(principal, body) of a check's sign-in request; a 401/429 for a missing or wrong client token, 413 for
+    a body over SIGNIN_MAX_BODY_BYTES, 400 for one that isn't a JSON object."""
+    principal = auth.check_principal(store.client_token_name)
+    # By its Content-Length before it is read; a chunked one, by what MAX_CONTENT_LENGTH let through.
+    limit = store.SIGNIN_MAX_BODY_BYTES
+    if (request.content_length or 0) > limit or len(request.get_data()) > limit:
+        abort(_too_large("The request is over {} bytes.".format(limit)))
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        abort(_private(jsonify(error='Send {"name": "<sign-in name>", ...} as a JSON object.'), 400))
+    return principal, body
+
+
+def _no_signin(name):
+    return _private(jsonify(error="There is no saved sign-in called {!r}.".format(name.strip())), 404)
+
+
+@app.get("/api/signins")
+@auth.admin_required(refuse_when_unconfigured=True)
+def list_signins():
+    result = store.list_signins()
+    result["keyProblem"] = mfa.key_problem("signin")
+    result["serverTime"] = time.time()
+    return _private(jsonify(result))
+
+
+@app.post("/api/signins/<int:signin_id>/forget")
+@auth.admin_required(refuse_when_unconfigured=True)
+def forget_signin(signin_id):
+    signin = store.forget_signin(signin_id)
+    if signin is None:
+        return jsonify(error="There is no saved sign-in {}.".format(signin_id)), 404
+    log.info("saved sign-in %r forgotten by %s", signin["name"], g.principal.name if g.principal else "an open grid")
+    return _private(jsonify(forgotten=True, signin=signin))
+
+
+@app.post("/api/signins/<int:signin_id>/delete")
+@auth.admin_required(refuse_when_unconfigured=True)
+def delete_signin(signin_id):
+    if not store.delete_signin(signin_id):
+        return jsonify(error="There is no saved sign-in {}.".format(signin_id)), 404
+    log.info("saved sign-in %d deleted by %s", signin_id, g.principal.name if g.principal else "an open grid")
+    return _private(jsonify(deleted=True, id=signin_id))
+
+
+@app.post(CHECK_CHECKOUT_PATH)
+def checkout_signin():
+    """A check's saved sign-in, or its turn to sign in. It sends its client token and {"name",
+    "rejectedVersion"?, "id"?, "leaseS"?}; the answer's status is "saved" (with the state), "sign-in" (with a
+    lease token) or "wait" (with retryAfterS). rejectedVersion is the version of a state the site refused,
+    and id the id it came with."""
+    principal, body = _check_signin_request()
+    return _private(jsonify(store.checkout_signin(principal.name, body.get("name"), body.get("rejectedVersion"),
+                                                  body.get("leaseS"), body.get("id"))))
+
+
+@app.post(CHECK_SAVE_PATH)
+def save_signin():
+    """The state a check is signed in with: {"name", "state", "maxAgeS"?} and either the "leaseToken" of the
+    sign-in it just made or the "baseVersion" and "id" of the state it reused (cookies roll over)."""
+    principal, body = _check_signin_request()
+    answer = store.save_signin(principal.name, body.get("name"), body.get("state"), body.get("leaseToken"),
+                               body.get("baseVersion"), body.get("maxAgeS"), body.get("id"))
+    if answer is None:
+        return _no_signin(body["name"])
+    return _private(jsonify(answer))
+
+
+@app.post(CHECK_RELEASE_PATH)
+def release_signin():
+    """{"name", "leaseToken"}: the lease of a sign-in that failed, so the next check signs in at once."""
+    _, body = _check_signin_request()
+    released = store.release_signin(body.get("name"), body.get("leaseToken"))
+    if released is None:
+        return _no_signin(body["name"])
+    return _private(jsonify(released=released))
 
 
 if __name__ == "__main__":

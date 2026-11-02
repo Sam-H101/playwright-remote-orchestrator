@@ -93,3 +93,77 @@ CREATE TABLE IF NOT EXISTS hubs (
     lastSeen DATETIME NULL
 )
 ;
+-- Authenticator-app (TOTP, RFC 6238) enrolments the Grid UI keeps for checks that sign in to sites with
+-- two-step verification. Only the Grid UI reads and writes them. seedCipher is the seed encrypted with
+-- AES-256-GCM under a key derived from GRID_SECRETS_KEY: base64 of the 12-byte nonce and the ciphertext,
+-- with 'mfa:<name>' as associated data, so a ciphertext copied to another row doesn't decrypt. The seed
+-- itself is never stored, logged or sent anywhere: checks get codes. lastStep is the newest time step
+-- whose code was handed out; each step is handed out once (sites accept each code once), so checks
+-- running at the same time never get the same code.
+CREATE TABLE IF NOT EXISTS mfaSecrets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    issuer VARCHAR(128) NULL,
+    account VARCHAR(255) NULL,
+    algorithm VARCHAR(8) NOT NULL DEFAULT 'SHA1',
+    digits INT NOT NULL DEFAULT 6,
+    period INT NOT NULL DEFAULT 30,
+    seedCipher VARCHAR(1024) NOT NULL,
+    createdAt DATETIME NOT NULL,
+    lastStep BIGINT NULL,
+    lastIssuedAt DATETIME NULL,
+    lastIssuedTo VARCHAR(255) NULL,
+    issuedCount INT NOT NULL DEFAULT 0,
+    UNIQUE KEY uq_mfa_name (name)
+)
+;
+-- The codes the Grid UI handed out: which secret, which time step, when, to whom (the client token's
+-- name, GATEWAY_CLIENT_TOKEN or an admin) and the label the check sent. Rows older than 7 days are
+-- deleted as new ones are added. Never holds a code or a seed.
+CREATE TABLE IF NOT EXISTS mfaIssues (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    secretId INT NOT NULL,
+    step BIGINT NOT NULL,
+    issuedAt DATETIME NOT NULL,
+    issuedTo VARCHAR(255) NOT NULL,
+    label VARCHAR(128) NULL,
+    KEY idx_mfa_issues_secret (secretId, issuedAt)
+)
+;
+-- Signed-in browser states (Playwright's storage_state: cookies and local storage) the Grid UI keeps for
+-- checks, so most runs reuse a sign-in instead of signing in again. Only the Grid UI reads and writes
+-- them. stateCipher is the state's JSON, zlib-compressed and encrypted with AES-256-GCM under a key
+-- derived from GRID_SECRETS_KEY (not the MFA seeds' key): base64 of the 12-byte nonce and the ciphertext,
+-- with 'signin:<name>' as associated data. NULL means nothing usable is saved (never saved, forgotten, or
+-- dropped because the site asked to sign in again or expiresAt passed). version goes up with every save
+-- and every forget, so a check can tell its state from a newer one; 0 means never saved. A name deleted
+-- and checked out again is a new row whose versions start over, under a new id (InnoDB doesn't reuse
+-- AUTO_INCREMENT ids since MySQL 8.0), and checks send the id with the version. domains (the
+-- cookies' domains, comma separated) and the counts are for display. While a check signs in, it holds
+-- the lease: leaseHash is the sha256 of its lease token, and nobody else signs in for that name until
+-- it saves, releases it, or leaseUntil passes.
+CREATE TABLE IF NOT EXISTS savedSignins (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(64) NOT NULL,
+    stateCipher MEDIUMTEXT NULL,
+    version INT NOT NULL DEFAULT 0,
+    domains VARCHAR(1024) NULL,
+    cookieCount INT NOT NULL DEFAULT 0,
+    originCount INT NOT NULL DEFAULT 0,
+    savedAt DATETIME NULL,
+    savedBy VARCHAR(255) NULL,
+    expiresAt DATETIME NULL,
+    signInCount INT NOT NULL DEFAULT 0,
+    refreshCount INT NOT NULL DEFAULT 0,
+    useCount INT NOT NULL DEFAULT 0,
+    lastUsedAt DATETIME NULL,
+    lastUsedBy VARCHAR(255) NULL,
+    rejectedCount INT NOT NULL DEFAULT 0,
+    lastRejectedAt DATETIME NULL,
+    leaseHash CHAR(64) NULL,
+    leaseUntil DATETIME NULL,
+    leaseHolder VARCHAR(255) NULL,
+    createdAt DATETIME NOT NULL,
+    UNIQUE KEY uq_signin_name (name)
+)
+;

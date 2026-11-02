@@ -34,6 +34,7 @@
       <symbol id="i-more" viewBox="0 0 16 16"><path d="M3.5 8h.01M8 8h.01M12.5 8h.01" stroke-width="2.4"/></symbol>
       <symbol id="i-user" viewBox="0 0 16 16"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.5a5 5 0 0 1 10 0"/></symbol>
       <symbol id="i-logout" viewBox="0 0 16 16"><path d="M6.5 13.5h-3a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3M10 5l3 3-3 3M13 8H6.5"/></symbol>
+      <symbol id="i-login" viewBox="0 0 16 16"><path d="M9.5 2.5h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-3M6 5l3 3-3 3M9 8H2.5"/></symbol>
       <symbol id="i-pause" viewBox="0 0 16 16"><path d="M6 3.5v9M10 3.5v9"/></symbol>
       <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.5v9l7.5-4.5z"/></symbol>
       <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></symbol>
@@ -49,6 +50,9 @@
       <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M3 8h10M9 4l4 4-4 4"/></symbol>
       <symbol id="i-link" viewBox="0 0 16 16"><path d="M6.5 9.5l3-3M7.5 4.5l1-1a2.47 2.47 0 0 1 3.5 3.5l-1 1M8.5 11.5l-1 1A2.47 2.47 0 0 1 4 9l1-1"/></symbol>
       <symbol id="i-rows" viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></symbol>
+      <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8 13 3.6v4.1c0 3.1-2.1 5.3-5 6.5-2.9-1.2-5-3.4-5-6.5V3.6z"/><path d="m5.7 8 1.6 1.6 3-3.1"/></symbol>
+      <symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.5 8S3.9 3.5 8 3.5 14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></symbol>
+      <symbol id="i-eye-off" viewBox="0 0 16 16"><path d="M6.6 3.7A6 6 0 0 1 8 3.5c4.1 0 6.5 4.5 6.5 4.5a11 11 0 0 1-1.6 2.2M4.2 4.9C2.4 6.1 1.5 8 1.5 8S3.9 12.5 8 12.5a6 6 0 0 0 3.2-.9M6.6 6.6a2 2 0 0 0 2.8 2.8M2.5 2.5l11 11"/></symbol>
     </defs>
   </svg>
 
@@ -93,6 +97,7 @@
         <li><a href="#/activity" data-nav-view="activity" title="Activity (g a)"><svg class="i" aria-hidden="true"><use href="#i-activity"></use></svg><span class="rail-label">Activity</span></a></li>
         <li><a href="#/sessions" data-nav-view="sessions" title="Sessions (g s)"><svg class="i" aria-hidden="true"><use href="#i-sessions"></use></svg><span class="rail-label">Sessions</span><span class="nav-count mono" data-session-count hidden></span></a></li>
         <li><a href="#/access" data-nav-view="access" title="Access (g t)"><svg class="i" aria-hidden="true"><use href="#i-key"></use></svg><span class="rail-label">Access</span></a></li>
+        <li><a href="#/mfa" data-nav-view="mfa" title="MFA &amp; sign-ins (g m)"><svg class="i" aria-hidden="true"><use href="#i-shield"></use></svg><span class="rail-label">MFA &amp; sign-ins</span></a></li>
       </ul>
       <div class="rail-foot">
         <a class="rail-btn" href="#/connect" data-inspect="connect" data-id="grid" title="How checks connect to the grid"><svg class="i" aria-hidden="true"><use href="#i-link"></use></svg><span class="rail-label">Connect a check</span></a>
@@ -106,6 +111,7 @@
       <section id="view-activity" class="view" aria-labelledby="activity-h1" hidden></section>
       <section id="view-sessions" class="view" aria-labelledby="sessions-h1" hidden></section>
       <section id="view-access" class="view" aria-labelledby="access-h1" hidden></section>
+      <section id="view-mfa" class="view" aria-labelledby="mfa-h1" hidden></section>
     </main>
 
     <aside class="inspector" id="inspector" aria-labelledby="insp-title" hidden>
@@ -127,6 +133,7 @@
     <a href="#/activity" data-nav-view="activity"><svg class="i" aria-hidden="true"><use href="#i-activity"></use></svg><span>Activity</span></a>
     <a href="#/sessions" data-nav-view="sessions"><svg class="i" aria-hidden="true"><use href="#i-sessions"></use></svg><span>Sessions</span><span class="nav-count mono" data-session-count hidden></span></a>
     <a href="#/access" data-nav-view="access"><svg class="i" aria-hidden="true"><use href="#i-key"></use></svg><span>Access</span></a>
+    <a href="#/mfa" data-nav-view="mfa"><svg class="i" aria-hidden="true"><use href="#i-shield"></use></svg><span>MFA</span></a>
   </nav>
 
   <div class="menu" id="account-menu" role="menu" aria-label="Account" hidden></div>
@@ -185,6 +192,65 @@
     </form>
   </dialog>
   <datalist id="node-names"></datalist>
+
+  <dialog id="add-mfa-dialog" class="sheet form-sheet" aria-labelledby="add-mfa-title">
+    <form id="add-mfa-form" novalidate autocomplete="off">
+      <h2 id="add-mfa-title">Add an MFA secret</h2>
+      <p class="sheet-sub">The Grid UI keeps the seed encrypted and only ever hands out codes: it can't be shown again, here or anywhere.</p>
+      <div class="field">
+        <label for="mfa-name">Name</label>
+        <input type="text" id="mfa-name" class="mono" maxlength="64" required pattern="[A-Za-z0-9._\-]{1,64}" autocomplete="off" autocapitalize="off" spellcheck="false"
+          placeholder="e.g. intranet-admin" aria-describedby="mfa-name-hint">
+        <p class="hint" id="mfa-name-hint">Checks ask for codes by this name: letters, digits, '.', '_' and '-'.</p>
+      </div>
+      <div class="field">
+        <label for="mfa-secret">Setup key or otpauth:// address</label>
+        <div class="secret-input">
+          <input type="text" id="mfa-secret" class="mono masked" required autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+            data-1p-ignore data-lpignore="true" data-bwignore
+            placeholder="Base32 key or otpauth://totp/…" aria-describedby="mfa-secret-hint">
+          <button type="button" class="icon-btn" id="mfa-secret-toggle" aria-pressed="false" aria-label="Show the secret" title="Show the secret"><svg class="i" aria-hidden="true"><use href="#i-eye"></use></svg></button>
+        </div>
+        <p class="hint" id="mfa-secret-hint">The key the site shows when you set up an authenticator app (often under “Can't scan the code?”), or the otpauth:// address its QR code holds.</p>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="mfa-issuer">Issuer <span class="optional">optional</span></label>
+          <input type="text" id="mfa-issuer" maxlength="128" autocomplete="off" placeholder="e.g. Intranet">
+        </div>
+        <div class="field">
+          <label for="mfa-account">Account <span class="optional">optional</span></label>
+          <input type="text" id="mfa-account" maxlength="255" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. checks@example.com">
+        </div>
+      </div>
+      <details class="advanced" id="mfa-advanced">
+        <summary><svg class="i" aria-hidden="true"><use href="#i-chevron"></use></svg>Advanced settings</summary>
+        <fieldset id="mfa-settings" aria-describedby="mfa-settings-hint">
+          <legend class="sr-only">Code settings</legend>
+          <p class="hint" id="mfa-settings-hint">Most sites use 6 digits every 30 s with SHA1. Change these only if the site says so.</p>
+          <div class="field-row three">
+            <div class="field">
+              <label for="mfa-digits">Digits</label>
+              <select id="mfa-digits"><option value="6" selected>6</option><option value="7">7</option><option value="8">8</option></select>
+            </div>
+            <div class="field">
+              <label for="mfa-period">Period</label>
+              <span class="days"><input type="number" id="mfa-period" min="10" max="300" step="1" value="30"> s</span>
+            </div>
+            <div class="field">
+              <label for="mfa-algorithm">Algorithm</label>
+              <select id="mfa-algorithm"><option value="SHA1" selected>SHA1</option><option value="SHA256">SHA256</option><option value="SHA512">SHA512</option></select>
+            </div>
+          </div>
+        </fieldset>
+      </details>
+      <p class="form-error" id="mfa-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" data-dismiss>Cancel</button>
+        <button type="submit" class="btn primary" id="mfa-submit">Add secret</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="tip" id="tip" role="tooltip" hidden></div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

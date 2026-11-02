@@ -1,0 +1,135 @@
+# The long proof-of-concept checks in full/poc, each run by main.py on a schedule like example_playwright:
+#   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.poc.yaml up -d
+# Each check holds one slot for about POC_DURATION_S (180 s) per run (poc_cross_browser takes a
+# Chromium, then a Firefox, then a WebKit slot), then sleeps POC_INTERVAL_S (600 s). Logs and failure
+# screenshots go to ./logs/<check>/. POC_GATEWAY_NODE pins them all to one node.
+# Stop them with the same -f list and `rm -sf <service>...`, or `down` for the whole stack.
+# Written for the bundled MySQL (docker-compose.mysql.yaml); with your own server set DB_* below instead.
+
+x-poc-check: &poc-check
+  image: playwright_orchestrator_web
+  # Built by the web service of docker-compose.yaml.
+  pull_policy: never
+  restart: unless-stopped
+  init: true
+  networks:
+    - playwright
+  environment: &poc-env
+    DB_HOST: mysql
+    DB_PORT: "3306"
+    DB_NAME: ${MYSQL_DATABASE:-orchestrator}
+    DB_USER: ${MYSQL_USER:-orchestrator}
+    DB_PASSWORD: ${MYSQL_PASSWORD:-orchestrator}
+    GATEWAY_URL: ${GATEWAY_URL:-ws://hub:4500}
+    GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:?set GATEWAY_CLIENT_TOKEN in .env (see .env.example)}
+    GATEWAY_NODE: ${POC_GATEWAY_NODE:-}
+    POC_DURATION_S: ${POC_DURATION_S:-180}
+  depends_on:
+    hub:
+      condition: service_started
+
+services:
+  poc_shop_journey:
+    <<: *poc-check
+    container_name: poc_shop_journey
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_shop_journey/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_shop_journey.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
+
+  poc_files_and_media:
+    <<: *poc-check
+    container_name: poc_files_and_media
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_files_and_media/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_files_and_media.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
+
+  poc_multi_context:
+    <<: *poc-check
+    container_name: poc_multi_context
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_multi_context/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_multi_context.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
+
+  poc_network_resilience:
+    <<: *poc-check
+    container_name: poc_network_resilience
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_network_resilience/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_network_resilience.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
+
+  poc_cross_browser:
+    <<: *poc-check
+    container_name: poc_cross_browser
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_cross_browser/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_cross_browser.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
+
+  poc_long_session:
+    <<: *poc-check
+    container_name: poc_long_session
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_long_session/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_long_session.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
+
+  # Sign-in with a password and an authenticator (TOTP) code. Every code comes from the Grid UI's MFA
+  # secret POC_TOTP_SECRET_NAME (default poc-intranet), asked for with GATEWAY_CLIENT_TOKEN. The fake site
+  # checks codes against its own copy of the enrolment, POC_TOTP_SEED (base32), which must be the seed
+  # stored in that secret; the check fails while it is unset. The password is made up per run unless
+  # POC_TOTP_PASSWORD is set.
+  poc_totp_login:
+    <<: *poc-check
+    container_name: poc_totp_login
+    environment:
+      <<: *poc-env
+      GRID_UI_URL: ${GRID_UI_URL:-http://grid_ui:4444}
+      POC_TOTP_SECRET_NAME: ${POC_TOTP_SECRET_NAME:-poc-intranet}
+      POC_TOTP_SEED: ${POC_TOTP_SEED:-}
+      POC_TOTP_PASSWORD: ${POC_TOTP_PASSWORD:-}
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_totp_login/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_totp_login.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
+
+  # Saved sign-in reuse. Signs in once to a fake app behind a Microsoft-style identity provider, keeps the
+  # browser state in the Grid UI (encrypted, the savedSignins table) and reuses it on later runs, so most
+  # runs skip the password and the MFA prompt. The MFA code comes from the Grid UI's secret
+  # POC_SIGNIN_SECRET_NAME (default poc-idp); the saved state is kept under POC_SIGNIN_NAME (default
+  # poc-idp-session). The fake IdP checks codes against POC_TOTP_SEED (base32), which must be that secret's
+  # seed; the check fails while it is unset. No other run may use the same POC_SIGNIN_NAME while this one
+  # runs: the rounds of two runs at once break each other's (full/poc/run_poc.sh uses poc-idp-session-manual).
+  poc_signin_reuse:
+    <<: *poc-check
+    container_name: poc_signin_reuse
+    environment:
+      <<: *poc-env
+      GRID_UI_URL: ${GRID_UI_URL:-http://grid_ui:4444}
+      POC_SIGNIN_SECRET_NAME: ${POC_SIGNIN_SECRET_NAME:-poc-idp}
+      POC_SIGNIN_NAME: ${POC_SIGNIN_NAME:-poc-idp-session}
+      POC_TOTP_SEED: ${POC_TOTP_SEED:-}
+      POC_SIGNIN_PASSWORD: ${POC_SIGNIN_PASSWORD:-}
+    volumes:
+      - ./full/poc/:/app/poc/
+      - ./logs/poc_signin_reuse/:/app/poc/logs/
+      - ./src/:/app/src
+      - ./main.py:/app/main.py
+    command: python3 /app/main.py --fil poc_signin_reuse.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}

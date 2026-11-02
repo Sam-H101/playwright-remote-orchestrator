@@ -634,11 +634,11 @@ select { padding-right: 4px; }
 .table tr[data-inspect] { cursor: pointer; }
 .table small { display: block; color: var(--text-3); font-size: 11px; }
 .empty { padding: 28px 20px; text-align: center; display: grid; gap: 8px; justify-items: center; color: var(--text-2); }
-.empty h2 { font-size: 15px; font-weight: 600; color: var(--text); }
+.empty h2, .empty h3 { font-size: 15px; font-weight: 600; color: var(--text); }
 .empty p { max-width: 560px; }
 .empty.compact { padding: 20px; }
 .empty-mark { width: 24px; height: 24px; color: var(--text-3); }
-#access-state .empty { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+#access-state .empty, #mfa-state .empty, #mfa-key .empty, #mfa-empty .empty, #signin-state .empty { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .empty.calm { padding: 40px 20px; }
 
 .sessions .cell-subject a { font-weight: 600; color: var(--text); }
@@ -691,7 +691,7 @@ select { padding-right: 4px; }
 .reveal-head { display: flex; gap: 12px; align-items: center; }
 .reveal-mark { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 6px; background: var(--accent-tint); color: var(--accent); flex: none; }
 .reveal-title { flex: 1; min-width: 0; }
-.reveal-title h2 { font-size: 15px; font-weight: 600; }
+.reveal-title h2, .reveal-title h3 { font-size: 15px; font-weight: 600; }
 .reveal-title p { color: var(--text-2); font-size: 12px; }
 .secret { display: flex; gap: 8px; align-items: center; padding: 8px 8px 8px 12px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--raised); }
 .secret code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; color: var(--text); }
@@ -712,6 +712,97 @@ select { padding-right: 4px; }
 .first-run h2 { font-size: 16px; }
 .first-run .hub-field { width: 100%; max-width: 520px; }
 .first-run-actions { display: flex; align-items: center; gap: 10px; }
+
+/* MFA secrets. */
+.mfa-secrets .mfa-name { display: block; font-size: 12.5px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.mfa-secrets .cell-settings { color: var(--text-2); white-space: nowrap; }
+.mfa-secrets .cell-last { color: var(--text-2); }
+.mfa-secrets .issued-to { color: var(--text); }
+.table .num-col { text-align: right; }
+.table td.num-col { font-family: var(--mono); font-size: 12px; }
+.mfa-secrets .cell-actions { text-align: right; width: 1%; white-space: nowrap; }
+.mfa-secrets .cell-actions .btn + .btn { margin-left: 4px; }
+.mfa-secrets tr.showing td, .mfa-secrets tbody tr.showing:hover td { background: var(--accent-tint); }
+.mfa-secrets tr.showing [data-show-code] { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }
+.mfa-live.used { border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); }
+.mfa-live.used .reveal-mark { background: var(--ok-tint); color: var(--ok); }
+.mfa-code-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 20px; padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--raised); }
+.mfa-code { font-size: 34px; font-weight: 600; line-height: 1; letter-spacing: .06em; color: var(--text); }
+.mfa-code .half + .half { margin-left: .4em; }
+.mfa-code.issued { color: var(--text-2); }
+.mfa-timer { display: grid; gap: 6px; flex: 1 1 160px; max-width: 280px; min-width: 120px; }
+.mfa-left { font-size: 12px; font-weight: 500; color: var(--text-2); }
+.mfa-bar { position: relative; display: block; height: 6px; border-radius: 3px; border: 1px solid var(--line-strong); background: var(--surface); overflow: hidden; }
+.mfa-bar-fill { position: absolute; inset: 0 auto 0 0; width: calc(var(--p, 1) * 100%); background: var(--accent); transition: width 250ms linear; }
+.mfa-bar.low .mfa-bar-fill { background: var(--warn); }
+.mfa-bar.waiting { background: repeating-linear-gradient(135deg, var(--raised) 0 4px, var(--surface) 4px 8px); }
+.mfa-actions { display: flex; gap: 8px; margin-left: auto; }
+.mfa-note { display: flex; gap: 8px; align-items: flex-start; color: var(--text-2); font-size: 12px; }
+.mfa-note .i { margin-top: 1px; }
+.mfa-live.used .mfa-note .i { color: var(--ok); }
+.mfa-note.warn .i { color: var(--warn); }
+.mfa-note strong { color: var(--text); font-weight: 600; }
+.mfa-lower { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.panel-head { display: flex; align-items: baseline; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.panel-head h2, .panel-head h3 { font-size: 13px; font-weight: 600; }
+.panel-sub { color: var(--text-3); font-size: 12px; }
+.mfa-log-scroll { max-height: 380px; overflow: auto; }
+.mfa-issues th { position: sticky; top: 0; z-index: 1; }
+.mfa-issues td { height: 32px; }
+.mfa-issues .cell-when { width: 1%; white-space: nowrap; color: var(--text-3); }
+.mfa-issues .cell-label { color: var(--text-2); }
+.mfa-issues .cell-secret code { white-space: nowrap; }
+.mfa-use { padding: 12px 14px 14px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; align-content: start; }
+.mfa-use h3 { font-size: 13px; font-weight: 600; }
+.env-list { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; margin: 0; font-size: 12px; }
+.env-list dt { color: var(--text); }
+.env-list dd { margin: 0; color: var(--text-2); }
+.env-list code { color: var(--text); }
+
+/* MFA & sign-ins: the page's two parts, each under its own heading. Empty slots take no gap. */
+#view-mfa > div:empty, .mfa-part > div:empty { display: none; }
+.mfa-part { display: grid; gap: 14px; align-content: start; }
+.signin-part { margin-top: 18px; }
+.part-head { display: grid; gap: 4px; }
+.part-head h2 { font-size: 16px; font-weight: 600; scroll-margin-top: calc(var(--top) + 16px); }
+.part-head h2:focus { outline: none; }
+.part-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+
+/* Saved sign-ins. */
+.signins .signin-name { display: block; font-size: 12.5px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.signins .signin-domains { overflow-wrap: break-word; }
+.signins .stack { display: grid; gap: 1px; justify-items: start; }
+.signins .cell-saved, .signins .cell-runs, .signins .cell-asked, .signins .cell-expires { color: var(--text-2); }
+.signins .cell-expires, .signins .count { white-space: nowrap; }
+.signins .who { color: var(--text); }
+.signins small .who { color: var(--text-2); }
+.signins .cell-actions { text-align: right; width: 1%; white-space: nowrap; }
+.signins .cell-actions .btn + .btn { margin-left: 4px; }
+.signins tbody tr { scroll-margin: calc(var(--top) + 16px) 0 16px; }
+.tag.live { gap: 5px; color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); background: var(--accent-tint); }
+.tag.live .spinner { width: 9px; height: 9px; border-width: 1.5px; }
+.signin-intro { padding: 16px; display: grid; gap: 16px; }
+.signin-intro-head { display: flex; gap: 12px; align-items: center; }
+.signin-intro-head h3 { font-size: 15px; font-weight: 600; }
+.signin-intro-head p { color: var(--text-2); }
+.signin-how-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); gap: 16px 24px; align-items: start; }
+.signin-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; counter-reset: step; }
+.signin-steps li { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 10px; color: var(--text-2); counter-increment: step; }
+.signin-steps li::before {
+  content: counter(step); display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--accent-tint); color: var(--accent); font: 600 11px/1 var(--mono);
+}
+.signin-steps strong { color: var(--text); font-weight: 600; }
+.signin-code { display: grid; gap: 8px; min-width: 0; }
+.signin-how > summary {
+  display: flex; align-items: center; gap: 6px; padding: 10px 12px; cursor: pointer; list-style: none;
+  font-size: 13px; font-weight: 600; color: var(--text);
+}
+.signin-how > summary::-webkit-details-marker { display: none; }
+.signin-how > summary .i { width: 12px; height: 12px; color: var(--text-3); transition: transform var(--ease); }
+.signin-how[open] > summary { border-bottom: 1px solid var(--line); }
+.signin-how[open] > summary .i { transform: rotate(90deg); }
+.signin-how-body { padding: 14px 12px; }
 
 /* ---- dialogs, menus, toast, tooltip, palette ----------------------------------------------------------- */
 dialog { color: var(--text); }
@@ -738,6 +829,24 @@ dialog::backdrop { background: var(--backdrop); }
 .signin-sheet.anchored::backdrop { background: transparent; }
 .form-sheet { width: min(500px, calc(100vw - 32px)); }
 .form-sheet input[type=text] { width: 100%; }
+.form-sheet .field-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }
+.form-sheet .field-row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.form-sheet .field-row select { width: 100%; }
+.form-sheet .field-row .days input { width: 72px; }
+.secret-input { display: flex; gap: 4px; align-items: center; }
+.form-sheet .secret-input input { flex: 1; width: auto; }
+/* The seed field is a text field (password managers would save a password field as this site's password), dotted like one. */
+.secret-input input.masked { -webkit-text-security: disc; }
+.secret-input .icon-btn { width: 30px; height: 30px; }
+.advanced { margin: 0 0 14px; }
+.advanced summary { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-2); list-style: none; }
+.advanced summary::-webkit-details-marker { display: none; }
+.advanced summary .i { width: 12px; height: 12px; transition: transform var(--ease); }
+.advanced[open] summary .i { transform: rotate(90deg); }
+.advanced fieldset { margin: 10px 0 0; padding: 0; border: 0; min-width: 0; display: grid; gap: 10px; }
+.advanced fieldset .field { margin: 0; }
+.advanced fieldset:disabled .field { color: var(--text-3); }
+.advanced fieldset:disabled select, .advanced fieldset:disabled input { color: var(--text-3); background: var(--raised); }
 .form-sheet .sheet-sub { margin-bottom: 18px; }
 .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .choice { display: flex; gap: 8px; align-items: flex-start; padding: 10px; border: 1px solid var(--line-strong); border-radius: 4px; cursor: pointer; }
@@ -816,7 +925,7 @@ dialog::backdrop { background: var(--backdrop); }
   .rail { display: none; }
   .main { padding: 12px 12px calc(76px + env(safe-area-inset-bottom)); }
   .tabbar {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 45; display: grid; grid-template-columns: repeat(4, 1fr);
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 45; display: grid; grid-template-columns: repeat(5, 1fr);
     height: calc(56px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom);
     border-top: 1px solid var(--line); background: var(--surface);
   }
@@ -893,6 +1002,30 @@ dialog::backdrop { background: var(--backdrop); }
   .legend-pop { position: fixed; left: 12px; right: 12px; top: auto; width: auto; }
   .tokens .cell-status, .tokens .cell-actions { display: inline-block; margin-top: 6px; }
   .tokens .cell-actions { float: right; width: auto; }
+  .mfa-secrets .cell-secret small, .signins .cell-signin small { margin-bottom: 4px; }
+  .mfa-secrets .cell-actions, .signins .cell-actions { display: flex; gap: 6px; margin-top: 6px; width: auto; }
+  .mfa-secrets .cell-actions .btn + .btn, .signins .cell-actions .btn + .btn { margin-left: auto; }
+  .signins td[data-label] { align-items: start; }
+  .signins td[data-label]::before { padding-top: 1px; }
+  .signin-how-grid { grid-template-columns: minmax(0, 1fr); }
+  .signin-intro { padding: 14px 12px; }
+  .signin-intro-head { align-items: flex-start; }
+  .mfa-lower { grid-template-columns: minmax(0, 1fr); }
+  .mfa-log-scroll { max-height: none; }
+  .table td.num-col { text-align: left; font-family: var(--sans); font-size: 13px; }
+  .mfa-issues tr { display: grid !important; grid-template-columns: 64px auto minmax(0, 1fr); gap: 2px 6px; align-items: baseline; }
+  .mfa-issues td[data-label] { display: block; }
+  .mfa-issues td[data-label]::before { content: none; }
+  .mfa-issues .cell-when { grid-row: 1 / span 2; width: auto; }
+  .mfa-issues .cell-secret { grid-column: 2 / 4; }
+  .mfa-issues .cell-label { overflow-wrap: anywhere; }
+  .mfa-issues td.cell-label::before { content: "·"; margin-right: 6px; color: var(--text-3); }
+  .mfa-code { font-size: 30px; }
+  .mfa-timer { max-width: none; }
+  .mfa-actions { margin-left: 0; flex-basis: 100%; }
+  .mfa-actions .btn { flex: 1; height: 36px; }
+  .form-sheet .field-row { grid-template-columns: minmax(0, 1fr); }
+  .form-sheet .field-row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .activity tr { display: grid !important; grid-template-columns: 64px 14px minmax(0, 1fr) auto; gap: 2px 8px; align-items: center; }
   .activity td { padding: 0; }
   .activity .cell-detail { grid-column: 3 / 5; }
@@ -915,6 +1048,8 @@ dialog::backdrop { background: var(--backdrop); }
   .capacity { display: none; }
   .jump { width: 220px; }
   .grid-name { display: none; }
+  .mfa-lower { grid-template-columns: minmax(0, 1fr); }
+  .signin-how-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* Reduced motion: no flash ring or sliding; the changed halo stays as a static marker. */

@@ -40,10 +40,10 @@ test('node names', () => {
   assert.equal(P.canonicalName('Runner-A.Example'), 'runner-a.example');
 });
 
-test('splitSchema yields the five CREATE TABLE statements of src/schema.sql', () => {
+test('splitSchema yields the eight CREATE TABLE statements of src/schema.sql', () => {
   const statements = splitSchema(fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'schema.sql'), 'utf8'));
-  assert.equal(statements.length, 5);
-  assert.deepEqual(statements.map((s) => /CREATE TABLE IF NOT EXISTS (\w+)/.exec(s)[1]), ['portStatus', 'portUsage', 'nodes', 'accessTokens', 'hubs']);
+  assert.equal(statements.length, 8);
+  assert.deepEqual(statements.map((s) => /CREATE TABLE IF NOT EXISTS (\w+)/.exec(s)[1]), ['portStatus', 'portUsage', 'nodes', 'accessTokens', 'hubs', 'mfaSecrets', 'mfaIssues', 'savedSignins']);
   assert.ok(statements.every((s) => !s.includes('--') && !/;\s*$/.test(s)));
   assert.equal(splitSchema('-- c\nSELECT 1\r\n;\r\n-- only a comment\r\n;\r\n').length, 1);
   assert.match(statements[2], /\bephemeral TINYINT NOT NULL DEFAULT 0\b/);
