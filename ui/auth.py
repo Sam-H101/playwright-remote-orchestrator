@@ -164,6 +164,45 @@ def admin_required(refuse_when_unconfigured=False):
     return decorate
 
 
+# ---- checks -------------------------------------------------------------------------
+#
+# Checks ask for MFA codes and saved sign-ins with the client token they already connect to the hub
+# with, sent as "Authorization: Bearer <token>": a managed client token from the Access page, or the
+# hub's bootstrap GATEWAY_CLIENT_TOKEN when the UI is given its value. Wrong tokens count towards the
+# same guessing limit as wrong admin tokens.
+
+# A bootstrap value shorter than this is ignored: older compose files gave the UI the word "set" in place
+# of the token, and that must never work as one.
+MIN_BOOTSTRAP_TOKEN_LENGTH = 16
+
+
+def _bearer():
+    header = request.headers.get("Authorization", "")
+    scheme, _, token = header.partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+def check_principal(lookup):
+    """The check a request comes from, judged by its client token, or a 401/429 abort.
+
+    lookup(token) -> the managed client token's name or None (store.client_token_name)."""
+    token = _bearer()
+    if not token:
+        abort(make_response(jsonify(error="Send the check's client token as 'Authorization: Bearer <token>'.",
+                                    client_token_required=True), 401))
+    wait = retry_after()
+    if wait:
+        _too_many(wait)
+    bootstrap = os.environ.get("GATEWAY_CLIENT_TOKEN", "")
+    if len(bootstrap) >= MIN_BOOTSTRAP_TOKEN_LENGTH and hmac.compare_digest(token.encode(), bootstrap.encode()):
+        return Principal("GATEWAY_CLIENT_TOKEN", "client-bootstrap")
+    name = lookup(token)
+    if name is not None:
+        return Principal("client token '{}'".format(name), "client-token")
+    _note_failure()
+    abort(make_response(jsonify(error="The client token is wrong, revoked or expired.", client_token_required=True), 401))
+
+
 def session_info():
     """What the page needs to present sign-in state. Validates the credentials sent, if any."""
     principal = current_principal()

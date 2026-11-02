@@ -151,7 +151,7 @@ def test_forget_node(db):
 def test_schema_file_splits_into_statements():
     with open(SCHEMA_SQL) as f:
         statements = [s for s in store._schema_statements(f.read()) if "CREATE TABLE" in s]
-    assert len(statements) == 5
+    assert len(statements) == 8
 
 
 def test_api(db, monkeypatch):
@@ -193,7 +193,8 @@ def test_ensure_schema_runs_each_statement_once_on_mysql(monkeypatch):
     monkeypatch.setattr(store, "_session", contextlib.contextmanager(lambda: (yield Cursor())))
     store.ensure_schema()
     store.ensure_schema()
-    assert [s.split("(")[0].split()[-1] for s in executed] == ["portStatus", "portUsage", "nodes", "accessTokens", "hubs"]
+    assert [s.split("(")[0].split()[-1] for s in executed] == ["portStatus", "portUsage", "nodes", "accessTokens", "hubs",
+                                                                     "mfaSecrets", "mfaIssues", "savedSignins"]
     assert not any(line.strip().startswith("--") for s in executed for line in s.splitlines())
 
 

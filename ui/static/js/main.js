@@ -17,6 +17,7 @@ import { createOverview, attentionItems, verdict } from "./views/overview.js";
 import { createSessions } from "./views/sessions.js";
 import { createActivity } from "./views/activity.js";
 import { createAccess } from "./views/access.js";
+import { createMfa } from "./views/mfa.js";
 
 const $ = (id) => document.getElementById(id);
 const root = document.documentElement;
@@ -31,6 +32,7 @@ const views = {
   activity: createActivity($("view-activity")),
   sessions: createSessions($("view-sessions")),
   access: createAccess($("view-access")),
+  mfa: createMfa($("view-mfa")),
 };
 const inspector = createInspector({ onClose: () => closeInspector() });
 let route = router.state();
@@ -57,7 +59,8 @@ function showView(view) {
     if (a.dataset.navView === view) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
   });
   if (view === "access") views.access.show(); else views.access.hide();
-  document.title = { overview: "Playwright Grid", activity: "Activity · Playwright Grid", sessions: "Sessions · Playwright Grid", access: "Access · Playwright Grid" }[view];
+  if (view === "mfa") views.mfa.show(); else views.mfa.hide();
+  document.title = { overview: "Playwright Grid", activity: "Activity · Playwright Grid", sessions: "Sessions · Playwright Grid", access: "Access · Playwright Grid", mfa: "MFA & sign-ins · Playwright Grid" }[view];
 }
 
 router.onRoute((r) => {
@@ -315,12 +318,17 @@ syncTheme();
 const palette = createPalette({
   items() {
     const d = app.data(), out = [];
-    const view = (id, label, hash, ic) => out.push({ id: "view-" + id, group: "View", label, icon: ic, run: () => router.go(hash) });
+    const view = (id, label, hash, ic, keywords) => out.push({ id: "view-" + id, group: "View", label, icon: ic, keywords, run: () => router.go(hash) });
+    // Saved sign-ins sit below the MFA secrets: the page scrolls to the one asked for once the route has opened it.
+    const toSignins = (id) => { views.mfa.showSignin(id); router.go("#/mfa"); };
     view("overview", "Overview", "#/overview", "i-grid");
     view("activity", "Activity", "#/activity", "i-activity");
     view("sessions", "Sessions", "#/sessions", "i-sessions");
     view("stale", "Stale sessions", "#/sessions?filter=stale", "i-sessions");
     view("access", "Access tokens", "#/access", "i-key");
+    view("mfa", "MFA & sign-ins", "#/mfa", "i-shield", "mfa totp codes secrets");
+    out.push({ id: "view-signins", group: "View", label: "Saved sign-ins", icon: "i-login", keywords: "signin reuse cookies storage state session",
+      run: () => toSignins(null) });
     out.push({ id: "connect", group: "View", label: "Connect to the grid", icon: "i-link", keywords: "connect hub address endpoint snippet token",
       run: () => app.inspect("connect", "grid", null) });
     out.push({ id: "help", group: "View", label: "Keyboard shortcuts", icon: "i-keyboard", run: () => $("shortcuts-dialog").showModal() });
@@ -343,6 +351,15 @@ const palette = createPalette({
     for (const t of views.access.tokens()) {
       out.push({ id: "token-" + t.id, group: "Tokens", label: t.name, icon: "i-key", keywords: t.prefix + " " + (t.nodeName || "") + " " + t.kind,
         meta: t.kind + " · " + t.status, run: () => router.go("#/access") });
+    }
+    for (const s of views.mfa.secrets()) {
+      out.push({ id: "mfa-" + s.id, group: "MFA secrets", label: s.name, mono: true, icon: "i-shield", keywords: "mfa totp " + (s.issuer || "") + " " + (s.account || ""),
+        meta: [s.issuer, s.account].filter(Boolean).join(" · "), run: () => router.go("#/mfa") });
+    }
+    for (const s of views.mfa.signins()) {
+      const meta = s.leaseForS != null ? "signing in now" : !s.saved ? "not saved" : s.expired ? "expired" : "saved";
+      out.push({ id: "signin-" + s.id, group: "Saved sign-ins", label: s.name, mono: true, icon: "i-login", keywords: "signin sign-in cookies " + s.domains.join(" "),
+        meta, run: () => toSignins(s.id) });
     }
     return out;
   },
@@ -469,6 +486,11 @@ function tick() {
     setText(el, el.hasAttribute("data-short") ? age(s) : ago(s));
   });
   document.querySelectorAll("[data-dur]").forEach((el) => { if (el.dataset.dur) setText(el, duration(since(el.dataset.dur))); });
+  // A moment ahead ("in 29d") that reads as an age once it has passed ("2d ago").
+  document.querySelectorAll("[data-until]").forEach((el) => {
+    const s = since(el.dataset.until);
+    if (s != null) setText(el, s < 0 ? inTime(-s) : ago(s));
+  });
   document.querySelectorAll("[data-retry]").forEach((el) => {
     const left = (parseTime(el.dataset.retry) - now) / 1000;
     const text = left > 0 ? (el.hasAttribute("data-short") ? inTime(left) : "retry " + inTime(left)) : (el.hasAttribute("data-short") ? "due now" : "retry due");
@@ -496,7 +518,7 @@ function tick() {
   freshness();
 }
 setInterval(tick, 1000);
-app.tick = tick; // views that render on their own schedule (Access) fill their ages at once
+app.tick = tick; // views that render on their own schedule (Access, MFA) fill their ages at once
 
 // ---- start -----------------------------------------------------------------------------------
 if (prefs.get("gridDensity", "") === "compact") root.dataset.density = "compact";
