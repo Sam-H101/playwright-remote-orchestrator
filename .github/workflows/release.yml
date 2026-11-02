@@ -1,0 +1,146 @@
+name: Release
+
+# Every merge to master is a release: the next version is tagged vX.Y.Z, a GitHub Release lists the
+# pull requests merged since the last one, and the images are published as :X.Y.Z, :X.Y and :latest
+# (docker-images.yml, called from here: a tag made with the workflow token starts no workflow itself).
+#
+# A pull request's label sets the version: release:minor or release:major, and otherwise a patch.
+# release:skip (docs, CI) makes no release while nothing else is waiting to go out; what it changed
+# goes out with the next one. On each pull request into master the "next version" check's summary
+# says what merging it would release, as of its last push or label change.
+#
+# A run releases master as it is when the run starts, not only the merge that started it: runs can
+# wait, be replaced by a later one or start out of order, and whatever is on master and unreleased
+# goes out together. A commit that a release already contains is never released again.
+#
+# If a release's images fail, use "Re-run failed jobs" (or "Re-run all jobs" while master hasn't
+# moved on). :latest only moves to the newest release, and :X.Y to the newest of that X.Y, so
+# re-running an older release can't take them back.
+#
+# The runner binaries are still released by pushing a pwrunner/vX.Y.Z tag (runner-go.yml). Both
+# kinds of release share one line of numbers (.github/scripts/next-version.sh).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+# Releases go one at a time. On a pull request, a newer check replaces an older one.
+concurrency:
+  group: release-${{ github.event_name == 'push' && 'master' || github.event.pull_request.number }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # -eo pipefail: a failure anywhere in a pipeline fails the step
+
+jobs:
+  version:
+    name: next version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      previous: ${{ steps.next.outputs.previous }}
+      sha: ${{ steps.next.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # every tag and branch, and the merges since the last release
+
+      - name: work it out
+        id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          MERGES: ${{ runner.temp }}/merges.md
+        run: |
+          if [ "$EVENT" = push ]; then SHA=$(git rev-parse "origin/$GITHUB_REF_NAME"); else SHA=$BASE; fi
+          export SHA
+          bash .github/scripts/next-version.sh > "$RUNNER_TEMP/next.txt"
+          grep -q '^why=' "$RUNNER_TEMP/next.txt" # an answer, or the step fails
+          { cat "$RUNNER_TEMP/next.txt"; echo "sha=$SHA"; } >> "$GITHUB_OUTPUT"
+          version=$(sed -n 's/^version=//p' "$RUNNER_TEMP/next.txt")
+          why=$(sed -n 's/^why=//p' "$RUNNER_TEMP/next.txt")
+          if [ "$EVENT" = pull_request ]; then lead="Merging this releases"; else lead="Releasing ${SHA:0:7} as"; fi
+          {
+            if [ -n "$version" ]; then echo "$lead **v$version**: $why."; else echo "No release: $why."; fi
+            if [ -s "$MERGES" ]; then echo; echo "Counted:"; cat "$MERGES"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/next.txt"
+
+  script-tests:
+    name: release script tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/next-version.test.sh
+
+  release:
+    name: tag and release
+    needs: version
+    if: github.event_name == 'push' && needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the tags as they are now: this job may be a re-run of an old one
+
+      - name: v${{ needs.version.outputs.version }}
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PREVIOUS: ${{ needs.version.outputs.previous }}
+          SHA: ${{ needs.version.outputs.sha }}
+        run: |
+          tag="v$VERSION"
+          skip() { echo "Not releasing $tag: $1." >> "$GITHUB_STEP_SUMMARY"; echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          # Re-running only this job reuses the version worked out the first time, so check the tags
+          # as they are now.
+          at=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)
+          if [ -n "$at" ] && [ "$at" != "$SHA" ]; then skip "it went out from ${at:0:7}, not ${SHA:0:7}"; fi
+          if [ -z "$at" ]; then
+            later=$(git tag --contains "$SHA" | grep -E '^(pwrunner/)?v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
+            if [ -n "$later" ]; then skip "${SHA:0:7} went out in $later"; fi
+            newest=$(git tag -l | grep -E '^(pwrunner/)?v[0-9]+\.[0-9]+\.[0-9]+$' | sed -E 's#^(pwrunner/)?v##' | sort -V | tail -n 1 || true)
+            top=$(printf '%s\n%s\n' "$newest" "$VERSION" | sed '/^$/d' | sort -V | tail -n 1)
+            if [ "$top" != "$VERSION" ] || [ "$newest" = "$VERSION" ]; then
+              echo "::error::$tag isn't above the newest release, $newest. Re-run all jobs to work the version out again."
+              exit 1
+            fi
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$tag is released already; its images are published again." >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "$tag" --latest \
+              --generate-notes ${PREVIOUS:+--notes-start-tag "$PREVIOUS"}
+            echo "Released [$tag]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  images:
+    name: images
+    needs: [version, release]
+    if: needs.release.outputs.publish == 'true'
+    uses: ./.github/workflows/docker-images.yml
+    with:
+      ref: refs/tags/v${{ needs.version.outputs.version }} # what the release is, whatever started this run
+      version: ${{ needs.version.outputs.version }}
+    permissions:
+      contents: read
+      packages: write

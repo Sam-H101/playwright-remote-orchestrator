@@ -122,13 +122,21 @@ jobs:
           path: dist
       - name: create the release
         working-directory: dist
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           sha256sum -c SHA256SUMS.txt
+          # Latest only if it's the newest release: the vX.Y.Z releases release.yml makes on every merge
+          # share these numbers, and one may have gone out while this built.
+          newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" --jq '.[].ref' | sed -E 's#^refs/tags/##' \
+            | { grep -E '^(pwrunner/)?v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed -E 's#^(pwrunner/)?v##' | sort -V | tail -n 1)
+          top=$(printf '%s\n%s\n' "$newest" "$VERSION" | sed '/^$/d' | sort -V | tail -n 1)
           # Unsigned: there is no code-signing certificate yet. With one, sign the .exe files here
           # (signtool sign /fd sha256 /tr <timestamp url> /td sha256 /f <cert> ...) and regenerate SHA256SUMS.txt.
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "pwrunner ${{ needs.build.outputs.version }}" \
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "pwrunner $VERSION" \
+            --latest="$([ "$top" = "$VERSION" ] && echo true || echo false)" \
             --notes "Windows runner host for the Playwright gateway. Verify downloads against SHA256SUMS.txt." *
 
   contract:

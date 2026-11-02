@@ -48,11 +48,16 @@ free port (see the plan, §4).
 
 ## Release
 
-Releases are cut from tags `pwrunner/v<MAJOR.MINOR.PATCH>`:
+Releases are cut from tags `pwrunner/v<MAJOR.MINOR.PATCH>`, pushed by hand:
 
 ```powershell
-git tag pwrunner/v1.1.0 ; git push origin pwrunner/v1.1.0
+git tag pwrunner/v1.3.0 ; git push origin pwrunner/v1.3.0
 ```
+
+Use the next version number nobody has: the `vX.Y.Z` releases that every merge to master makes
+(`.github/workflows/release.yml`) share the same numbers, and a `pwrunner/v*` tag also publishes the
+Docker images as that version. If it's the newest release, it also gets `:latest`. The next automatic release
+counts on from it.
 
 `.github/workflows/runner-go.yml` then builds the embedded amd64/arm64 exes, the slim exe, the two Linux
 builds, `pwrunner-runtime-<v>-windows-amd64.zip` (for `install --offline-dir`) and `SHA256SUMS.txt`, and
