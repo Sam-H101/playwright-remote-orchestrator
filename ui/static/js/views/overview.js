@@ -86,6 +86,53 @@ function sentence(data, items) {
   return (parts.length ? parts.join(", ") + ". " : "") + cap + " · " + plural(t.nodes, "node");
 }
 
+// The summary above "Needs you": where the slots are, and six counts. Slot problems are counted by
+// slot state, as "Needs you" lists them, so the two never disagree.
+export function summary(data) {
+  const t = data.totals;
+  const states = { failing: 0, unhealthy: 0 };
+  for (const n of data.nodes || []) for (const s of n.slots) if (s.state in states) states[s.state]++;
+  const pct = (n) => (t.slots ? Math.round((100 * n) / t.slots) : 0);
+  const problems = states.failing + states.unhealthy;
+  const kinds = [states.failing && states.failing + " failing", states.unhealthy && states.unhealthy + " unhealthy"].filter(Boolean);
+  return {
+    // Idle but not taking runs: on an offline node, not answering health checks, or cooling down.
+    busy: t.busy, free: t.available, out: Math.max(0, t.slots - t.busy - t.available), slots: t.slots, pct: pct(t.busy),
+    // tone marks the sub line; hot also colours the number, for counts that are themselves the problem.
+    tiles: {
+      nodes: { value: t.nodes, sub: t.offline ? t.offline + " offline" : "none offline", tone: t.offline ? "warn" : "" },
+      slots: { value: t.slots, sub: "across " + plural(t.nodes, "node") },
+      sessions: { value: (data.sessions || []).length, sub: pct(t.busy) + "% utilization" },
+      free: { value: t.available, sub: pct(t.available) + "% available", tone: t.available ? "" : "warn", hot: !t.available },
+      problems: { value: problems, sub: kinds.join(" · ") || "all slots healthy", tone: states.failing ? "bad" : problems ? "warn" : "", hot: problems > 0 },
+      stale: { value: t.stale, sub: t.stale ? "held too long or hub gone" : "none abandoned", tone: t.stale ? "warn" : "", hot: t.stale > 0 },
+    },
+  };
+}
+
+const TILES = [
+  { key: "nodes", label: "Nodes", icon: "i-server" },
+  { key: "slots", label: "Total slots", icon: "i-grid" },
+  { key: "sessions", label: "Sessions", icon: "i-sessions", href: "#/sessions" },
+  { key: "free", label: "Free slots", icon: "i-check" },
+  { key: "problems", label: "Slot problems", icon: "i-alert" },
+  { key: "stale", label: "Stale sessions", icon: "i-clock", href: "#/sessions?filter=stale" },
+];
+
+function tileShell(t) {
+  const inner = html`<span class="stat-label">${t.label}${icon(t.icon)}</span><span class="stat-value" data-v></span><span class="stat-sub" data-s></span>`;
+  return t.href ? html`<a class="panel stat" href="${t.href}" data-stat="${t.key}">${inner}</a>`
+    : html`<div class="panel stat" data-stat="${t.key}">${inner}</div>`;
+}
+
+function utilRow(n) {
+  const off = n.kind === "gateway" && !n.online;
+  return html`<li class="util-row" data-key="${n.host}">
+    <a class="mono util-host" href="#/node/${encodeURIComponent(n.host)}" data-inspect="node" data-id="${n.host}" title="${n.host}">${n.host}</a>
+    <span class="util-bar${off ? " off" : ""}" data-meter="${off || !n.total ? 0 : n.busy / n.total}" aria-hidden="true"><span class="util-fill"></span></span>
+    <span class="util-n mono">${off ? "offline" : n.busy + "/" + n.total}</span></li>`;
+}
+
 function attentionRow(it) {
   const [type, id] = it.inspect;
   return html`<li class="att-row t-${it.tone}" data-key="${it.key}" data-fk="att-${it.key}" data-jk tabindex="-1" data-inspect="${type}" data-id="${id}">
@@ -108,6 +155,31 @@ export function createOverview(section) {
       <p class="verdict-sub" id="verdict-sub"></p>
     </header>
     <div id="ov-error"></div>
+    <section class="summary" id="summary" aria-labelledby="cap-title" hidden>
+      <div class="summary-grid">
+        <div class="panel cap-card">
+          <h2 class="section-label cap-label" id="cap-title">Grid capacity</h2>
+          <div class="donut-wrap">
+            <svg class="donut" viewBox="0 0 42 42" aria-hidden="true" focusable="false">
+              <circle class="d-free" cx="21" cy="21" r="17"></circle>
+              <circle class="d-busy" cx="21" cy="21" r="17" pathLength="100" stroke-dasharray="0 100"></circle>
+              <circle class="d-out" cx="21" cy="21" r="17" pathLength="100" stroke-dasharray="0 100"></circle>
+            </svg>
+            <p class="donut-center"><span class="donut-pct" id="cap-pct"></span><span class="donut-sub" id="cap-sub"></span></p>
+          </div>
+          <dl class="cap-counts">
+            <div class="cap-count"><dt><i class="sw sw-busy" aria-hidden="true"></i>In use</dt><dd id="cap-busy"></dd></div>
+            <div class="cap-count"><dt><i class="sw sw-free" aria-hidden="true"></i>Free</dt><dd id="cap-free"></dd></div>
+            <div class="cap-count"><dt><i class="sw sw-out" aria-hidden="true"></i>Unavailable</dt><dd id="cap-out"></dd></div>
+          </dl>
+          <div class="cap-util">
+            <h3 class="util-title">Utilization by node</h3>
+            <ul class="util-list" id="util-list"></ul>
+          </div>
+        </div>
+        ${TILES.map(tileShell)}
+      </div>
+    </section>
     <section class="attention" id="attention" tabindex="-1" aria-labelledby="att-title">
       <h2 class="section-label" id="att-title">Needs you <span class="count mono" id="att-count"></span></h2>
       <ul class="att-list" id="att-list"></ul>
@@ -171,6 +243,7 @@ export function createOverview(section) {
     const box = section.querySelector("#first-run");
     const empty = !data || !data.db.initialised || !data.totals.slots;
     box.hidden = !empty || !data;
+    section.querySelector("#summary").hidden = empty;
     section.querySelector("#runs").hidden = empty;
     section.querySelector("#slots").hidden = empty;
     section.querySelector("#attention").hidden = empty || !data;
@@ -236,6 +309,33 @@ export function createOverview(section) {
     });
   });
 
+  const utilList = section.querySelector("#util-list");
+  function renderSummary(data) {
+    if (!data.totals.slots) return;
+    const s = summary(data);
+    const seg = (cls, start, len) => {
+      const el = section.querySelector(".donut ." + cls);
+      el.setAttribute("stroke-dasharray", len + " " + (100 - len));
+      el.setAttribute("stroke-dashoffset", String(-start));
+    };
+    seg("d-busy", 0, (100 * s.busy) / s.slots);
+    seg("d-out", (100 * s.busy) / s.slots, (100 * s.out) / s.slots);
+    setText(section.querySelector("#cap-pct"), s.pct + "%");
+    setHTML(section.querySelector("#cap-sub"), html`<span>${s.busy} of ${s.slots}</span> <span>in use</span>`);
+    setText(section.querySelector("#cap-busy"), s.busy);
+    setText(section.querySelector("#cap-free"), s.free);
+    setText(section.querySelector("#cap-out"), s.out);
+    patchList(utilList, data.nodes, (n) => n.host, utilRow);
+    utilList.querySelectorAll("[data-meter]").forEach((m) => m.style.setProperty("--p", m.dataset.meter));
+    for (const [key, t] of Object.entries(s.tiles)) {
+      const el = section.querySelector('[data-stat="' + key + '"]');
+      el.classList.toggle("t-warn", !!t.hot && t.tone === "warn");
+      el.classList.toggle("t-bad", !!t.hot && t.tone === "bad");
+      setText(el.querySelector("[data-v]"), t.value);
+      setHTML(el.querySelector("[data-s]"), html`${t.tone ? html`<span class="glyph g-${t.tone}" aria-hidden="true"></span>` : ""}${t.sub}`);
+    }
+  }
+
   function update(msg) {
     const data = msg.data, live = msg.live;
     const items = attentionItems(data);
@@ -247,6 +347,7 @@ export function createOverview(section) {
     renderError(live);
     renderFirstRun(data);
     if (!data) return v;
+    renderSummary(data);
     setText(section.querySelector("#att-count"), items.length ? String(items.length) : "");
     const clear = section.querySelector("#att-clear");
     clear.hidden = items.length > 0;

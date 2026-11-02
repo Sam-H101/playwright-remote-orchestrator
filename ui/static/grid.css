@@ -375,6 +375,74 @@ select { padding-right: 4px; }
 .section-label .count { color: var(--text-3); font-weight: 500; }
 .panel { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 
+/* Summary: the capacity card spans both rows of the six count tiles; narrower, it goes on top. */
+.summary { container-type: inline-size; }
+.summary-grid { display: grid; grid-template-columns: minmax(0, 2.3fr) repeat(3, minmax(0, 1fr)); gap: 10px; }
+.cap-card {
+  --seg-busy: var(--accent); --seg-free: color-mix(in srgb, var(--ok) 35%, var(--surface)); --seg-out: var(--warn);
+  grid-row: span 2; display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "label label" "donut counts" "donut util";
+  gap: 8px 20px; align-items: start; padding: 10px 14px 12px;
+}
+.cap-label { grid-area: label; }
+.donut-wrap { grid-area: donut; position: relative; width: 128px; height: 128px; align-self: center; }
+.donut { display: block; width: 100%; height: 100%; transform: rotate(-90deg); }
+.donut circle { fill: none; stroke-width: 5; }
+.donut .d-free { stroke: var(--seg-free); }
+.donut .d-busy { stroke: var(--seg-busy); }
+.donut .d-out { stroke: var(--seg-out); }
+/* Inset to fit the hole (29/42 of the width): a long count wraps between "N of M" and "in use". */
+.donut-center { position: absolute; inset: 17%; display: grid; place-content: center; justify-items: center; text-align: center; }
+.donut-pct { font-size: 24px; font-weight: 600; line-height: 1.15; letter-spacing: -.01em; }
+.donut-sub { color: var(--text-3); font-size: 12px; line-height: 1.3; }
+.donut-sub span { white-space: nowrap; }
+.cap-counts {
+  grid-area: counts; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0;
+  border: 1px solid var(--line); border-radius: 6px; background: color-mix(in srgb, var(--raised) 50%, var(--surface));
+}
+.cap-count { padding: 6px 10px; min-width: 0; }
+.cap-count + .cap-count { border-left: 1px solid var(--line); }
+.cap-count dt { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12px; white-space: nowrap; }
+.cap-count dd { margin: 0; font-size: 18px; font-weight: 600; }
+.sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.sw-busy { background: var(--seg-busy); } .sw-free { background: var(--seg-free); } .sw-out { background: var(--seg-out); }
+.cap-util { grid-area: util; display: grid; gap: 4px; min-width: 0; }
+.util-title { font-size: 12px; font-weight: 600; color: var(--text-2); }
+.util-list { list-style: none; margin: 0; padding: 0; max-height: 110px; overflow: auto; }
+.util-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(40px, 1fr) 56px; gap: 10px; align-items: center; height: 22px; }
+.util-host { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.util-bar { position: relative; height: 6px; border-radius: 3px; background: var(--raised); border: 1px solid var(--line); }
+.util-fill { position: absolute; inset: 0 auto 0 0; width: calc(var(--p, 0) * 100%); border-radius: 3px; background: var(--seg-busy); }
+.util-bar.off { background: none; border-style: dashed; border-color: var(--off); }
+.util-n { text-align: right; color: var(--text-2); }
+.stat { display: grid; align-content: start; gap: 2px; min-width: 0; padding: 10px 12px; color: var(--text); }
+a.stat:hover { text-decoration: none; border-color: var(--line-strong); }
+.stat-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-2); font-size: 12px; font-weight: 600; }
+.stat-label .i { color: var(--text-3); }
+.stat-value { font-size: 24px; font-weight: 600; line-height: 1.2; letter-spacing: -.01em; }
+.stat-sub { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12px; }
+.stat-sub .glyph { width: 8px; height: 8px; }
+.stat-sub .g-bad::before, .stat-sub .g-bad::after { left: 3px; height: 10px; }
+.stat.t-warn .stat-value { color: var(--warn); }
+.stat.t-bad .stat-value { color: var(--bad); }
+:root[data-density="compact"] .stat { padding: 7px 12px; }
+:root[data-density="compact"] .stat-value { font-size: 20px; }
+@container (max-width: 1000px) {
+  .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .cap-card { grid-column: 1 / -1; grid-row: auto; }
+}
+@container (max-width: 560px) {
+  .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cap-card { grid-template-areas: "label label" "donut counts" "util util"; gap: 8px 14px; }
+  .donut-wrap { width: 104px; height: 104px; }
+  .donut-pct { font-size: 20px; }
+  .stat { padding: 8px 10px; }
+  .stat-value { font-size: 20px; }
+  .cap-counts { grid-template-columns: minmax(0, 1fr); align-self: center; }
+  .cap-count { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 4px 10px; }
+  .cap-count + .cap-count { border-left: 0; border-top: 1px solid var(--line); }
+  .cap-count dd { font-size: 15px; }
+}
+
 .attention { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .attention:focus { outline: none; }
 .attention:focus-visible { outline: 2px solid var(--accent); }

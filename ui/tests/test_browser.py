@@ -193,7 +193,7 @@ def test_heartbeats_update_last_seen_without_rebuilding_the_page(grid, page):
     page.wait_for_selector(".mx-row[data-key]")
     page.evaluate("""() => {
         window.__mutations = 0;
-        for (const id of ['mx-body', 'att-list', 'tl-lanes']) {
+        for (const id of ['mx-body', 'att-list', 'tl-lanes', 'util-list']) {
             new MutationObserver(() => window.__mutations++).observe(document.getElementById(id), { childList: true });
         }
     }""")
@@ -208,6 +208,85 @@ def test_heartbeats_update_last_seen_without_rebuilding_the_page(grid, page):
     assert page.evaluate("window.__mutations") == 0
 
 
+TILES = r"""els => Object.fromEntries(els.map(e => [e.dataset.stat,
+    [e.querySelector('[data-v]').textContent, e.querySelector('[data-s]').textContent, e.className]]))"""
+UTIL = r"""rows => rows.map(r => [r.dataset.key, r.querySelector('.util-n').textContent,
+    r.querySelector('[data-meter]').style.getPropertyValue('--p')])"""
+# Whether each line shown in the middle of the donut stays inside its hole: the ring (r 17, width 5 in
+# a 42 box) leaves a hole 29/42 of the width across.
+IN_HOLE = """() => {
+    const r = document.querySelector('.donut-wrap').getBoundingClientRect(), edge = r.width * 6.5 / 42;
+    return [...document.querySelectorAll('.donut-center > *')].filter((e) => e.offsetParent)
+      .map((e) => e.getBoundingClientRect()).map((b) => b.left >= r.left + edge && b.right <= r.right - edge);
+}"""
+
+
+def test_the_summary_counts_what_the_verdict_counts_and_follows_the_data(grid, page):
+    url, path = grid
+    # A running slot whose failures reached the limit is running, not failing: neither the verdict nor the summary counts it.
+    run(path, "UPDATE portUsage SET failCount = 3 WHERE id = ?", (slot_id(path, "WIN-BUILD-01", 3),))
+    page.goto(url)
+    page.wait_for_selector("#summary:not([hidden]) .util-row")
+    assert page.evaluate("!!(document.getElementById('summary').compareDocumentPosition(document.getElementById('attention')) & 4)")
+    assert "2 slots failing, 1 slot unhealthy, 1 stale session, 1 node offline. 7 of 21 slots free · 8 running" in page.text_content("#verdict-sub")
+    t = page.eval_on_selector_all(".stat", TILES)
+    assert t["nodes"][:2] == ["5", "1 offline"] and "t-warn" not in t["nodes"][2]  # the line is marked, not the count
+    assert t["slots"][:2] == ["21", "across 5 nodes"]
+    assert t["sessions"][:2] == ["8", "38% utilization"]
+    assert t["free"][:2] == ["7", "33% available"] and "t-" not in t["free"][2]
+    assert t["problems"][:2] == ["3", "2 failing · 1 unhealthy"] and "t-bad" in t["problems"][2]  # the slots "Needs you" lists
+    assert t["stale"][:2] == ["1", "held too long or hub gone"] and "t-warn" in t["stale"][2]
+    assert page.locator("#att-list li").count() == 5  # 3 slots, the stale session and the offline node
+    assert [page.text_content(s) for s in ("#cap-pct", "#cap-sub", "#cap-busy", "#cap-free", "#cap-out")] == ["38%", "8 of 21 in use", "8", "7", "6"]
+    assert page.evaluate(IN_HOLE) == [True, True]
+    page.eval_on_selector("#cap-sub", "el => { el.innerHTML = '<span>1200 of 4000</span> <span>in use</span>'; }")
+    assert page.evaluate(IN_HOLE) == [True, True]  # a long count wraps instead of running over the ring
+    dash = lambda cls: [float(x) for x in page.get_attribute(".donut ." + cls, "stroke-dasharray").split()] + \
+        [float(page.get_attribute(".donut ." + cls, "stroke-dashoffset"))]
+    assert dash("d-busy") == pytest.approx([800 / 21, 100 - 800 / 21, 0])
+    assert dash("d-out") == pytest.approx([600 / 21, 100 - 600 / 21, -800 / 21])  # starts where "in use" ends
+    assert page.eval_on_selector_all(".util-row", UTIL) == [
+        ["MAC-QA-02", "offline", "0"], ["runner-7f3a9c", "3/6", "0.5"], ["runner-b81e04", "1/4", "0.25"],
+        ["WIN-BUILD-01", "2/4", "0.5"], ["pw-static.lab.local", "2/4", "0.5"]]
+
+    # A run finishes and the offline node comes back: every number follows on the next poll.
+    run(path, "UPDATE portUsage SET inUse = 0 WHERE id = ?", (slot_id(path, "WIN-BUILD-01", 1),))
+    run(path, "UPDATE nodes SET online = 1, lastSeen = '2030-01-01 00:00:00' WHERE name = 'MAC-QA-02'")
+    run(path, "UPDATE portStatus SET PortStatus = 1 WHERE PortServer = 'MAC-QA-02'")  # and its slots pass health checks
+    refresh_now(page)
+    page.wait_for_function("document.getElementById('cap-busy').textContent === '7'")
+    t = page.eval_on_selector_all(".stat", TILES)
+    assert t["nodes"][:2] == ["5", "none offline"] and t["sessions"][:2] == ["7", "33% utilization"]
+    assert t["free"][:2] == ["11", "52% available"] and t["problems"][0] == "3"
+    assert [page.text_content(s) for s in ("#cap-pct", "#cap-free", "#cap-out")] == ["33%", "11", "3"]
+    util = dict((r[0], r[1:]) for r in page.eval_on_selector_all(".util-row", UTIL))
+    assert util["MAC-QA-02"] == ["0/3", "0"] and util["WIN-BUILD-01"] == ["1/4", "0.25"]
+
+    page.click(".util-host >> text=runner-7f3a9c")
+    page.wait_for_selector("#inspector:not([hidden])")
+    assert page.text_content("#insp-title") == "runner-7f3a9c"
+    page.keyboard.press("Escape")
+    page.click('[data-stat="stale"]')
+    page.wait_for_selector("#view-sessions:not([hidden])")
+    assert page.evaluate("location.hash") == "#/sessions?filter=stale"
+    assert page.errors == []
+
+
+def test_the_summary_fits_a_phone(grid, browser):
+    url, _ = grid
+    p = browser.new_page(viewport={"width": 390, "height": 844})
+    try:
+        p.goto(url)
+        p.wait_for_selector("#summary:not([hidden]) .util-row")
+        assert p.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        columns = p.evaluate("getComputedStyle(document.querySelector('.summary-grid')).gridTemplateColumns.split(' ').length")
+        inside = p.evaluate(IN_HOLE)
+    finally:
+        p.close()
+    assert columns == 2
+    assert inside and all(inside)
+
+
 def test_empty_grid_explains_how_to_add_nodes(tmp_path, monkeypatch, page):
     path = str(tmp_path / "empty.db")
     sqlite3.connect(path).close()
@@ -219,9 +298,10 @@ def test_empty_grid_explains_how_to_add_nodes(tmp_path, monkeypatch, page):
         h1 = page.text_content("#ov-h1")
         commands = page.eval_on_selector_all("[data-copy]", "els => els.map(e => e.dataset.copy)")
         panel = page.text_content("#first-run")
+        summary_hidden = page.is_hidden("#summary")
     finally:
         server.shutdown()
-    assert h1 == "No nodes yet"
+    assert h1 == "No nodes yet" and summary_hidden
     assert "docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml up -d --build --scale runner=2" in text
     assert "node gateway/agent.js --hub ws://127.0.0.1:4500 --slots 4" in text and "README" in text
     assert "ws://127.0.0.1:4500/connect" in commands and "/connect/" not in panel  # checks: one address, no slot
@@ -333,6 +413,7 @@ def test_hostile_names_and_ports_are_escaped_everywhere(grid, page):
 
     attention = page.text_content("#att-list")
     assert port in attention and name in attention  # the stale session and the failing slot
+    assert name in page.text_content("#util-list")
     page.goto(url + "#/node/" + urllib.parse.quote(name, safe=""))
     page.wait_for_selector("#inspector:not([hidden])")
     assert page.text_content("#insp-title") == name
