@@ -206,8 +206,17 @@ select { padding-right: 4px; }
 .f-bad { color: var(--bad); } .f-bad .fresh-dot { background: transparent; border-radius: 0; box-shadow: inset 0 0 0 2px var(--bad); }
 .f-paused .fresh-dot { background: transparent; border: 1.5px solid var(--text-3); border-radius: 2px; }
 .f-wait .fresh-dot { background: transparent; border: 1.5px dashed var(--off); }
+/* Wide enough for every age its state shows: "now" to "29s"; "59m 59s" when stale; "59m 59s old" paused. */
+.fresh-when { display: inline-block; min-width: 3.5ch; }
+.f-bad .fresh-when { min-width: 7.5ch; }
+.f-paused .fresh-when { min-width: 10.5ch; }
 @keyframes breathe { 50% { opacity: .45; } }
-.jump-wrap { flex: 1; display: flex; justify-content: center; min-width: 0; }
+/* The search box keeps its place at the right, beside the account controls, and its width. Centred in
+   the space left over, or squeezed into it, it moved whenever the live status changed width; now the
+   brand and the capacity give way (cut short) when the bar is short of room. */
+.jump-wrap { flex: 1 0 auto; display: flex; justify-content: flex-end; }
+.verdict-chip, .freshness, #pause-btn, .top-right { flex: none; }
+.brand-name, .capacity { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .jump {
   display: flex; align-items: center; gap: 8px; width: 320px; max-width: 100%; height: 30px; padding: 0 6px 0 10px;
   border: 1px solid var(--line-strong); border-radius: 6px; background: var(--bg); color: var(--text-3); font-size: 12px;
@@ -374,6 +383,86 @@ select { padding-right: 4px; }
 .section-label { font-size: 12px; font-weight: 600; color: var(--text-2); display: flex; align-items: center; gap: 8px; }
 .section-label .count { color: var(--text-3); font-weight: 500; }
 .panel { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+
+/* Summary: the capacity card spans both rows of the six count tiles; narrower, it goes on top. */
+.summary { container-type: inline-size; }
+.summary-grid { display: grid; grid-template-columns: minmax(0, 2.3fr) repeat(3, minmax(0, 1fr)); gap: 10px; }
+.cap-card {
+  --seg-busy: var(--accent); --seg-free: color-mix(in srgb, var(--ok) 35%, var(--surface)); --seg-out: var(--warn);
+  grid-row: span 2; display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "label label" "donut counts" "donut util";
+  gap: 8px 20px; align-items: start; padding: 10px 14px 12px;
+}
+.cap-label { grid-area: label; }
+.donut-wrap { grid-area: donut; position: relative; width: 128px; height: 128px; align-self: center; }
+.donut { display: block; width: 100%; height: 100%; transform: rotate(-90deg); }
+.donut circle { fill: none; stroke-width: 5; }
+.donut .d-free { stroke: var(--seg-free); }
+.donut .d-busy { stroke: var(--seg-busy); }
+.donut .d-out { stroke: var(--seg-out); }
+/* Inset to fit the hole (29/42 of the width): a long count wraps between "N of M" and "in use". */
+.donut-center { position: absolute; inset: 17%; display: grid; place-content: center; justify-items: center; text-align: center; }
+.donut-pct { font-size: 24px; font-weight: 600; line-height: 1.15; letter-spacing: -.01em; }
+.donut-sub { color: var(--text-3); font-size: 12px; line-height: 1.3; }
+.donut-sub span { white-space: nowrap; }
+/* Equal thirds while they fit; short of room, "Unavailable" keeps its width and the others share the rest. */
+.cap-counts {
+  grid-area: counts; display: grid; grid-template-columns: repeat(3, minmax(min-content, 1fr)); margin: 0;
+  border: 1px solid var(--line); border-radius: 6px; background: color-mix(in srgb, var(--raised) 50%, var(--surface));
+}
+.cap-count { padding: 6px 10px; min-width: 0; }
+.cap-count + .cap-count { border-left: 1px solid var(--line); }
+.cap-count dt { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12px; white-space: nowrap; }
+.cap-count dd { margin: 0; font-size: 18px; font-weight: 600; }
+.sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.sw-busy { background: var(--seg-busy); } .sw-free { background: var(--seg-free); } .sw-out { background: var(--seg-out); }
+.cap-util { grid-area: util; display: grid; gap: 4px; min-width: 0; }
+.util-title { font-size: 12px; font-weight: 600; color: var(--text-2); }
+/* Room inside the scroller for a focused name's ring. */
+.util-list { list-style: none; margin: -4px; padding: 4px; max-height: 118px; overflow: auto; }
+.util-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(40px, 1fr) 56px; gap: 10px; align-items: center; height: 22px; }
+/* A name is one run of text, so it reads, copies and finds as one. Its head gives way to whole
+   characters, so the ellipsis meets the 6-character tail utilRow keeps; the rest (a domain) gets
+   what room the first part's --n characters leave. Counted as 1ch each, which a hostname's are. */
+.util-host { display: block; min-width: 0; overflow: hidden; color: var(--text); white-space: nowrap; }
+.util-head, .util-rest { display: inline-block; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.util-head { max-width: calc(100% - 6ch); max-width: calc(round(down, 100% - 6ch, 1ch) + .5px); }
+.util-rest { max-width: max(0px, 100% - var(--n) * 1ch); max-width: max(0px, round(down, 100% - var(--n) * 1ch, 1ch)); }
+.util-bar { position: relative; height: 6px; border-radius: 3px; background: var(--raised); border: 1px solid var(--line); }
+.util-fill { position: absolute; inset: 0 auto 0 0; width: calc(var(--p, 0) * 100%); border-radius: 3px; background: var(--seg-busy); }
+.util-bar.off { background: none; border-style: dashed; border-color: var(--off); }
+.util-n { text-align: right; color: var(--text-2); }
+/* High contrast keeps the donut's colours (an SVG stroke), so the key and the bars keep them too. */
+@media (forced-colors: active) {
+  .sw, .util-fill { forced-color-adjust: none; }
+}
+.stat { display: grid; align-content: start; gap: 2px; min-width: 0; padding: 10px 12px; color: var(--text); }
+a.stat:hover { text-decoration: none; border-color: var(--line-strong); }
+.stat-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-2); font-size: 12px; font-weight: 600; }
+.stat-label .i { color: var(--text-3); }
+.stat-value { font-size: 24px; font-weight: 600; line-height: 1.2; letter-spacing: -.01em; }
+.stat-sub { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12px; }
+.stat-sub .glyph { width: 8px; height: 8px; }
+.stat-sub .g-bad::before, .stat-sub .g-bad::after { left: 3px; height: 10px; }
+.stat.t-warn .stat-value { color: var(--warn); }
+.stat.t-bad .stat-value { color: var(--bad); }
+:root[data-density="compact"] .stat { padding: 7px 12px; }
+:root[data-density="compact"] .stat-value { font-size: 20px; }
+@container (max-width: 1000px) {
+  .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .cap-card { grid-column: 1 / -1; grid-row: auto; }
+}
+@container (max-width: 560px) {
+  .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cap-card { grid-template-areas: "label label" "donut counts" "util util"; gap: 8px 14px; }
+  .donut-wrap { width: 104px; height: 104px; }
+  .donut-pct { font-size: 20px; }
+  .stat { padding: 8px 10px; }
+  .stat-value { font-size: 20px; }
+  .cap-counts { grid-template-columns: minmax(0, 1fr); align-self: center; }
+  .cap-count { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 4px 10px; }
+  .cap-count + .cap-count { border-left: 0; border-top: 1px solid var(--line); }
+  .cap-count dd { font-size: 15px; }
+}
 
 .attention { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .attention:focus { outline: none; }
@@ -825,8 +914,12 @@ dialog::backdrop { background: var(--backdrop); }
 .signin .sheet-head { display: grid; gap: 2px; margin-bottom: 14px; justify-content: stretch; }
 .signin input { width: 100%; }
 .signin-sheet { width: min(340px, calc(100vw - 32px)); }
-.signin-sheet.anchored { position: fixed; margin: 0; inset: var(--anchor-top) var(--anchor-right) auto auto; }
-.signin-sheet.anchored::backdrop { background: transparent; }
+/* Anchored, it's a non-modal popup in the menus' layer: the page around it stays usable. It keeps
+   that shape if the window narrows to phone width while it's open. */
+.signin-sheet.anchored {
+  position: fixed; z-index: 70; margin: 0; inset: var(--anchor-top) var(--anchor-right) auto auto;
+  max-width: calc(100% - var(--anchor-right) - 8px);
+}
 .form-sheet { width: min(500px, calc(100vw - 32px)); }
 .form-sheet input[type=text] { width: 100%; }
 .form-sheet .field-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }
@@ -915,10 +1008,16 @@ dialog::backdrop { background: var(--backdrop); }
 /* ---- phones ------------------------------------------------------------------------------------- */
 @media (max-width: 759px) {
   .topbar { gap: 6px; padding: 0 8px 0 10px; }
-  .brand-name, .grid-name, .capacity, #pause-btn, .jump-text, .jump-keys, .fresh-text, .chip-btn span, .acct-label { display: none; }
+  .brand-name, .grid-name, .capacity, #pause-btn, .jump-text, .jump-keys, .fresh-text { display: none; }
+  /* Icon-only chips: the label leaves the layout but still names the button. */
+  .chip-btn span, .acct-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+  }
+  /* Short of room even so (under 320px), the verdict's words give way, not the logo. */
+  .brand { flex: none; }
+  .verdict-chip { flex: 0 1 auto; min-width: 0; }
+  #verdict-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .account-chip { padding: 0 8px; }
-  .account-chip .acct-dot + .acct-label { display: none; }
-  .jump-wrap { justify-content: flex-end; flex: 1; }
   .jump { width: 32px; height: 32px; padding: 0; justify-content: center; border-color: transparent; background: transparent; color: var(--text-2); }
   .chip-btn { padding: 0 7px; }
   .shell { grid-template-columns: minmax(0, 1fr); background: none; }
@@ -1032,7 +1131,7 @@ dialog::backdrop { background: var(--backdrop); }
   .act-toolbar .select-field { flex: 1 1 40%; }
   .act-toolbar .select-field select { flex: 1; max-width: none; }
 
-  .sheet.signin-sheet, .sheet.form-sheet, #confirm-dialog {
+  .sheet.signin-sheet:not(.anchored), .sheet.form-sheet, #confirm-dialog {
     width: 100%; max-width: none; margin: auto 0 0; border-radius: 12px 12px 0 0; padding-bottom: calc(20px + env(safe-area-inset-bottom));
   }
   .palette { width: 100%; max-width: none; height: 100%; max-height: none; margin: 0; border-radius: 0; border: 0; }
@@ -1044,10 +1143,29 @@ dialog::backdrop { background: var(--backdrop); }
   .first-run { padding: 18px 14px; }
 }
 
+/* The smallest phones: a little less space between things, so the verdict chip and its count fit. */
+@media (max-width: 359px) {
+  .topbar, .top-right { gap: 4px; }
+  .verdict-chip { padding: 0 8px; }
+  .account-chip { padding: 0 6px; }
+}
+
+/* A little less room: an error stays in the status's title. Shown, it cut the product's and the grid's
+   names to a letter or two. */
+@media (min-width: 1100px) and (max-width: 1279px) {
+  .fresh-note { display: none; }
+  .jump { width: 260px; }
+}
+
 @media (min-width: 760px) and (max-width: 1099px) {
-  .capacity { display: none; }
-  .jump { width: 220px; }
-  .grid-name { display: none; }
+  /* The top bar keeps the logo, the verdict, the live state and its age; the error stays in its title. */
+  .topbar { gap: 8px; padding-left: 10px; }
+  .capacity, .brand-name, .grid-name, .fresh-note { display: none; }
+  .jump { width: 200px; }
+  /* Open access: the Unprotected chip beside it says so. */
+  .account-chip.open-access .acct-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+  }
   .mfa-lower { grid-template-columns: minmax(0, 1fr); }
   .signin-how-grid { grid-template-columns: minmax(0, 1fr); }
 }

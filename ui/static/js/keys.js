@@ -1,4 +1,5 @@
-// Keyboard shortcuts. Ignored while typing and while a modal dialog is open (dialogs own their keys).
+// Keyboard shortcuts. Ignored while typing, while a modal dialog is open, and in a dialog that isn't
+// modal (the sign-in prompt under the account chip): dialogs own their keys.
 export const SHORTCUTS = [
   ["/", "Jump to a node, slot, session or view"],
   ["Ctrl K", "Jump to anything"],
@@ -24,7 +25,7 @@ export function bind(handlers) {
   let chord = 0;
   document.addEventListener("keydown", (e) => {
     if (e.defaultPrevented) return;
-    const modal = document.querySelector("dialog[open]:modal");
+    const modal = document.querySelector("dialog[open]:modal") || (e.target.closest && e.target.closest("dialog[open]"));
     if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "k") {
       if (modal && modal.id !== "palette") return;
       e.preventDefault();
