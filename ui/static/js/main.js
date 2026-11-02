@@ -112,22 +112,27 @@ function renderTop(msg, v) {
 const why = () => (live.errorKind === "database" ? "database unreachable" : "Grid UI server unreachable");
 
 function freshness() {
-  const el = $("freshness"), text = $("fresh-text");
+  const el = $("freshness");
   const age = live.lastOk ? Math.max(0, Math.round((Date.now() - live.lastOk) / 1000)) : null;
-  let tone = "ok", label;
+  let tone = "ok", state, when = "", note = "";
   if (live.paused) {
     tone = "paused";
-    label = "Paused" + (age != null ? " · " + duration(age) + " old" : "");
+    state = "Paused";
+    if (age != null) when = duration(age) + " old";
   } else if (age == null) {
     tone = live.error ? "bad" : "wait";
-    label = live.error ? "No data · " + why() : "Connecting…";
+    state = live.error ? "No data" : "Connecting…";
+    if (live.error) note = why();
   } else {
-    label = "Live · " + (age < 1 ? "now" : age + "s");
-    if (age >= 30) { tone = "bad"; label = "Stale · " + duration(age) + " · " + (live.error ? why() : "no response"); }
-    else if (age >= 10) { tone = "warn"; label = "Delayed · " + age + "s" + (live.error ? " · " + why() : ""); }
+    state = "Live";
+    when = age < 1 ? "now" : age + "s";
+    if (age >= 30) { tone = "bad"; state = "Stale"; when = duration(age); note = live.error ? why() : "no response"; }
+    else if (age >= 10) { tone = "warn"; state = "Delayed"; if (live.error) note = why(); }
   }
   el.className = "freshness f-" + tone;
-  setText(text, label);
+  // The age goes last, in a box sized for its state, so the second hand never nudges what follows it.
+  // The note gives way on a narrow bar; the title still has the error.
+  setHTML($("fresh-text"), html`${state}${note ? html`<span class="fresh-note"> · ${note}</span>` : ""}${when ? html` · <span class="fresh-when">${when}</span>` : ""}`);
   el.title = live.error ? "Last error: " + live.error : live.lastOk ? "Updated " + clock(live.lastOk) : "";
 }
 
@@ -156,6 +161,7 @@ const accountBtn = $("account-btn"), accountMenu = $("account-menu");
 function renderAccount() {
   const s = auth.state();
   accountBtn.classList.toggle("signed-in", s.signedIn);
+  accountBtn.classList.toggle("open-access", !s.adminConfigured);
   accountBtn.hidden = !s.known;
   if (!s.adminConfigured) {
     setHTML(accountBtn, html`${icon("i-user")}<span class="acct-label">Open access</span>${icon("i-caret", "caret")}`);
@@ -165,7 +171,7 @@ function renderAccount() {
     accountBtn.setAttribute("aria-haspopup", "menu");
   } else {
     setHTML(accountBtn, html`${icon("i-user")}<span class="acct-label">Sign in</span>`);
-    accountBtn.removeAttribute("aria-haspopup");
+    accountBtn.setAttribute("aria-haspopup", "dialog");
   }
   $("unprotected-btn").hidden = !(s.known && !s.adminConfigured);
   document.body.classList.toggle("signed-in", s.signedIn);
@@ -182,7 +188,10 @@ function openAccountMenu() {
 }
 accountBtn.addEventListener("click", () => {
   const s = auth.state();
-  if (s.adminConfigured && !s.signedIn) { auth.signIn(); return; }
+  if (s.adminConfigured && !s.signedIn) {
+    if (auth.signingIn()) auth.closeSignIn(); else auth.signIn();
+    return;
+  }
   if (!accountMenu.hidden) closeMenus(); else openAccountMenu();
 });
 accountMenu.addEventListener("click", (e) => {
@@ -220,7 +229,7 @@ function openMenu(menu, owner) {
   owner.setAttribute("aria-expanded", "true");
   const r = owner.getBoundingClientRect();
   menu.style.setProperty("--menu-top", Math.round(r.bottom + 4) + "px");
-  menu.style.setProperty("--menu-right", Math.max(8, Math.round(window.innerWidth - r.right)) + "px");
+  menu.style.setProperty("--menu-right", Math.max(8, Math.round(document.documentElement.clientWidth - r.right)) + "px"); // a scrollbar isn't part of it
   const first = menu.querySelector("[role^=menuitem]");
   if (first) first.focus();
 }
@@ -272,7 +281,9 @@ rowMenu.addEventListener("click", async (e) => {
   const item = e.target.closest("[data-row-act]");
   if (!item) return;
   const host = rowMenu.dataset.host, owner = menuOwner, n = app.findNode(host);
-  closeMenus();
+  // Focus goes back to the row's button first: the prompt or confirm an action opens returns it
+  // there, and a hidden menu item can't take it back.
+  closeMenus(true);
   switch (item.dataset.rowAct) {
     case "inspect": app.inspect("node", host, owner); break;
     case "activity": router.go(router.build("activity", { node: host })); break;
@@ -281,10 +292,20 @@ rowMenu.addEventListener("click", async (e) => {
       copy(connectUrlForToken(app.hub(), host), "the connect URL for " + host + ": add your client token at the end");
       if (owner) owner.focus();
       break;
-    case "reset": await resetNode(host); if (owner && owner.isConnected) owner.focus(); break;
-    case "forget": if (await forgetNode(host)) { app.lastActionAt = Date.now(); $("attention").focus(); } else if (owner && owner.isConnected) owner.focus(); break;
+    case "reset": await resetNode(host); refocus(owner); break;
+    case "forget": if (await forgetNode(host)) { app.lastActionAt = Date.now(); $("attention").focus(); } else refocus(owner); break;
   }
 });
+
+// Back to the control an action started from, unless focus has gone somewhere since (a press
+// elsewhere that closed the sign-in prompt), and without scrolling: that press may be under way.
+// Focus still on something no longer shown (in a dialog that just closed) is lost too: the
+// browser drops it a moment later.
+function refocus(el) {
+  const active = document.activeElement;
+  const lost = !active || active === document.body || !active.getClientRects().length;
+  if (el && el.isConnected && lost) el.focus({ preventScroll: true });
+}
 
 // ---- rail --------------------------------------------------------------------------
 $("rail-toggle").addEventListener("click", () => {
@@ -417,7 +438,7 @@ document.addEventListener("click", (e) => {
 
 // Admin controls anywhere on the page. After an action, focus lands somewhere sensible.
 bindActions(document.body, (el, done, act) => {
-  if (!done) { if (el.isConnected) el.focus(); return; }
+  if (!done) { refocus(el); return; }
   app.lastActionAt = Date.now();
   const row = el.closest(".att-row");
   if (row) {

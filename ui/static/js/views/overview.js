@@ -125,10 +125,19 @@ function tileShell(t) {
     : html`<div class="panel stat" data-stat="${t.key}">${inner}</div>`;
 }
 
+const graphemes = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+const characters = (s) => (graphemes ? Array.from(graphemes.segment(s), (g) => g.segment) : Array.from(s));
+
+// Short of room, a node's name is cut in the middle, keeping the last 6 characters of its first part:
+// nodes named alike (k8s-node-eastus-01, -02…) differ there. A domain after it is usually the same on
+// every node, so it gives way first. An IP address differs at its end, so it's all one part.
 function utilRow(n) {
   const off = n.kind === "gateway" && !n.online;
+  const dot = /^[\d.]+$/.test(n.host) ? -1 : n.host.indexOf(".");
+  const first = characters(dot > 0 ? n.host.slice(0, dot) : n.host), rest = dot > 0 ? n.host.slice(dot) : "";
+  const cut = Math.max(0, first.length - 6);
   return html`<li class="util-row" data-key="${n.host}">
-    <a class="mono util-host" href="#/node/${encodeURIComponent(n.host)}" data-inspect="node" data-id="${n.host}" title="${n.host}">${n.host}</a>
+    <a class="mono util-host" dir="auto" href="#/node/${encodeURIComponent(n.host)}" data-inspect="node" data-id="${n.host}" data-fk="util-${n.host}" title="${n.host}" aria-label="${n.host}"><span class="util-head">${first.slice(0, cut).join("")}</span><span class="util-tail">${first.slice(cut).join("")}</span>${rest ? html`<span class="util-rest" data-n="${first.length}">${rest}</span>` : ""}</a>
     <span class="util-bar${off ? " off" : ""}" data-meter="${off || !n.total ? 0 : n.busy / n.total}" aria-hidden="true"><span class="util-fill"></span></span>
     <span class="util-n mono">${off ? "offline" : n.busy + "/" + n.total}</span></li>`;
 }
@@ -327,6 +336,7 @@ export function createOverview(section) {
     setText(section.querySelector("#cap-out"), s.out);
     patchList(utilList, data.nodes, (n) => n.host, utilRow);
     utilList.querySelectorAll("[data-meter]").forEach((m) => m.style.setProperty("--p", m.dataset.meter));
+    utilList.querySelectorAll("[data-n]").forEach((r) => r.style.setProperty("--n", r.dataset.n));
     for (const [key, t] of Object.entries(s.tiles)) {
       const el = section.querySelector('[data-stat="' + key + '"]');
       el.classList.toggle("t-warn", !!t.hot && t.tone === "warn");

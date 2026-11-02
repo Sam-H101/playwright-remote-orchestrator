@@ -6,6 +6,8 @@ import { html, setHTML } from "../html.js";
 export function confirm(opts) {
   return new Promise((resolve) => {
     const dlg = document.getElementById("confirm-dialog");
+    // One question at a time: a second one asked over it would share its OK.
+    if (dlg.open) return resolve(false);
     const danger = opts.danger !== false;
     dlg.__html = null;
     setHTML(dlg, html`

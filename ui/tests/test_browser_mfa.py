@@ -228,6 +228,26 @@ def test_add_a_secret_and_the_seed_never_comes_back(mfa_grid, mfa_page):
     assert [e for e in p.errors if "status of 400" not in e] == []
 
 
+def test_a_refused_form_asks_for_sign_in_on_top_of_it(mfa_grid, mfa_page):
+    """The prompt opens over the open form, modal like it, not out of reach behind it."""
+    url, _ = mfa_grid
+    p = mfa_page
+    p.goto(url + "#/mfa")
+    p.click("#mfa-empty [data-add-mfa]")
+    p.wait_for_selector("#add-mfa-dialog[open]")
+    p.fill("#mfa-name", "intranet")
+    p.fill("#mfa-secret", SEED)
+    p.evaluate("sessionStorage.setItem('gridToken', 'rotated')")  # the admin token changed since this tab signed in
+    p.click("#mfa-submit")
+    p.wait_for_selector("#signin-dialog[open]")
+    assert p.evaluate("document.getElementById('signin-dialog').matches(':modal')")
+    p.fill("#signin-token", "s3cret")
+    p.press("#signin-token", "Enter")
+    p.wait_for_selector("#add-mfa-dialog", state="hidden")
+    p.wait_for_selector("#mfa-rows tr")
+    assert [s["name"] for s in store.list_mfa()["secrets"]] == ["intranet"]
+
+
 def test_show_code_counts_down_and_hides_itself(mfa_grid, mfa_page):
     url, _ = mfa_grid
     add_secret()
