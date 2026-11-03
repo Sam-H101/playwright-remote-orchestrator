@@ -9,9 +9,10 @@ name: Release
 # goes out with the next one. On each pull request into master the "next version" check's summary
 # says what merging it would release, as of its last push or label change.
 #
-# A run releases master as it is when the run starts, not only the merge that started it: runs can
-# wait, be replaced by a later one or start out of order, and whatever is on master and unreleased
-# goes out together. A commit that a release already contains is never released again.
+# A run releases master as it is when the run starts, not only the merge that started it: runs wait
+# their turn and can start out of order, and whatever is on master and unreleased goes out together.
+# A commit that a release already contains is never released again, so a run whose merge went out
+# with an earlier one says so and makes no release.
 #
 # If a release's images fail, use "Re-run failed jobs" (or "Re-run all jobs" while master hasn't
 # moved on). :latest only moves to the newest release, and :X.Y to the newest of that X.Y, so
@@ -27,10 +28,12 @@ on:
     branches: [master]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
-# Releases go one at a time. On a pull request, a newer check replaces an older one.
+# Releases go one at a time, each run waiting its turn rather than replacing the one before (which
+# GitHub would show as cancelled). Pull request checks change nothing, so each runs on its own: opening
+# a pull request with a label starts two at once.
 concurrency:
-  group: release-${{ github.event_name == 'push' && 'master' || github.event.pull_request.number }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-${{ github.event_name == 'push' && 'master' || github.run_id }}
+  queue: max
 
 permissions:
   contents: read
@@ -42,6 +45,10 @@ defaults:
 jobs:
   version:
     name: next version
+    # Of label changes, only a release:* label's can change the answer.
+    if: >-
+      github.event_name == 'push' || !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action)
+      || startsWith(github.event.label.name, 'release:')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -80,7 +87,7 @@ jobs:
 
   script-tests:
     name: release script tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
