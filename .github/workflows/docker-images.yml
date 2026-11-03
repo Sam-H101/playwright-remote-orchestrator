@@ -4,8 +4,11 @@ name: Docker images
 # ghcr.io/<owner>/playwright-remote-orchestrator/<name>:
 #   master                    -> :edge and :sha-<short sha>
 #   tag pwrunner/v1.2.3 or v1.2.3 -> :1.2.3, :1.2 and :latest
-#   workflow_dispatch         -> builds `ref` and tags it `version` (+ :latest), e.g. for a tag pushed
-#                                before this workflow existed
+#   called by release.yml, or workflow_dispatch
+#                             -> builds `ref` and tags it `version`, :X.Y and :latest (dispatch: e.g.
+#                                for a tag pushed before this workflow existed)
+# :latest and :X.Y move only to the newest release (and the newest of that X.Y), so publishing an older
+# version again (a re-run, a backfill, a late tag) can't take them back.
 # Pull requests only build (amd64), to catch a broken Dockerfile before it merges.
 
 on:
@@ -15,18 +18,32 @@ on:
     paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', '.github/workflows/docker-images.yml']
   pull_request:
     paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', '.github/workflows/docker-images.yml']
+  workflow_call:
+    inputs:
+      ref:
+        description: git ref to build
+        type: string
+        default: ''
+      version:
+        description: image tag for that ref, e.g. 1.2.3
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       ref:
         description: git ref to build, e.g. pwrunner/v1.1.0 (empty = the branch the workflow runs on)
         default: ''
       version:
-        description: image tag for that ref, e.g. 1.1.0 (empty = edge)
+        description: image tag for that ref, e.g. 1.1.0 (empty = edge); :latest only if it's the newest release, :X.Y if the newest of its X.Y
         default: ''
 
 permissions:
   contents: read
   packages: write
+
+defaults:
+  run:
+    shell: bash # -eo pipefail: a failure anywhere in a pipeline fails the step
 
 jobs:
   image:
@@ -60,6 +77,38 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: newest release?
+        id: rank
+        if: inputs.version != '' || startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          v=${VERSION:-$GITHUB_REF_NAME}
+          v=${v#pwrunner/}
+          v=${v#v}
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "latest=false" >> "$GITHUB_OUTPUT"; echo "xy=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Every release as it is now, on the remote: this may be a re-run of an old one.
+          remote=$(git ls-remote --tags origin)
+          # A release of this number made from another commit is that commit's: don't overwrite its images.
+          head=$(git rev-parse HEAD)
+          for t in "v$v" "pwrunner/v$v"; do
+            at=$(echo "$remote" | awk -v r="refs/tags/$t" '$2 == r "^{}" { peeled = $1 } $2 == r { plain = $1 } END { print peeled ? peeled : plain }')
+            if [ -n "$at" ] && [ "$at" != "$head" ]; then
+              echo "::error::$t is ${at:0:7}, but this is building ${head:0:7}."
+              exit 1
+            fi
+          done
+          releases=$(echo "$remote" | sed -E 's#.*refs/tags/##' \
+            | { grep -E '^(pwrunner/)?v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed -E 's#^(pwrunner/)?v##')
+          all=$(printf '%s\n%s\n' "$releases" "$v" | sed '/^$/d' | sort -V)
+          newest=$(echo "$all" | tail -n 1)
+          newest_xy=$(echo "$all" | awk -F. -v xy="${v%.*}" '$1 "." $2 == xy' | tail -n 1)
+          echo "latest=$([ "$v" = "$newest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "xy=$([ "$v" = "$newest_xy" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "$v: the newest release is $newest, and the newest ${v%.*}.x is $newest_xy"
+
       - name: image name
         id: name
         # Registry paths must be lower-case; the owner is Sam-H101.
@@ -73,13 +122,14 @@ jobs:
           flavor: latest=false
           tags: |
             type=match,pattern=pwrunner/v(\d+\.\d+\.\d+),group=1
-            type=match,pattern=pwrunner/v(\d+\.\d+)\.\d+,group=1
+            type=match,pattern=pwrunner/v(\d+\.\d+)\.\d+,group=1,enable=${{ steps.rank.outputs.xy == 'true' }}
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') || inputs.version != '' }}
-            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.rank.outputs.xy == 'true' }}
+            type=raw,value=latest,enable=${{ steps.rank.outputs.latest == 'true' }}
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }},priority=901
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.version != '' && steps.rank.outputs.xy == 'true' }}
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' && inputs.version == '' }}
-            type=sha,format=short,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+            type=sha,format=short,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && inputs.version == '' }}
             type=ref,event=pr
 
       - uses: docker/setup-qemu-action@v3

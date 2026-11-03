@@ -1,8 +1,8 @@
 # Runs the stack from the images CI publishes to GitHub Container Registry instead of building them:
 #   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.ghcr.yaml pull
 #   docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.ghcr.yaml up -d --scale runner=2
-# IMAGE_TAG (in .env or the shell) picks the version: a release such as 1.1.0, latest (the newest
-# release, the default) or edge (master). Leave this file out to build from the checkout as before.
+# IMAGE_TAG (in .env or the shell) picks the version: a release such as 1.2.0 (or 1.2, the newest
+# 1.2.x), latest (the newest release, the default) or edge (master). Leave this file out to build from the checkout as before.
 
 services:
   hub:

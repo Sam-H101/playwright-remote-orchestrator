@@ -58,7 +58,7 @@ CI builds every image and publishes it to GitHub Container Registry (`.github/wo
 | `ghcr.io/sam-h101/playwright-remote-orchestrator/grid-ui` | the Grid UI (amd64, arm64) |
 | `ghcr.io/sam-h101/playwright-remote-orchestrator/checks` | the image `main.py` checks run in (amd64) |
 
-Tags: `latest` and a version such as `1.1.0` for each release (git tags `pwrunner/v*` or `v*`), `edge` and `sha-<commit>` for every change on master.
+Tags: a version such as `1.2.0` for each [release](#releases), `1.2` for the newest 1.2.x, `latest` for the newest release, and `edge` and `sha-<commit>` for every change on master that touches the images. The packages are public: pulling needs no login. Each one's page is under **Packages** on the repository page.
 
 ```
 docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-compose.ghcr.yaml pull
@@ -66,6 +66,23 @@ docker compose -f docker-compose.yaml -f docker-compose.mysql.yaml -f docker-com
 ```
 
 `IMAGE_TAG` in `.env` pins the version (default `latest`).
+
+### Releases
+
+Every merge to master is a release (`.github/workflows/release.yml`):
+- The next version is tagged `vX.Y.Z`.
+- A GitHub Release lists the pull requests merged since the last one.
+- The images above are published as `X.Y.Z`, `X.Y` and `latest`.
+
+A pull request's label picks the version:
+- `release:minor` or `release:major`; otherwise it's a patch.
+- `release:skip` makes no release, for changes that ship nothing (docs, CI). What it changed goes out with the next release. If an earlier merge is still waiting to go out, it releases that.
+
+The labels exist in the repository; any other label counts as a patch. Each pull request's **next version** check says, in its summary, what merging it would release and which merges it counted. That's as of its last push or label change: re-run it after other merges.
+
+A release takes master as it is when its run starts, so merges that land while a release is running go out together in the next one, and a commit that a release already contains is never released again. If a release's images fail to build, re-run the failed jobs. `latest` only ever moves to the newest release, and `X.Y` to the newest of that X.Y, so re-running an older release can't take them back.
+
+The Windows runner's binaries are released by hand: push a `pwrunner/vX.Y.Z` tag, and `.github/workflows/runner-go.yml` builds and attaches them. That tag publishes the images too, so give it the next free version number. The automatic releases count on from it.
 
 ## Connecting tests
 
@@ -142,7 +159,7 @@ docker run -d --name pw-runner --restart unless-stopped --init --shm-size 1g --e
   ghcr.io/sam-h101/playwright-remote-orchestrator/runner:latest
 ```
 
-Use a version tag (`:1.1.0`) instead of `:latest` to pin it; the runner's Playwright version must match your checks' minor version. To build it yourself instead: `docker build -f docker/runner/Dockerfile -t playwright_orchestrator_runner .` from a checkout, and run that image.
+Use a version tag (`:1.2.0`) instead of `:latest` to pin it; the runner's Playwright version must match your checks' minor version. To build it yourself instead: `docker build -f docker/runner/Dockerfile -t playwright_orchestrator_runner .` from a checkout, and run that image.
 
 `NODE_NAME` keeps the node's name when the container is recreated (the default is the container ID), and `EPHEMERAL=0` makes the hub show it OFFLINE while it is down instead of removing it. Keep `--init` (reaps browser processes) and `--shm-size` (Chromium crashes with docker's 64 MB `/dev/shm`).
 
