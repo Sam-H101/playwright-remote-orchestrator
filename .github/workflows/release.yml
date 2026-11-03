@@ -29,8 +29,9 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 # Releases go one at a time, each run waiting its turn rather than replacing the one before (which
-# GitHub would show as cancelled). Pull request checks change nothing, so each runs on its own: opening
-# a pull request with a label starts two at once.
+# GitHub would show as cancelled). Pull request checks change nothing and take seconds, so each runs on
+# its own and in full, whatever started it: opening a pull request with a label starts two at once, and
+# a skipped check would hide the last one's answer.
 concurrency:
   group: release-${{ github.event_name == 'push' && 'master' || github.run_id }}
   queue: max
@@ -45,10 +46,6 @@ defaults:
 jobs:
   version:
     name: next version
-    # Of label changes, only a release:* label's can change the answer.
-    if: >-
-      github.event_name == 'push' || !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action)
-      || startsWith(github.event.label.name, 'release:')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -87,7 +84,7 @@ jobs:
 
   script-tests:
     name: release script tests
-    if: github.event_name == 'pull_request' && !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
