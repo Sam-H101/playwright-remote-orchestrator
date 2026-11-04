@@ -1,13 +1,13 @@
-// Command updatepins prints the pins.go declarations for a Node and a playwright-core version, read from
-// the Node release's SHASUMS256.txt and the npm registry's dist.integrity. Paste the output over the
-// matching block of internal/runtime/pins.go and update the go:embed file names.
+// Command updatepins prints the pins.go declarations for a Node version, read from the Node release's
+// SHASUMS256.txt. Paste the output over the matching block of internal/runtime/pins.go and update the Node
+// file names in internal/runtime/embed_windows_*.go. playwright-core is pinned in runner/playwright
+// instead, which Dependabot updates.
 //
-//	go run ./tools/updatepins --node 22.23.4 --playwright 1.64.1
+//	go run ./tools/updatepins --node 22.23.4
 package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -18,9 +18,8 @@ import (
 
 func main() {
 	node := flag.String("node", "", "Node version, e.g. 22.23.4")
-	pw := flag.String("playwright", "", "playwright-core version, e.g. 1.64.1")
 	flag.Parse()
-	if *node == "" || *pw == "" {
+	if *node == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -53,18 +52,6 @@ func main() {
 		fmt.Printf("\t%q: {%q, %q, %d},\n", t[0], url, sum, max(size, 0))
 	}
 	fmt.Println("}")
-
-	resp, err = client.Get(fmt.Sprintf("https://registry.npmjs.org/playwright-core/%s", *pw))
-	check(err)
-	var meta struct {
-		Dist struct{ Integrity string } `json:"dist"`
-	}
-	check(json.NewDecoder(resp.Body).Decode(&meta))
-	resp.Body.Close()
-	if meta.Dist.Integrity == "" {
-		check(fmt.Errorf("playwright-core %s has no dist.integrity", *pw))
-	}
-	fmt.Printf("\nvar PlaywrightVersion = %q\n\nvar PlaywrightPins = map[string]string{ // version -> SRI integrity of the registry tarball\n\t%q: %q,\n}\n", *pw, *pw, meta.Dist.Integrity)
 }
 
 func check(err error) {

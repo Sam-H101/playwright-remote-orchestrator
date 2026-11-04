@@ -1,8 +1,10 @@
 # Dependabot opens update pull requests every Monday at 06:00 UTC:
 # - npm, Go and pip: one per ecosystem for the minor and patch updates, and one for each major.
+# - Playwright: one for each new version (see below).
 # - GitHub Actions: one for everything. The workflows use major tags, so these are mostly majors.
 # - Base images: one per image. Their tags already take patch releases, so these are new Node and Python
-#   versions. Their checks only build the images, so try one before merging it.
+#   versions. Their checks build the images and run a check through the hub and a runner with them. That
+#   check doesn't use the Grid UI, so try a Grid UI update before merging it.
 #
 # Merging one releases it like any other pull request (release.yml), as a patch. GitHub Actions updates
 # change only CI, so they're labelled release:skip and go out with the next release. Setting labels replaces
@@ -16,14 +18,23 @@
 # every few days, and Dependabot counts from the last push, so a week would hold back almost every update.
 # Security updates never wait.
 #
+# Playwright is pinned once, in runner/playwright: package.json, with its integrity in package-lock.json.
+# pwrunner embeds that playwright-core, the runner image installs it, and the checks image installs the
+# Python package of the same major.minor (the newest up to that version), so one pull request moves the
+# client and every server together (README.md, "Upgrading Playwright"). Its checks build the images and
+# run a check through the hub in every browser, and build pwrunner and install it on Windows. A new minor
+# version means upgrading every runner host that isn't built from here, so these are labelled
+# release:minor (patches too: the label can't depend on the update). They wait two weeks, because the
+# checks image can't be built until the Python package is out: usually a week or two after npm's, but it
+# has taken five (1.56, 1.59). If it isn't yet, the checks image fails saying so: leave the pull request
+# open and re-run its failed jobs once it is. The Python package itself has no cooldown: a build takes
+# the newest release up to the pinned version, however new.
+#
 # Left out on purpose:
-# - Playwright. Its version moves in several places at once (README.md, "Upgrading Playwright"), and
-#   Dependabot would move only one of them. Its pip package is ignored. The base images' tags come from an
-#   ARG, which Dependabot can't read, and they're ignored too in case that changes.
 # - The compose files. Their one third-party image, mysql:8.4, is an LTS line whose tag already takes its
 #   patch releases, and moving to the next LTS is a database upgrade, not a bump.
-# - The Windows runner's Node and Playwright runtime, pinned in runner/internal/runtime/pins.go, which
-#   Dependabot can't read.
+# - The Windows runner's Node runtime, pinned in runner/internal/runtime/pins.go, which Dependabot can't
+#   read.
 
 version: 2
 
@@ -54,6 +65,16 @@ updates:
         patterns: ['*']
         update-types: [minor, patch]
 
+  - package-ecosystem: npm
+    directory: /runner/playwright # Playwright: see above
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00' # UTC
+    cooldown:
+      default-days: 14 # see above
+    labels: [dependencies, 'release:minor']
+
   - package-ecosystem: gomod
     directory: /runner # pwrunner
     schedule:
@@ -78,8 +99,6 @@ updates:
     # Move a range only when a new version falls outside it. By default Dependabot raises every >= floor
     # to the newest version, which changes nothing in the images (they install the newest in range anyway).
     versioning-strategy: increase-if-necessary
-    ignore:
-      - dependency-name: playwright # moves with the checks' base image: see above
     groups:
       python:
         patterns: ['*']
@@ -93,7 +112,3 @@ updates:
       time: '06:00' # UTC
     cooldown:
       default-days: 1 # see above
-    ignore:
-      # The runner's and the checks' base images (Dependabot names an image without its registry): see above.
-      - dependency-name: playwright
-      - dependency-name: playwright/python

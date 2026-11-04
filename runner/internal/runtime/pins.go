@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/Sam-H101/playwright-remote-orchestrator/runner/playwright"
 )
 
 // Pin is one artefact: where it comes from and its SHA-256. Size 0 means unknown.
@@ -18,7 +20,7 @@ type Pin struct {
 // File is the artefact's file name (the URL's last element).
 func (p Pin) File() string { return path.Base(p.URL) }
 
-// Update with `go run ./tools/updatepins --node <v> --playwright <v>`.
+// Update with `go run ./tools/updatepins --node <v>`.
 var NodeVersion = "22.23.4"
 
 var NodePins = map[string]Pin{ // key "<goos>/<goarch>"
@@ -28,10 +30,11 @@ var NodePins = map[string]Pin{ // key "<goos>/<goarch>"
 	"linux/arm64":   {"https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-arm64.tar.gz", "f7a1e486dbc8b286847815b477d4fb5e9fb963ed4489c3e1588853d685f589f9", 0},
 }
 
-var PlaywrightVersion = "1.64.1"
+// PlaywrightVersion is the one runner/playwright pins, which Dependabot updates.
+var PlaywrightVersion = playwright.Version
 
 var PlaywrightPins = map[string]string{ // version -> SRI integrity of the registry tarball
-	"1.64.1": "sha512-BC4s8y6SEVA6Q1rSxZTto8hI1KUI3xXlHGZgvGqP4IqPdI/a6FX9H29IDNz7vKo9l21b6LfYosScPL6M3xxyDQ==",
+	playwright.Version: playwright.Integrity,
 }
 
 // NodeEOL is the end-of-life date of each Node major line, for the selfcheck warning.

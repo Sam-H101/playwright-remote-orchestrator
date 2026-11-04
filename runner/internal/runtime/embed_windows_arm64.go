@@ -7,9 +7,6 @@ import _ "embed"
 //go:embed files/node-v22.23.4-win-arm64.zip
 var embeddedNode []byte
 
-//go:embed files/playwright-core-1.64.1.tgz
-var embeddedPlaywright []byte
-
 // Embedded returns the Node zip and playwright-core tarball built into this exe (their pinned
 // versions are NodeVersion and PlaywrightVersion); they are verified against the pins before use.
 //

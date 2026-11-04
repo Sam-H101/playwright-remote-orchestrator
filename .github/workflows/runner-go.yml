@@ -81,7 +81,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: runner/internal/runtime/files
-          key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go') }}
+          key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go', 'runner/playwright/package-lock.json') }}
       - name: version
         id: version
         run: |

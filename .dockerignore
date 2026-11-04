@@ -1,4 +1,4 @@
-# Build context for the hub, runner and UI images is the repo root. Keep secrets, host
+# Build context for every image is the repo root. Keep secrets, host
 # node_modules, logs and tests out of it.
 .git
 .github

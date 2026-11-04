@@ -84,7 +84,7 @@ A release takes master as it is when its run starts, so merges that land while a
 
 The Windows runner's binaries are released by hand: push a `pwrunner/vX.Y.Z` tag, and `.github/workflows/runner-go.yml` builds and attaches them. That tag publishes the images too, so give it the next free version number. The automatic releases count on from it.
 
-Dependabot (`.github/dependabot.yml`) opens update pull requests every Monday at 06:00 UTC, for the gateway's npm packages, the runner's Go modules, the Python requirements, the images' base images and the workflows' actions. Merging one releases a patch. Its GitHub Actions updates come labelled `release:skip`. A base-image update's checks only build the images, so try it before merging. It leaves Playwright alone: see [Upgrading Playwright](#upgrading-playwright).
+Dependabot (`.github/dependabot.yml`) opens update pull requests every Monday at 06:00 UTC, for the gateway's npm packages, the runner's Go modules, the Python requirements, Playwright, the images' base images and the workflows' actions. Merging one releases a patch. Its GitHub Actions updates come labelled `release:skip`, and its Playwright updates `release:minor` (see [Upgrading Playwright](#upgrading-playwright)). An update to the hub, runner or checks image is tested by building the images and running a check through the hub and a runner with them; the Grid UI's base image is only built, so try that one before merging.
 
 ## Connecting tests
 
@@ -167,12 +167,13 @@ Use a version tag (`:1.2.0`) instead of `:latest` to pin it; the runner's Playwr
 
 ## Adding a Linux or macOS host (no docker)
 
-playwright-core and the browsers go outside the checkout, in fixed folders, so `npm ci` after a `git pull` keeps them and the service user finds the browsers:
+playwright-core (the version `runner/playwright` pins) and the browsers go outside the checkout, in fixed folders, so `npm ci` after a `git pull` keeps them and the service user finds the browsers:
 
 ```
 sudo git clone <this repo> /opt/playwright-remote-orchestrator
 cd /opt/playwright-remote-orchestrator/gateway && sudo npm ci --omit=dev
-sudo npm install --prefix /opt/playwright-core playwright-core@1.64.1
+sudo mkdir -p /opt/playwright-core && sudo cp /opt/playwright-remote-orchestrator/runner/playwright/package*.json /opt/playwright-core/
+cd /opt/playwright-core && sudo npm ci --omit=dev
 sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright node /opt/playwright-core/node_modules/playwright-core/cli.js install --with-deps chromium
 ```
 
@@ -479,14 +480,24 @@ When the hub turns the agent away, it logs why and keeps retrying (1 s doubling 
 
 ## Upgrading Playwright
 
-The checks' client and every run-server must be on the same minor version (1.64.1 today; see [here][l1]). Bump these together, by hand (Dependabot skips Playwright, since it would bump only one of them):
+The checks' client and every run-server must be on the same minor version (see [here][l1]). The version is pinned once, in `runner/playwright/package.json` (with its integrity in `package-lock.json`), and every image and `pwrunner` built from this repo is built with it:
 
-* `PLAYWRIGHT_VERSION` in `docker/python/Dockerfile` and `playwright==` in `docker/python/requirements.txt` (checks)
-* `PLAYWRIGHT_VERSION` in `docker/runner/Dockerfile` (runner containers: base image and `playwright-core`), then rebuild every runner image
-* the pins in `runner/internal/runtime/pins.go` (`go run ./tools/updatepins --node <v> --playwright <new>` prints them; also update the file names in `embed_windows_*.go`), release a new `pwrunner.exe`, and re-run `pwrunner install` on every Windows host (or pass `--playwright-version <new> --playwright-integrity <sha512-...>` to an existing exe)
-* the version `.github/workflows/windows-backend-installer.yml` checks an install for, and the `-PlaywrightVersion` default in the deprecated `installer/windows/install-backend.ps1`
-* `npm install --prefix /opt/playwright-core playwright-core@<new>` and the browser install on every Linux/macOS agent host
-* the `run-server` install on any legacy static host
+* The runner image installs that playwright-core and its browsers.
+* The checks image installs the Python `playwright` with the same major.minor, the newest up to that version (the Python package skips some of npm's patch releases), and its browsers.
+* `pwrunner` embeds it and installs it by default. The Windows install test and the deprecated `installer/windows/install-backend.ps1` default to it too.
+
+Dependabot proposes each new version as one pull request that changes those two files, two weeks after it comes out. Its checks build the images and run a check through the hub on a runner in Chromium, Firefox and WebKit, and build `pwrunner` and install it on Windows. The Python package usually comes out a week or two after npm's, but it has taken five; until it has, the checks image fails with `No Playwright X.Y up to X.Y.Z on PyPI?`. Leave the pull request open and re-run its failed jobs once it's out.
+
+The pull request is labelled `release:minor`. After merging it, upgrade every place Playwright runs:
+
+* The orchestrator: `git pull` and `docker compose ... up -d --build`, or with `docker-compose.ghcr.yaml`, `pull` and `up -d`. That upgrades the checks and the compose runners together. An `IMAGE_TAG` of `X.Y` never moves to the next minor version, which is what a Playwright update is: use `latest` or the new release.
+* Windows hosts: release a new `pwrunner` (a `pwrunner/vX.Y.Z` tag, see [Releases](#releases)) and re-run `pwrunner install` with it on every host, or pass `--playwright-version <new> --playwright-integrity <sha512-...>` (the `integrity` in `package-lock.json`) to the existing exe.
+* Linux/macOS agent hosts: after a `git pull`, repeat the copy, `npm ci` and browser install steps from [Adding a Linux or macOS host](#adding-a-linux-or-macos-host-no-docker), then restart the agent.
+* Runner containers on other docker hosts: pull the new image and recreate the container (the same `docker run`).
+* Legacy static hosts: the `run-server` install.
+* Any other Playwright client that connects to the hub: the same minor version.
+
+To move to a version by hand, change it in `runner/playwright/package.json` and run `npm install` in that folder, which updates `package-lock.json`.
 
 The hub itself needs no upgrade: it passes frames through without reading them. It does read each client's version, and only routes it to nodes on the same minor version, so during a rolling upgrade clients go to the nodes that match them.
 

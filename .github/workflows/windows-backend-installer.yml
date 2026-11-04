@@ -64,7 +64,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: runner/internal/runtime/files
-          key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go') }}
+          key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go', 'runner/playwright/package-lock.json') }}
 
       - name: Build pwrunner with the runtime embedded
         working-directory: runner
@@ -188,7 +188,9 @@ jobs:
           & $env:PWRUNNER status --install-dir $env:INSTALL_DIR --health-timeout 90
           if ($LASTEXITCODE -ne 0) { throw 'The previous install did not come back' }
           $manifest = Get-Content "$env:INSTALL_DIR\manifest.json" -Raw | ConvertFrom-Json
-          if ($manifest.playwrightVersion -ne '1.64.1') { throw "app\ changed: $($manifest | ConvertTo-Json)" }
+          # The version the exe installed by default: the one runner/playwright pins.
+          $pinned = (Get-Content runner\playwright\package.json -Raw | ConvertFrom-Json).dependencies.'playwright-core'
+          if (-not $pinned -or $manifest.playwrightVersion -ne $pinned) { throw "app\ changed (pinned: $pinned): $($manifest | ConvertTo-Json)" }
 
       - name: Connect clients through the hub
         run: |
