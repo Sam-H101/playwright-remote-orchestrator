@@ -509,4 +509,11 @@ The hub itself needs no upgrade: it passes frames through without reading them. 
 
 None of these need docker (the Go tests need Go 1.26 or newer).
 
+## Licensing
+
+<!-- Not "License": GitHub's license detection reads a "License" section too, and takes "MIT" in it for the plain MIT license. -->
+MIT No Attribution (MIT-0): see [LICENSE](LICENSE). Use, change and share it however you like, in open or closed projects, without crediting it or including the license. It comes as is, without warranty, and its authors aren't liable for any claim or damages arising from it.
+
+The third-party software the images and the Windows runner bundle (Node.js, Playwright, the browsers and the rest) keeps its own licenses.
+
 [l1]: https://playwright.dev/docs/intro
