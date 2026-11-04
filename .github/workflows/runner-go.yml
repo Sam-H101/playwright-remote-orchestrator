@@ -31,12 +31,12 @@ jobs:
         working-directory: runner
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: runner/go.mod
           cache-dependency-path: runner/go.sum
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -73,12 +73,12 @@ jobs:
         working-directory: runner
         shell: powershell
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: runner/go.mod
           cache-dependency-path: runner/go.sum
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: runner/internal/runtime/files
           key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go') }}
@@ -99,7 +99,7 @@ jobs:
           $line = & "dist\pwrunner-$v-windows-amd64.exe" version
           Write-Host $line
           if ($line -notmatch 'embedded=yes') { throw "embedded build does not report embedded=yes: $line" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pwrunner-${{ steps.version.outputs.version }}
           path: runner/dist/*
@@ -116,7 +116,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pwrunner-${{ needs.build.outputs.version }}
           path: dist
@@ -152,12 +152,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: runner/go.mod
           cache-dependency-path: runner/go.sum
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm

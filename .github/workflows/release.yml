@@ -55,7 +55,7 @@ jobs:
       previous: ${{ steps.next.outputs.previous }}
       sha: ${{ steps.next.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # every tag and branch, and the merges since the last release
 
@@ -87,7 +87,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: bash .github/scripts/next-version.test.sh
 
   release:
@@ -100,7 +100,7 @@ jobs:
     outputs:
       publish: ${{ steps.release.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # the tags as they are now: this job may be a re-run of an old one
 
