@@ -28,15 +28,15 @@ jobs:
       HUB_HTTP: http://127.0.0.1:4500
       PWRUNNER: C:\pwbuild\pwrunner.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: gateway/package-lock.json
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: runner/go.mod
           cache-dependency-path: runner/go.sum
@@ -61,7 +61,7 @@ jobs:
           go test ./...
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: runner/internal/runtime/files
           key: runtime-files-${{ hashFiles('runner/internal/runtime/pins.go') }}
@@ -244,7 +244,7 @@ jobs:
 
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backend-logs
           path: |
