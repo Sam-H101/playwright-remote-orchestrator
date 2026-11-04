@@ -502,7 +502,7 @@ The hub itself needs no upgrade: it passes frames through without reading them. 
 ## Tests
 
 * Gateway: `cd gateway && npm ci && npm test`. `GATEWAY_TEST_MYSQL=1` plus `DB_*` also runs the MySQL registry tests; they drop the gateway tables in `DB_NAME`, so point it at a scratch database.
-* Orchestrator and Grid UI: `pip install -r ui/requirements.txt pytest && python -m pytest tests ui/tests`. The example-check and browser tests run when the `playwright` package is installed; the MySQL tests run when `ORCHESTRATOR_TEST_DB` (plus `DB_*`) points at a scratch database.
+* Orchestrator and Grid UI: `pip install -r ui/requirements.txt pytest && python -m pytest tests ui/tests`. The example-check and browser tests run when the `playwright` package is installed; the MySQL tests run when `ORCHESTRATOR_TEST_DB` (plus `DB_*`) points at a scratch database. CI runs them all, the Grid UI's inside the Grid UI image (`.github/workflows/python-tests.yml`).
 * Agent contract: `cd gateway && node --test test/agent-contract.test.js` runs any agent as a child process against an in-process hub (`AGENT_CMD`, default `node agent.js`; `AGENT_CMD="..\dist\pwrunner.exe run"` for the Go agent).
 * Go runner: `cd runner && go test ./...`, and `go test -tags integration ./test/integration/...` against the real hub (needs `gateway/node_modules`). See `runner/README.md`.
 * Windows install: `.github/workflows/windows-backend-installer.yml` migrates a PowerShell install to `pwrunner.exe` against a hub on a Windows runner and connects Playwright through it.

@@ -31,6 +31,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.parse
 import zlib
@@ -72,6 +73,9 @@ _ENV_OVERRIDES = {
     "database": "DB_NAME",
 }
 _schema_attempted = False
+_schema_lock = threading.Lock()
+_schema_failure = None  # the last attempt that couldn't reach the database: its error's (type, message, public)
+_SCHEMA_WAIT_S = 10  # two connect timeouts
 
 
 class DatabaseUnavailable(Exception):
@@ -267,26 +271,47 @@ def _schema_statements(text):
 
 
 def ensure_schema():
-    """Create the tables on MySQL if src/schema.sql is reachable. Tried once per process."""
-    global _schema_attempted
+    """Create the tables on MySQL if src/schema.sql is reachable. Tried once per process.
+
+    The background recorder and a request can both be first on a new database: whoever comes second
+    waits until the tables are made, rather than finding them missing. If the database can't be reached,
+    those that waited get that error, rather than each waiting out a connect timeout of its own."""
+    global _schema_attempted, _schema_failure
     if _schema_attempted or DB_ENGINE != "mysql":
         return
-    try:
-        with open(SCHEMA_PATH) as stream:
-            text = stream.read()
-    except OSError:
-        _schema_attempted = True
-        log.info("schema not found at %s; waiting for the hub or a check to create the tables", SCHEMA_PATH)
+    failure = _schema_failure
+    # Bounded: PyMySQL has no read timeout, so a server that takes the connection and never answers would
+    # otherwise hold up every caller behind it. One that gives up carries on, as before there was a lock.
+    if not _schema_lock.acquire(timeout=_SCHEMA_WAIT_S):
         return
-    with _session() as cur:  # DatabaseUnavailable propagates, so we try again next time
-        _schema_attempted = True
-        for statement in _schema_statements(text):
-            code = "\n".join(l for l in statement.splitlines() if not l.strip().startswith("--")).strip()
-            if code:
-                try:
-                    cur.execute(code)
-                except Exception as e:  # e.g. no CREATE privilege: the UI still works read-only
-                    log.warning("could not apply schema statement: %s", e)
+    try:
+        if _schema_attempted:
+            return
+        if _schema_failure is not failure:  # an attempt failed while we waited
+            kind, message, public = _schema_failure
+            raise kind(message, public)
+        try:
+            with open(SCHEMA_PATH) as stream:
+                text = stream.read()
+        except OSError:
+            _schema_attempted = True
+            log.info("schema not found at %s; waiting for the hub or a check to create the tables", SCHEMA_PATH)
+            return
+        try:
+            with _session() as cur:  # DatabaseUnavailable propagates, so we try again next time
+                for statement in _schema_statements(text):
+                    code = "\n".join(l for l in statement.splitlines() if not l.strip().startswith("--")).strip()
+                    if code:
+                        try:
+                            cur.execute(code)
+                        except Exception as e:  # e.g. no CREATE privilege: the UI still works read-only
+                            log.warning("could not apply schema statement: %s", e)
+                _schema_attempted = True
+        except DatabaseUnavailable as e:
+            _schema_failure = (type(e), str(e), e.public)
+            raise
+    finally:
+        _schema_lock.release()
 
 
 def _tables(cur):

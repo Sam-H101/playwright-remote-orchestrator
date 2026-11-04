@@ -12,7 +12,8 @@ CSS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 
 
 def _tokens():
-    text = open(CSS, encoding="utf-8").read()
+    with open(CSS, encoding="utf-8") as f:
+        text = f.read()
     pairs = dict(re.findall(r"--([\w-]+):\s*light-dark\((#[0-9a-fA-F]{6}),\s*#[0-9a-fA-F]{6}\)", text))
     dark = dict((k, v) for k, v in re.findall(r"--([\w-]+):\s*light-dark\(#[0-9a-fA-F]{6},\s*(#[0-9a-fA-F]{6})\)", text))
     tint = int(re.search(r"--tint:\s*(\d+)%", text).group(1)) / 100

@@ -3,6 +3,7 @@
 Skipped unless the playwright package and its Chromium are installed:
     pip install playwright && python -m playwright install chromium
 """
+import contextlib
 import sqlite3
 import threading
 import urllib.parse
@@ -62,7 +63,7 @@ def page(browser):
 
 
 def run(path, sql, params=()):
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         return con.execute(sql, params).fetchall()
 
 

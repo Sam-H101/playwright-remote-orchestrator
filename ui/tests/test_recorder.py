@@ -1,7 +1,9 @@
 """The server-side flight recorder: diff(), the ring buffer, recording with no page open, admin
 attribution, the guarded force release, the guessing limit and what a database error discloses."""
+import contextlib
 import datetime
 import sqlite3
+import time
 
 import pytest
 
@@ -14,7 +16,7 @@ def utc(seconds=0):
 
 
 def run(path, sql, params=()):
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         return con.execute(sql, params).fetchall()
 
 
@@ -29,7 +31,7 @@ def free_ids(path):
 @pytest.fixture
 def grid(tmp_path, monkeypatch):
     path = str(tmp_path / "grid.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.seed(con)
     monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
     monkeypatch.setattr(store, "SQLITE_PATH", path)
@@ -146,7 +148,6 @@ def test_short_runs_are_recorded_with_no_page_open_and_a_late_tab_sees_them(grid
     marks = ",".join("?" * len(ids))
     run(path, "UPDATE portUsage SET inUse = 1, LastRunDate = ? WHERE id IN ({})".format(marks), [utc()] + ids)
     run(path, "UPDATE portUsage SET inUse = 0, LastRunDate = ? WHERE id IN ({})".format(marks), [utc(4)] + ids)
-    import time
     time.sleep(0.02)
     assert rec.tick()
     # A tab opened now asks for everything: the seven runs are there.
@@ -158,6 +159,35 @@ def test_short_runs_are_recorded_with_no_page_open_and_a_late_tab_sees_them(grid
     assert "events" not in client.get("/api/status").get_json()
     r = client.get("/api/events?since=0")
     assert r.headers["Cache-Control"] == "no-store" and len([e for e in r.get_json()["events"] if e["type"] == "finished"]) == 7
+
+
+def test_the_background_recorder_stops_at_once_and_starts_again():
+    rec = recorder.Recorder(lambda: snap(G0, []), lambda: "db", interval_s=60)
+    for _ in range(2):
+        rec.ensure_running()
+        thread = rec._thread
+        assert thread.is_alive()
+        began = time.monotonic()
+        rec.stop()
+        assert not thread.is_alive() and time.monotonic() - began < 5  # woken, not left to sleep out its 60 s
+    rec.stop()  # already stopped: nothing to do
+
+
+def test_a_cursor_that_is_not_a_finite_number_means_everything(grid):
+    """Like any cursor that isn't a number: the whole recording, not an error."""
+    client, path = grid
+    client.get("/api/status")
+    ids = free_ids(path)[:2]
+    marks = ",".join("?" * len(ids))
+    run(path, "UPDATE portUsage SET LastRunDate = ? WHERE id IN ({})".format(marks), [utc(4)] + ids)
+    everything = client.get("/api/events?since=0").get_json()["events"]
+    assert len(everything) == 2
+    for cursor in ("inf", "-inf", "1e999", "-1e999", "nan", "infinity", "x", ""):
+        r = client.get("/api/status", query_string={"events": cursor})
+        assert r.status_code == 200 and r.get_json()["events"] == everything, cursor
+        r = client.get("/api/events", query_string={"since": cursor})
+        assert r.status_code == 200 and r.get_json()["events"] == everything, cursor
+    assert client.get("/api/events?since=1e300").get_json()["events"] == []  # a finite cursor, past them all
 
 
 def test_a_force_release_only_ends_the_claim_the_confirm_described(grid, monkeypatch):

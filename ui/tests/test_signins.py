@@ -1,6 +1,7 @@
 """Saved sign-ins: their encryption (mfa.py), store.py and the API against sqlite.
 Run from the repo root: python -m pytest ui/tests"""
 import base64
+import contextlib
 import datetime
 import hashlib
 import io
@@ -122,7 +123,7 @@ def test_the_key_problem_says_what_the_key_is_for(monkeypatch):
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     path = str(tmp_path / "grid.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.create_schema(con)
     monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
     monkeypatch.setattr(store, "SQLITE_PATH", path)
@@ -133,12 +134,12 @@ def db(tmp_path, monkeypatch):
 
 
 def run(path, sql, params=()):
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         return con.execute(sql, params).fetchall()
 
 
 def row(path, name="contoso"):
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         con.row_factory = sqlite3.Row
         found = con.execute("SELECT * FROM savedSignins WHERE name = ?", (name,)).fetchone()
         return dict(found) if found else None
@@ -476,7 +477,7 @@ def test_a_state_copied_to_another_name_does_not_decrypt(db):
 
 
 def test_new_names_stop_at_200(db):
-    with sqlite3.connect(db) as con:
+    with contextlib.closing(sqlite3.connect(db)) as con, con:
         con.executemany("INSERT INTO savedSignins (name, createdAt) VALUES (?, ?)",
                         [("n-{}".format(i), ts(0)) for i in range(199)])
     assert store.checkout_signin("check", "new")["status"] == "sign-in"

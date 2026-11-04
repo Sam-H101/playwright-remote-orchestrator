@@ -1,4 +1,5 @@
 """The admin gate, the sign-in session endpoint, the security headers and the additive status keys."""
+import contextlib
 import json
 import os
 import random
@@ -16,7 +17,7 @@ TEMPLATE = os.path.join(os.path.dirname(STATIC), "templates", "index.html")
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     path = str(tmp_path / "grid.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.seed(con)
     monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
     monkeypatch.setattr(store, "SQLITE_PATH", path)
@@ -27,6 +28,7 @@ def client(tmp_path, monkeypatch):
 def test_every_response_carries_the_security_headers(client):
     for url in ("/", "/ui", "/api/status", "/status", "/api/session", "/static/js/main.js", "/static/grid.css", "/nope"):
         r = client.get(url)
+        r.close()  # only the headers are wanted, and a static file's response holds the file open
         assert r.headers["Content-Security-Policy"] == (
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
             "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"), url
@@ -40,7 +42,8 @@ def test_every_response_carries_the_security_headers(client):
 def test_scripts_are_served_as_javascript(client):
     # With nosniff, a module served as text/plain (a Windows registry quirk) would not run at all.
     for name in ("js/main.js", "js/live.js", "theme.js"):
-        assert client.get("/static/" + name).headers["Content-Type"].startswith("text/javascript")
+        with client.get("/static/" + name) as r:
+            assert r.headers["Content-Type"].startswith("text/javascript")
 
 
 def test_the_page_has_no_inline_script_or_style(client):
@@ -119,7 +122,8 @@ def test_only_the_auth_module_knows_how_admin_credentials_are_kept():
     for folder, _, files in os.walk(STATIC):
         for name in files:
             if name.endswith(".js"):
-                text = open(os.path.join(folder, name), encoding="utf-8").read()
+                with open(os.path.join(folder, name), encoding="utf-8") as f:
+                    text = f.read()
                 for word in ("X-Grid-Token", "sessionStorage", "gridToken"):
                     if word in text:
                         owners.setdefault(word, set()).add(name)
@@ -129,7 +133,8 @@ def test_only_the_auth_module_knows_how_admin_credentials_are_kept():
 def test_markup_is_built_only_through_the_escaping_template():
     for folder, _, files in os.walk(os.path.join(STATIC, "js")):
         for name in files:
-            text = open(os.path.join(folder, name), encoding="utf-8").read()
+            with open(os.path.join(folder, name), encoding="utf-8") as f:
+                text = f.read()
             assert 'style="' not in text and "style='" not in text and "setAttribute(\"style\"" not in text, name
             if name != "html.js":
                 assert ".innerHTML" not in text and "outerHTML" not in text and "insertAdjacentHTML" not in text, name
@@ -138,11 +143,11 @@ def test_markup_is_built_only_through_the_escaping_template():
 
 def test_demo_activity_claims_and_releases_like_the_checks(tmp_path):
     path = str(tmp_path / "demo.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.seed(con)
         before = con.execute("SELECT id, inUse, LastRunDate, failCount FROM portUsage ORDER BY id").fetchall()
     rng = random.Random(4)
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         claimed = demo.burst(con, rng)
         assert 3 <= len(claimed) <= 7
         assert all(r[0] == 1 for r in con.execute("SELECT inUse FROM portUsage WHERE id IN ({})".format(
