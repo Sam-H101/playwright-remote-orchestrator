@@ -1,0 +1,86 @@
+# Dependabot opens update pull requests once a week:
+# - npm, Go and pip: one per ecosystem for the minor and patch updates, and one for each major.
+# - GitHub Actions: one for everything. The workflows use major tags, so these are mostly majors.
+# - Base images: one per image. Their tags already take patch releases, so these are new Node and Python
+#   versions. Their checks only build the images, so try one before merging it.
+#
+# Merging one releases it like any other pull request (release.yml), as a patch. GitHub Actions updates
+# change only CI, so they're labelled release:skip and go out with the next release. Setting labels replaces
+# Dependabot's defaults, so `dependencies` is listed too. Dependabot creates that label with its first pull
+# request for any other ecosystem.
+#
+# A version is only offered once it has been out for a week (cooldown), long enough for most compromised
+# releases to be caught and pulled. That only holds for exact pins: ranged and unpinned Python requirements
+# and the actions' major tags take a new release the next time they're installed or used. Base images have
+# no cooldown: Docker Hub pushes their tags again every few days, and Dependabot counts the week from the
+# last push, so it would hold back almost every update. Security updates never wait.
+#
+# Left out on purpose:
+# - Playwright. Its version moves in several places at once (README.md, "Upgrading Playwright"), and
+#   Dependabot would move only one of them. Its pip package is ignored. The base images' tags come from an
+#   ARG, which Dependabot can't read, and they're ignored too in case that changes.
+# - The compose files. Their one third-party image, mysql:8.4, is an LTS line whose tag already takes its
+#   patch releases, and moving to the next LTS is a database upgrade, not a bump.
+# - The Windows runner's Node and Playwright runtime, pinned in runner/internal/runtime/pins.go, which
+#   Dependabot can't read.
+
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels: [dependencies, 'release:skip']
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: npm
+    directory: /gateway # the hub and the Node agent
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      gateway:
+        patterns: ['*']
+        update-types: [minor, patch]
+
+  - package-ecosystem: gomod
+    directory: /runner # pwrunner
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      runner:
+        patterns: ['*']
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directories: [/ui, /docker/python] # the Grid UI, and the checks image
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # Move a range only when a new version falls outside it. By default Dependabot raises every >= floor
+    # to the newest version, which changes nothing in the images (they install the newest in range anyway).
+    versioning-strategy: increase-if-necessary
+    ignore:
+      - dependency-name: playwright # moves with the checks' base image: see above
+    groups:
+      python:
+        patterns: ['*']
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directories: ['/docker/*'] # each published image's base image
+    schedule:
+      interval: weekly
+    ignore:
+      # The runner's and the checks' base images (Dependabot names an image without its registry): see above.
+      - dependency-name: playwright
+      - dependency-name: playwright/python
