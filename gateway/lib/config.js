@@ -120,14 +120,16 @@ function resolveCli(value, cwd) {
     if (!fs.existsSync(cli)) throw new Error(`PLAYWRIGHT_CLI not found: ${cli}`);
     return cli;
   }
-  // playwright-core's "exports" may not list cli.js, so go through package.json.
+  // playwright-core's "exports" may not list cli.js, so go through package.json. In a checkout,
+  // runner/playwright is where the pinned version is installed (npm ci there).
+  const pinned = path.resolve(__dirname, '..', '..', 'runner', 'playwright');
   for (const request of ['playwright-core/cli.js', 'playwright-core/package.json']) {
     try {
-      const resolved = require.resolve(request, { paths: [cwd, __dirname] });
+      const resolved = require.resolve(request, { paths: [cwd, __dirname, pinned] });
       return path.join(path.dirname(resolved), 'cli.js');
     } catch {}
   }
-  throw new Error('playwright-core not found; install it (npm install playwright-core@1.64.1) or set PLAYWRIGHT_CLI');
+  throw new Error('playwright-core not found; install the version runner/playwright pins (npm ci there) or set PLAYWRIGHT_CLI');
 }
 
 function agentConfig(argv = process.argv.slice(2), env = process.env, cwd = process.cwd()) {

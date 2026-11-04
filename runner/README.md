@@ -28,9 +28,10 @@ go build -tags embedruntime -o ..\dist\pwrunner.exe .\cmd\pwrunner   # runtime e
 .\build\build.ps1 -Version 1.1.0                                     # every release artefact + SHA256SUMS.txt into dist\
 ```
 
-The pinned versions and hashes live in `internal/runtime/pins.go`. `go run ./tools/updatepins --node <v>
---playwright <v>` prints a new block for it; update the file names in `internal/runtime/embed_windows_*.go`
-to match.
+Node's pinned version and hashes live in `internal/runtime/pins.go`. `go run ./tools/updatepins --node <v>`
+prints a new block for it; update the Node file names in `internal/runtime/embed_windows_*.go` to match.
+playwright-core is pinned in `playwright/` (`package.json`, with its integrity in `package-lock.json`),
+which Dependabot updates; the build picks it up from there.
 
 ## Test
 

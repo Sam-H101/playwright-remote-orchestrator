@@ -9,15 +9,19 @@ name: Docker images
 #                                for a tag pushed before this workflow existed)
 # :latest and :X.Y move only to the newest release (and the newest of that X.Y), so publishing an older
 # version again (a re-run, a backfill, a late tag) can't take them back.
-# Pull requests only build (amd64), to catch a broken Dockerfile before it merges.
+# Pull requests only build (amd64, and arm64 for the runner), to catch a broken Dockerfile before it merges.
+# Pull requests and master then run a check through the hub on a runner, in every browser, with the
+# images just built (.github/scripts/e2e.sh): the end-to-end test a Playwright update needs.
 
 on:
   push:
     branches: [master]
     tags: ['v*', 'pwrunner/v*']
-    paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', '.github/workflows/docker-images.yml']
+    paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', 'runner/playwright/**',
+            '.github/scripts/e2e*', '.github/workflows/docker-images.yml']
   pull_request:
-    paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', '.github/workflows/docker-images.yml']
+    paths: ['docker/**', 'gateway/**', 'ui/**', 'src/schema.sql', 'runner/playwright/**',
+            '.github/scripts/e2e*', '.github/workflows/docker-images.yml']
   workflow_call:
     inputs:
       ref:
@@ -58,10 +62,13 @@ jobs:
             file: docker/hub/Dockerfile
             context: .
             platforms: linux/amd64,linux/arm64
+          # Pull requests build its arm64 too: it installs Playwright's browsers and their packages itself,
+          # so a Playwright update can break one platform and not the other.
           - name: runner
             file: docker/runner/Dockerfile
             context: .
             platforms: linux/amd64,linux/arm64
+            pr_platforms: linux/amd64,linux/arm64
           - name: grid-ui
             file: docker/ui/Dockerfile
             context: .
@@ -70,8 +77,10 @@ jobs:
           # its trust-store fix links the x86_64 p11-kit library by path.
           - name: checks
             file: docker/python/Dockerfile
-            context: docker/python
+            context: .
             platforms: linux/amd64
+    env:
+      PLATFORMS: ${{ github.event_name == 'pull_request' && (matrix.pr_platforms || 'linux/amd64') || matrix.platforms }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -133,7 +142,7 @@ jobs:
             type=ref,event=pr
 
       - uses: docker/setup-qemu-action@v4
-        if: github.event_name != 'pull_request' && contains(matrix.platforms, 'arm64')
+        if: contains(env.PLATFORMS, 'arm64')
 
       - uses: docker/setup-buildx-action@v4
 
@@ -148,9 +157,10 @@ jobs:
       - name: build${{ github.event_name != 'pull_request' && ' and push' || '' }}
         uses: docker/build-push-action@v7
         with:
-          context: ${{ matrix.context }}
+          # A ref from before runner/playwright built the checks image from docker/python.
+          context: ${{ matrix.name == 'checks' && hashFiles('runner/playwright/package.json') == '' && 'docker/python' || matrix.context }}
           file: ${{ matrix.file }}
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || matrix.platforms }}
+          platforms: ${{ env.PLATFORMS }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -164,3 +174,45 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: end to end
+    # Only for the commit the workflow runs on: not for a release (release.yml, a dispatch with a version,
+    # a tag), whose commit was tested on master, nor for a rebuild of another ref.
+    if: inputs.version == '' && inputs.ref == '' && !startsWith(github.ref, 'refs/tags/')
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # The image jobs just built these (amd64); their layers come from those jobs' cache.
+      - name: load hub
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/hub/Dockerfile
+          load: true
+          tags: e2e/hub
+          cache-from: type=gha,scope=hub
+      - name: load runner
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/runner/Dockerfile
+          load: true
+          tags: e2e/runner
+          cache-from: type=gha,scope=runner
+      - name: load checks
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/python/Dockerfile
+          load: true
+          tags: e2e/checks
+          cache-from: type=gha,scope=checks
+
+      - name: a check in every browser, through the hub
+        run: bash .github/scripts/e2e.sh e2e/hub e2e/runner e2e/checks

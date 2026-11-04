@@ -78,7 +78,9 @@ services:
   web:
     container_name: python_playwright
     image: playwright_orchestrator_web
-    build: ./docker/python
+    build:
+      context: .
+      dockerfile: docker/python/Dockerfile
     networks:
       - playwright
 

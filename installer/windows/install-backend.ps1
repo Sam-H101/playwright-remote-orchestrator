@@ -45,8 +45,9 @@ param(
     [Alias('PortStart')][ValidateRange(1, 65535)][int]$BasePort = 3100,
     # Defaults to the folder this script is in when run from an install, otherwise C:\PlaywrightBackend.
     [string]$InstallDir,
-    # Must match the major.minor of the Playwright client the orchestrator's checks use.
-    [string]$PlaywrightVersion = '1.64.1',
+    # Must match the major.minor of the Playwright client the orchestrator's checks use. Defaults to the
+    # version runner\playwright pins when run from a checkout, else to the one already installed.
+    [string]$PlaywrightVersion,
     [string[]]$Browsers = @('chromium'),
     [string]$ReportUrl,
     [int]$HealthTimeoutSec = 60,
@@ -70,6 +71,13 @@ Import-Module (Join-Path $PSScriptRoot 'PlaywrightBackend.psm1') -Force
 Write-BackendLog 'install-backend.ps1 is deprecated: use pwrunner.exe install (see installer\windows\DEPRECATED.md).' 'WARN'
 
 $InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+if (-not $PlaywrightVersion) {
+    $pinFile = Join-Path $PSScriptRoot '..\..\runner\playwright\package.json'
+    $installed = Get-BackendConfig $InstallDir
+    $PlaywrightVersion = if (Test-Path -LiteralPath $pinFile) { (Get-Content -LiteralPath $pinFile -Raw | ConvertFrom-Json).dependencies.'playwright-core' }
+        elseif ($installed) { $installed.playwrightVersion }
+    if (-not $PlaywrightVersion) { throw 'Pass -PlaywrightVersion: this is not a checkout with runner\playwright\package.json, and nothing is installed yet.' }
+}
 # Inside the Invoke-Step script blocks $PSBoundParameters is the block's own (empty) one.
 $bound = $PSBoundParameters
 $started = Get-Date

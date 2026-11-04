@@ -1,0 +1,9 @@
+{
+  "name": "runner-playwright",
+  "private": true,
+  "description": "The playwright-core every runner serves and the version the checks' Playwright matches: see README.md, Upgrading Playwright",
+  "license": "MIT-0",
+  "dependencies": {
+    "playwright-core": "1.64.1"
+  }
+}
