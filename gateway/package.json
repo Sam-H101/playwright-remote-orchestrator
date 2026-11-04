@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "Hub and node agent that tunnel Playwright run-server sessions through one port",
-  "license": "UNLICENSED",
+  "license": "MIT-0",
   "engines": {
     "node": ">=20"
   },
