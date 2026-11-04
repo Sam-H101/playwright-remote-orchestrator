@@ -1,4 +1,4 @@
-# Dependabot opens update pull requests once a week:
+# Dependabot opens update pull requests every Monday at 06:00 UTC:
 # - npm, Go and pip: one per ecosystem for the minor and patch updates, and one for each major.
 # - GitHub Actions: one for everything. The workflows use major tags, so these are mostly majors.
 # - Base images: one per image. Their tags already take patch releases, so these are new Node and Python
@@ -6,8 +6,8 @@
 #
 # Merging one releases it like any other pull request (release.yml), as a patch. GitHub Actions updates
 # change only CI, so they're labelled release:skip and go out with the next release. Setting labels replaces
-# Dependabot's defaults, so `dependencies` is listed too. Dependabot creates that label with its first pull
-# request for any other ecosystem.
+# Dependabot's defaults, so `dependencies` is listed too. That label was made by hand: Dependabot only makes it
+# for an ecosystem that keeps the defaults.
 #
 # A version is only offered once it has been out for a week (cooldown), long enough for most compromised
 # releases to be caught and pulled. That only holds for exact pins: ranged and unpinned Python requirements
@@ -31,6 +31,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: monday
+      time: '06:00' # UTC
     cooldown:
       default-days: 7
     labels: [dependencies, 'release:skip']
@@ -42,6 +44,8 @@ updates:
     directory: /gateway # the hub and the Node agent
     schedule:
       interval: weekly
+      day: monday
+      time: '06:00' # UTC
     cooldown:
       default-days: 7
     groups:
@@ -53,6 +57,8 @@ updates:
     directory: /runner # pwrunner
     schedule:
       interval: weekly
+      day: monday
+      time: '06:00' # UTC
     cooldown:
       default-days: 7
     groups:
@@ -64,6 +70,8 @@ updates:
     directories: [/ui, /docker/python] # the Grid UI, and the checks image
     schedule:
       interval: weekly
+      day: monday
+      time: '06:00' # UTC
     cooldown:
       default-days: 7
     # Move a range only when a new version falls outside it. By default Dependabot raises every >= floor
@@ -80,6 +88,8 @@ updates:
     directories: ['/docker/*'] # each published image's base image
     schedule:
       interval: weekly
+      day: monday
+      time: '06:00' # UTC
     ignore:
       # The runner's and the checks' base images (Dependabot names an image without its registry): see above.
       - dependency-name: playwright

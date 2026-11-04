@@ -84,7 +84,7 @@ A release takes master as it is when its run starts, so merges that land while a
 
 The Windows runner's binaries are released by hand: push a `pwrunner/vX.Y.Z` tag, and `.github/workflows/runner-go.yml` builds and attaches them. That tag publishes the images too, so give it the next free version number. The automatic releases count on from it.
 
-Dependabot (`.github/dependabot.yml`) opens update pull requests once a week, for the gateway's npm packages, the runner's Go modules, the Python requirements, the images' base images and the workflows' actions. Merging one releases a patch. Its GitHub Actions updates come labelled `release:skip`. A base-image update's checks only build the images, so try it before merging. It leaves Playwright alone: see [Upgrading Playwright](#upgrading-playwright).
+Dependabot (`.github/dependabot.yml`) opens update pull requests every Monday at 06:00 UTC, for the gateway's npm packages, the runner's Go modules, the Python requirements, the images' base images and the workflows' actions. Merging one releases a patch. Its GitHub Actions updates come labelled `release:skip`. A base-image update's checks only build the images, so try it before merging. It leaves Playwright alone: see [Upgrading Playwright](#upgrading-playwright).
 
 ## Connecting tests
 
