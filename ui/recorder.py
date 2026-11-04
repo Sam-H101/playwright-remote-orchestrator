@@ -147,6 +147,7 @@ class Recorder:
         self.interval_s = interval_s
         self._lock = threading.Lock()
         self._thread = None
+        self._stopping = None
         self._reset(None)
 
     def _reset(self, identity):
@@ -227,7 +228,7 @@ class Recorder:
         """The events and samples recorded at or after cursor (epoch ms), for one page poll."""
         try:
             cursor = int(float(cursor))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # not a number, or an infinite one: all of them
             cursor = 0
         with self._lock:
             events = sorted((dict(e) for e in self._events.values() if e["observed"] >= cursor), key=lambda e: (e["t"], e["id"]))
@@ -245,8 +246,19 @@ class Recorder:
             return
         with self._lock:
             if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="grid-recorder", daemon=True)
+                self._stopping = threading.Event()
+                self._thread = threading.Thread(target=self._run, args=(self._stopping,), name="grid-recorder", daemon=True)
                 self._thread.start()
+
+    def stop(self):
+        """Stop the background recorder and wait for it (ensure_running() starts it again). The server never
+        does; the tests must, or one test's recorder goes on reading the database the next one sets up."""
+        with self._lock:
+            thread, self._thread = self._thread, None
+            if thread is None:
+                return
+            self._stopping.set()
+        thread.join()  # outside the lock, which the thread may need to finish a snapshot
 
     def tick(self):
         """One background step: snapshot unless a page poll just did."""
@@ -259,15 +271,16 @@ class Recorder:
             return False
         return True
 
-    def _run(self):
+    def _run(self, stopping):
         # Wake when the last snapshot (a page poll's or ours) is interval_s old, so snapshots are
         # never further apart than that; after a failure, wait a full interval before trying again.
-        while True:
+        # stop() cuts any wait short.
+        while not stopping.is_set():
             wait = self.interval_s - (time.monotonic() - self._fed_at)
             if wait > 0.01:
-                time.sleep(wait)
+                stopping.wait(wait)
             elif not self.tick():
-                time.sleep(self.interval_s)
+                stopping.wait(self.interval_s)
 
 
 def interval_from_env():

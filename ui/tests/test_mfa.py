@@ -1,6 +1,7 @@
 """MFA secrets: TOTP codes and seed encryption (mfa.py), store.py and the API against sqlite.
 Run from the repo root: python -m pytest ui/tests"""
 import base64
+import contextlib
 import datetime
 import logging
 import sqlite3
@@ -184,7 +185,7 @@ def test_without_the_cryptography_package_seeds_are_unavailable(monkeypatch):
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     path = str(tmp_path / "grid.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.create_schema(con)
     monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
     monkeypatch.setattr(store, "SQLITE_PATH", path)
@@ -195,7 +196,7 @@ def db(tmp_path, monkeypatch):
 
 
 def run(path, sql, params=()):
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         return con.execute(sql, params).fetchall()
 
 

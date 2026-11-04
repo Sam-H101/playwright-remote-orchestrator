@@ -1,7 +1,10 @@
 """store.py and the API against sqlite.  Run from the repo root: python -m pytest ui/tests"""
+import contextlib
 import datetime
 import os
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -29,13 +32,13 @@ def db(tmp_path, monkeypatch):
 
 
 def run(path, sql, params=()):
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         return con.execute(sql, params).fetchall()
 
 
 def add_node(path, name, online, seen_ago, slots):
     """slots: list of (healthy, in use since (s ago) or None, failCount)."""
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.create_schema(con)
         con.execute("INSERT INTO nodes (name, online, slots, playwrightVersion, platform, browsers, lastSeen) "
                     "VALUES (?, ?, ?, '1.64.1', 'linux', 'chromium, firefox', ?)", (name, online, len(slots), ts(seen_ago)))
@@ -59,7 +62,7 @@ def test_missing_tables_is_an_empty_grid_not_an_error(db):
 
 
 def test_legacy_db_without_nodes_table_shows_static_hosts(db):
-    with sqlite3.connect(db) as con:
+    with contextlib.closing(sqlite3.connect(db)) as con, con:
         demo.create_schema(con)
         con.execute("DROP TABLE nodes")
         cur = con.execute("INSERT INTO portStatus (PortNumber, PortServer) VALUES (3000, 'static1')")
@@ -117,7 +120,7 @@ def test_online_needs_flag_and_recent_heartbeat(db):
 
 def test_blank_hosts_are_hidden_and_names_are_quoted(db):
     add_node(db, "a b", 1, 1, [(1, None, 0)])
-    with sqlite3.connect(db) as con:
+    with contextlib.closing(sqlite3.connect(db)) as con, con:
         cur = con.execute("INSERT INTO portStatus (PortNumber, PortServer) VALUES (3000, '')")
         con.execute("INSERT INTO portUsage (id, portNumber) VALUES (?, 3000)", (cur.lastrowid,))
     snap = store.snapshot()
@@ -179,8 +182,6 @@ def test_api(db, monkeypatch):
 
 
 def test_ensure_schema_runs_each_statement_once_on_mysql(monkeypatch):
-    import contextlib
-
     executed = []
 
     class Cursor:
@@ -196,6 +197,100 @@ def test_ensure_schema_runs_each_statement_once_on_mysql(monkeypatch):
     assert [s.split("(")[0].split()[-1] for s in executed] == ["portStatus", "portUsage", "nodes", "accessTokens", "hubs",
                                                                      "mfaSecrets", "mfaIssues", "savedSignins"]
     assert not any(line.strip().startswith("--") for s in executed for line in s.splitlines())
+
+
+def finish(go_on, *threads):
+    """Let the threads run to the end, so a failed assert can't leave one holding the schema lock, or
+    marking the schema done, after the test has put store back."""
+    go_on.set()
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(5)
+
+
+def test_a_caller_waits_while_another_applies_the_schema(monkeypatch):
+    """A request and the background recorder can both be first on a new database. The one that comes
+    second must not query tables the first is still creating."""
+    executed, applying, go_on, seen = [], threading.Event(), threading.Event(), []
+
+    class Cursor:
+        def execute(self, sql):
+            applying.set()
+            go_on.wait(5)
+            executed.append(sql)
+
+    monkeypatch.setattr(store, "DB_ENGINE", "mysql")
+    monkeypatch.setattr(store, "SCHEMA_PATH", SCHEMA_SQL)
+    monkeypatch.setattr(store, "_schema_attempted", False)
+    monkeypatch.setattr(store, "_session", contextlib.contextmanager(lambda: (yield Cursor())))
+    first = threading.Thread(target=store.ensure_schema)
+    second = threading.Thread(target=lambda: (store.ensure_schema(), seen.append(len(executed))))
+    first.start()
+    try:
+        assert applying.wait(5)
+        second.start()
+        second.join(0.3)
+        assert second.is_alive()  # waiting for the first
+        go_on.set()
+        second.join(5)
+    finally:
+        finish(go_on, first, second)
+    assert seen == [8] and len(executed) == 8  # it returned once every table was made, and made none itself
+
+
+def test_callers_that_waited_on_a_failed_attempt_get_its_error(monkeypatch):
+    """While the database is down, rather than each waiting out a connect timeout of its own, one after
+    another. The next caller tries again."""
+    connecting, go_on, attempts, errors = threading.Event(), threading.Event(), [], []
+
+    def refused():
+        attempts.append(1)
+        connecting.set()
+        go_on.wait(5)
+        raise store.DatabasePermissionDenied("denied: detail", "denied")
+        yield
+
+    def call():
+        try:
+            store.ensure_schema()
+        except store.DatabaseUnavailable as e:
+            errors.append((type(e), str(e), e.public))
+
+    monkeypatch.setattr(store, "DB_ENGINE", "mysql")
+    monkeypatch.setattr(store, "SCHEMA_PATH", SCHEMA_SQL)
+    monkeypatch.setattr(store, "_schema_attempted", False)
+    monkeypatch.setattr(store, "_schema_failure", None)
+    monkeypatch.setattr(store, "_session", contextlib.contextmanager(refused))
+    first, second = threading.Thread(target=call), threading.Thread(target=call)
+    first.start()
+    try:
+        assert connecting.wait(5)
+        second.start()
+        second.join(0.3)
+        assert second.is_alive()  # waiting for the first
+        go_on.set()
+        second.join(5)
+    finally:
+        finish(go_on, first, second)
+    # One attempt, and the same error for both, kind included: a permission error is a 403, not a 503.
+    assert errors == [(store.DatabasePermissionDenied, "denied: detail", "denied")] * 2 and len(attempts) == 1
+    call()
+    assert len(errors) == 3 and len(attempts) == 2 and store._schema_attempted is False
+
+
+def test_a_caller_stops_waiting_for_an_attempt_that_never_ends(monkeypatch):
+    """A server that takes the connection and never answers holds the attempt up for good (PyMySQL has no
+    read timeout): the others carry on after a while, as they did before there was a lock."""
+    monkeypatch.setattr(store, "DB_ENGINE", "mysql")
+    monkeypatch.setattr(store, "_schema_attempted", False)
+    monkeypatch.setattr(store, "_SCHEMA_WAIT_S", 0.2)
+    assert store._schema_lock.acquire(timeout=5)  # the stuck attempt
+    try:
+        started = time.monotonic()
+        store.ensure_schema()
+        assert 0.2 <= time.monotonic() - started < 2 and store._schema_attempted is False
+    finally:
+        store._schema_lock.release()
 
 
 def set_last_run(path, name, number, seconds_ago):
@@ -246,8 +341,6 @@ def test_ephemeral_nodes_and_older_nodes_tables(db):
 
 def test_mysql_matches_slots_to_nodes_ignoring_case(monkeypatch):
     """MySQL compares names case-insensitively, so the UI must group slots the way the checks do."""
-    import contextlib
-
     now = utcnow()
     node_rows = [("Case-Node", 1, 1, "1.64.1", "1.0.0", "linux", "chromium", None, now, now, now, 0)]
     slot_rows = [(1, "Case-Node", 1, 1, 0, None, 0, None), (2, "case-node", 3000, 0, 0, None, 0, None)]
@@ -266,7 +359,7 @@ def test_mysql_matches_slots_to_nodes_ignoring_case(monkeypatch):
 
 def test_blank_host_rows_still_in_use_can_be_released(db):
     add_node(db, "gw", 1, 1, [(1, None, 0)])
-    with sqlite3.connect(db) as con:
+    with contextlib.closing(sqlite3.connect(db)) as con, con:
         for number, in_use in ((3000, 1), (3001, 0)):
             cur = con.execute("INSERT INTO portStatus (PortNumber, PortServer) VALUES (?, '')", (number,))
             con.execute("INSERT INTO portUsage (id, portNumber, inUse, LastRunDate) VALUES (?, ?, ?, ?)",
@@ -291,6 +384,8 @@ def test_permission_errors_are_not_reported_as_an_outage(db):
     add_node(db, "gw", 1, 1, [(1, 60, 0)])
     os.chmod(db, 0o444)  # a read-only database: reads work, writes don't
     try:
+        if os.access(db, os.W_OK):
+            pytest.skip("this user can write to read-only files (root, for one)")
         assert store.snapshot()["sessions"]
         with pytest.raises(store.DatabasePermissionDenied):
             store.release_slot(1)
@@ -349,7 +444,7 @@ def test_actions_only_from_the_grid_page(db, monkeypatch):
 def test_checks_connect_to_one_address_and_no_slot_has_its_own(db):
     """The hub picks the slot: the API offers /connect and no per-slot address to copy."""
     add_node(db, "gw", 1, 1, [(1, None, 0), (1, 30, 0)])
-    with sqlite3.connect(db) as con:
+    with contextlib.closing(sqlite3.connect(db)) as con, con:
         cur = con.execute("INSERT INTO portStatus (PortNumber, PortServer) VALUES (3000, 'static1')")
         con.execute("INSERT INTO portUsage (id, portNumber, inUse, LastRunDate) VALUES (?, 3000, 1, ?)", (cur.lastrowid, ts(10)))
     snap = store.snapshot()
@@ -374,7 +469,7 @@ def test_claims_say_whether_the_hub_made_them(db):
 
 
 def test_a_database_the_hub_has_not_upgraded_reports_claims_as_unknown(db):
-    with sqlite3.connect(db) as con:
+    with contextlib.closing(sqlite3.connect(db)) as con, con:
         demo.create_schema(con)
         con.execute("ALTER TABLE portUsage DROP COLUMN claimedBy")
     add_node(db, "gw", 1, 1, [(1, 30, 0)])
@@ -422,7 +517,7 @@ def test_a_hub_session_is_stale_only_once_its_hub_is_gone(db, monkeypatch):
 
 def test_the_demo_hub_renews_its_lease_so_its_sessions_are_running(tmp_path, monkeypatch):
     path = str(tmp_path / "demo.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.seed(con)
     monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
     monkeypatch.setattr(store, "SQLITE_PATH", path)

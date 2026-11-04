@@ -9,6 +9,7 @@
 Then: GRID_DB_ENGINE=sqlite GRID_DB_PATH=demo.db python -m ui.app
 """
 import argparse
+import contextlib
 import datetime
 import hashlib
 import os
@@ -246,7 +247,7 @@ def heartbeat(path, interval=5, activity=False, seed=None):
     running, release_at = [], None
     while True:
         now = time.monotonic()
-        with sqlite3.connect(path) as con:
+        with contextlib.closing(sqlite3.connect(path)) as con, con:  # commits, then closes
             if now >= next_beat:
                 con.execute("UPDATE nodes SET lastSeen = datetime('now') WHERE online = 1")
                 con.execute("UPDATE hubs SET lastSeen = datetime('now')")

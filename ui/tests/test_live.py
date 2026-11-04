@@ -3,6 +3,7 @@ short runs between polls, bursts, the palette, keyboard, inspector snippets and 
 
 Skipped unless the playwright package and its Chromium are installed, like test_browser.py.
 """
+import contextlib
 import datetime
 import re
 import sqlite3
@@ -224,7 +225,7 @@ def test_seven_short_runs_between_two_polls_show_up_within_3_seconds(grid, page)
     page.wait_for_timeout(1700)  # a second poll: the recorder has a baseline
     ids = free_ids(path)
     marks = ",".join("?" * len(ids))
-    with sqlite3.connect(path) as con:  # claimed and released between two polls, as 4-second checks do
+    with contextlib.closing(sqlite3.connect(path)) as con, con:  # claimed and released between two polls, as 4-second checks do
         con.execute("UPDATE portUsage SET inUse = 1, LastRunDate = ? WHERE id IN ({})".format(marks), [utc()] + ids)
         con.execute("UPDATE portUsage SET inUse = 0, LastRunDate = ? WHERE id IN ({})".format(marks), [utc(4)] + ids)
     started = time.time()
@@ -503,7 +504,7 @@ def test_no_console_errors_or_csp_violations_across_views(grid, browser):
 
 def test_a_large_grid_stays_usable(tmp_path, monkeypatch, browser):
     path = str(tmp_path / "large.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.create_schema(con)
         now = utc()
         for n in range(40):

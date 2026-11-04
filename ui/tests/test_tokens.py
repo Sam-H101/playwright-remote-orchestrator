@@ -1,4 +1,5 @@
 """Managed access tokens: store.py and the API against sqlite.  Run from the repo root: python -m pytest ui/tests"""
+import contextlib
 import datetime
 import hashlib
 import re
@@ -22,7 +23,7 @@ def ts(seconds_ago):
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     path = str(tmp_path / "grid.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.create_schema(con)
     monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
     monkeypatch.setattr(store, "SQLITE_PATH", path)
@@ -33,13 +34,13 @@ def db(tmp_path, monkeypatch):
 
 
 def run(path, sql, params=()):
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         return con.execute(sql, params).fetchall()
 
 
 def add_token(path, name, kind="agent", expires=None, revoked=None, node_name=None):
     """expires / revoked: seconds ago (negative: in the future) or None."""
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         cur = con.execute(
             "INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt, revokedAt) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -188,7 +189,7 @@ def test_databases_from_before_managed_tokens(db):
 
 def test_the_demo_database_has_every_kind_of_token(tmp_path, monkeypatch):
     path = str(tmp_path / "demo.db")
-    with sqlite3.connect(path) as con:
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
         demo.seed(con)
     monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
     monkeypatch.setattr(store, "SQLITE_PATH", path)

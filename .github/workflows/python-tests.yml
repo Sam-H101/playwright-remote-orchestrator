@@ -1,0 +1,126 @@
+name: Python tests
+
+# The Grid UI's tests (ui/tests) and the orchestrator's (tests/), with the MySQL and browser tests switched on.
+# The Grid UI's run inside its own image, built from the commit, so a base image update (a new Python, say) is
+# tested with the Python and packages that image ships rather than only built. The orchestrator's run on the
+# checks image's Python and packages, Playwright included, so a Playwright update is tested here too.
+#
+# Every test must run: these tests skip themselves when MySQL or Playwright is missing, so each step fails if
+# pytest skipped anything, instead of passing with less tested.
+
+on:
+  push:
+    branches: [master]
+    paths: ['ui/**', 'src/**', 'tests/**', 'full/**', 'main.py', 'docker/ui/**', 'docker/python/**',
+            'runner/playwright/**', '.github/workflows/python-tests.yml']
+  pull_request:
+    paths: ['ui/**', 'src/**', 'tests/**', 'full/**', 'main.py', 'docker/ui/**', 'docker/python/**',
+            'runner/playwright/**', '.github/workflows/python-tests.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # -eo pipefail: a failure anywhere in a pipeline fails the step
+
+jobs:
+  grid-ui:
+    name: Grid UI tests, in the Grid UI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: scratch
+          MYSQL_DATABASE: orchestrator_test
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pscratch --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      IMAGE: grid-ui:test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: build the image
+        # As docker-images.yml builds it, from the repo root, but only for amd64 and into this runner's docker.
+        run: docker build --platform linux/amd64 -f docker/ui/Dockerfile -t "$IMAGE" .
+
+      - name: unit and MySQL tests, as the image's user
+        # The image leaves ui/tests out (.dockerignore), so the checkout's are mounted. Its own user, not root:
+        # root can write to a read-only database file, and one test needs that to fail.
+        env:
+          NETWORK: ${{ job.services.mysql.network }}
+        run: |
+          docker run --rm --network "$NETWORK" -e PYTHONUNBUFFERED=1 \
+            -e ORCHESTRATOR_TEST_DB=orchestrator_test -e DB_HOST=mysql -e DB_PORT=3306 -e DB_USER=root -e DB_PASSWORD=scratch \
+            -v "$PWD/ui/tests:/app/ui/tests:ro" "$IMAGE" sh -ec '
+              python -m pip install --user --no-cache-dir --disable-pip-version-check --no-warn-script-location -q pytest
+              python -m pytest ui/tests -rs -p no:cacheprovider --ignore-glob="ui/tests/test_browser*.py" --ignore=ui/tests/test_live.py
+            ' | tee "$RUNNER_TEMP/unit.log"
+          if grep '^SKIPPED' "$RUNNER_TEMP/unit.log"; then echo "::error::pytest skipped the tests above"; exit 1; fi
+
+      - name: browser tests
+        # As root, so Playwright can install the system packages Chromium needs. test_live.py also checks the
+        # page's JavaScript snippet with node.
+        run: |
+          docker run --rm --user root --shm-size 1g -e PYTHONUNBUFFERED=1 \
+            -v "$PWD/ui/tests:/app/ui/tests:ro" "$IMAGE" sh -ec '
+              python -m pip install --no-cache-dir --disable-pip-version-check --root-user-action=ignore -q pytest playwright
+              python -m playwright install --with-deps chromium
+              apt-get update -q > /dev/null && apt-get install -y -q --no-install-recommends nodejs > /dev/null
+              python -m pytest ui/tests/test_browser*.py ui/tests/test_live.py -rs -p no:cacheprovider
+            ' | tee "$RUNNER_TEMP/browser.log"
+          if grep '^SKIPPED' "$RUNNER_TEMP/browser.log"; then echo "::error::pytest skipped the tests above"; exit 1; fi
+
+  orchestrator:
+    # On the checks image's Python and requirements rather than in that image, which is large (every browser
+    # and the packages they need) and which docker-images.yml builds.
+    name: orchestrator tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: scratch
+          MYSQL_DATABASE: orchestrator_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pscratch --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12' # the checks image's
+          cache: pip
+          cache-dependency-path: docker/python/requirements.txt
+
+      - name: dependencies
+        # What the checks image installs: its requirements, and the Playwright runner/playwright pins, picked as
+        # its Dockerfile does (the newest on that major.minor, up to that version). Without runner/playwright,
+        # requirements.txt pins it.
+        run: |
+          playwright=playwright
+          if [ -f runner/playwright/package.json ]; then
+            v=$(python -c "import json; print(json.load(open('runner/playwright/package.json'))['dependencies']['playwright-core'])")
+            playwright="playwright>=${v%.*}.0,<=${v}"
+          fi
+          python -m pip install -r docker/python/requirements.txt pytest "$playwright"
+          python -m playwright install --with-deps chromium
+
+      - name: tests
+        env:
+          PYTHONUNBUFFERED: 1
+          ORCHESTRATOR_TEST_DB: orchestrator_test
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_USER: root
+          DB_PASSWORD: scratch
+        run: |
+          python -m pytest tests -rs | tee "$RUNNER_TEMP/tests.log"
+          if grep '^SKIPPED' "$RUNNER_TEMP/tests.log"; then echo "::error::pytest skipped the tests above"; exit 1; fi
