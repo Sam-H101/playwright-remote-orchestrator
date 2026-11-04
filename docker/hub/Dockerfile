@@ -1,5 +1,5 @@
 # Gateway hub: the one port checks and runner agents connect to. Build context is the repo root.
-FROM node:22-slim
+FROM node:26-slim
 ENV NODE_ENV=production
 WORKDIR /app/gateway
 COPY gateway/package.json gateway/package-lock.json ./
