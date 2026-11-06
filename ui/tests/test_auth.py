@@ -48,7 +48,7 @@ def test_scripts_are_served_as_javascript(client):
 
 def test_the_page_has_no_inline_script_or_style(client):
     html = client.get("/").get_data(as_text=True)
-    assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>", html)  # every script has a src
+    assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>", html, re.I)  # every script has a src
     assert " style=" not in html and "<style" not in html
     assert not re.search(r"\son[a-z]+=", html)  # no inline handlers
     assert '<script type="module" src="/static/js/main.js">' in html
@@ -165,3 +165,5 @@ def test_a_soft_status_poll_reports_an_outage_as_data(client, monkeypatch, tmp_p
     r = client.get("/api/status?soft=1")
     assert r.status_code == 200 and r.get_json()["unavailable"] is True and r.get_json()["error"]
     assert r.headers["Cache-Control"] == "no-store"
+    # Only the page's status poll answers an outage softly: an action during one is still a 503.
+    assert client.post("/api/slots/1/reset-failures?soft=1", json={}).status_code == 503

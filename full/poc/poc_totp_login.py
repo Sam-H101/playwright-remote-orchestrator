@@ -515,7 +515,7 @@ def test_totp_login(grid_browser, budget, capture):
     # The UI's word for each code against the step the site matched it to: a code that isn't its step's,
     # or a step the site took that the UI didn't say it handed out, shows here.
     assert auth.steps == site.taken, "the Grid UI handed out steps {}, the site took {}".format(auth.steps, site.taken)
-    print("poc_totp_login: {} rounds in {:.0f}s; {} sign-ins with {} codes from the Grid UI ({!r}), {} codes refused "
+    print("poc_totp_login: {} rounds in {:.0f}s; {} sign-ins with {} codes from the Grid UI, {} codes refused "
           "as reused and {} as wrong, {} directory loads, {} waits for the next window ({:.0f}s)".format(
-              rounds, budget.elapsed(), stats["codes ok"], len(auth.steps), SECRET_NAME, stats["codes reused"],
+              rounds, budget.elapsed(), stats["codes ok"], len(auth.steps), stats["codes reused"],
               stats["codes wrong"], stats["directory loads"], auth.waits, auth.waited_s))

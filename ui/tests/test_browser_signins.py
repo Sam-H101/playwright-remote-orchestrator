@@ -198,7 +198,7 @@ def test_forget_makes_the_next_run_sign_in_again(mfa_grid, mfa_page):
     p.wait_for_selector("#confirm-dialog[open]")
     assert "contoso-monitor" in p.text_content("#confirm-title")
     assert "next run signs in again" in p.text_content("#confirm-text")
-    assert "contoso.sharepoint.com" in p.text_content("#confirm-dialog .confirm-facts")
+    assert p.text_content("#confirm-dialog .confirm-facts dd") == "contoso.sharepoint.com, login.microsoftonline.com"
     assert "danger-fill" not in p.get_attribute("#confirm-ok", "class")  # the next run just signs in
     p.click("#confirm-dialog [data-dismiss]")
     assert p.evaluate("document.activeElement.dataset.forgetSignin") is not None

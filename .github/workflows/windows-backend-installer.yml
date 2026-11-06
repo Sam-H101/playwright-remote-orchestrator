@@ -15,6 +15,9 @@ on:
       - '.github/workflows/windows-backend-installer.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   install:
     runs-on: windows-latest
