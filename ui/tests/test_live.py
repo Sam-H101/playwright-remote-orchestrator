@@ -425,8 +425,8 @@ def test_no_per_slot_endpoint_is_shown_or_copied_anywhere(grid, page):
     page.wait_for_selector(".mx-row[data-key]")
     sid = run(path, "SELECT id FROM portUsage WHERE inUse = 1 LIMIT 1")[0][0]
     texts = []
-    for route in ["#/overview", "#/sessions", "#/activity", "#/access", "#/connect", "#/node/runner-b81e04",
-                  "#/slot/{}".format(sid), "#/session/{}".format(sid), "#/node/pw-static.lab.local"]:
+    for route in ["#/overview", "#/sessions", "#/activity", "#/access", "#/admin", "#/admin?tab=audit", "#/connect",
+                  "#/node/runner-b81e04", "#/slot/{}".format(sid), "#/session/{}".format(sid), "#/node/pw-static.lab.local"]:
         page.goto(url + route)
         page.wait_for_timeout(250)
         texts.append(page.evaluate("""() => document.body.innerText + " " + Array.from(document.querySelectorAll('[data-copy]'))
@@ -494,7 +494,7 @@ def test_no_console_errors_or_csp_violations_across_views(grid, browser):
         p.on("pageerror", lambda e: errors.append(str(e)))
         p.goto(url)
         p.wait_for_selector(".mx-row[data-key]")
-        for hash_ in ("#/activity", "#/sessions", "#/access", "#/mfa", "#/node/WIN-BUILD-01", "#/overview"):
+        for hash_ in ("#/activity", "#/sessions", "#/access", "#/mfa", "#/admin", "#/admin?tab=audit", "#/node/WIN-BUILD-01", "#/overview"):
             p.goto(url + hash_)
             p.wait_for_timeout(250)
             assert p.evaluate("document.documentElement.scrollWidth <= innerWidth"), (width, hash_)

@@ -1,8 +1,8 @@
 """Authenticator (TOTP) codes for checks, handed out by the Grid UI's MFA secrets.
 
-An admin stores the account's seed on the Grid UI's MFA page; the check asks for a code at the moment
-the site's prompt is on screen and types it. The seed never leaves the Grid UI, so neither the check's
-environment nor the runner ever sees it:
+Someone stores the account's seed on the Grid UI's MFA page and shares it with whoever's checks need it;
+the check asks for a code at the moment the site's prompt is on screen and types it. The seed never
+leaves the Grid UI, so neither the check's environment nor the runner ever sees it:
 
     from src import mfa
     page.get_by_label("Code").fill(mfa.code("intranet", label="nightly login check"))
@@ -15,6 +15,9 @@ Settings, from the environment:
   GRID_UI_URL     the Grid UI, as the check reaches it (default http://grid_ui:4444, its compose name)
   GRID_MFA_TOKEN  the client token to ask with; default GATEWAY_CLIENT_TOKEN, which checks already have.
                   The Grid UI accepts managed client tokens, and the bootstrap one when it is given its value.
+                  A client token gets codes for the secrets its owner can use: their own and those shared
+                  with them (for any other, the Grid UI answers 403 not_shared). Legacy tokens, tokens made
+                  with the admin token, and GATEWAY_CLIENT_TOKEN act as an admin and get every secret's.
 """
 import time
 

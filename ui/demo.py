@@ -12,11 +12,14 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import json
 import os
 import random
 import secrets
 import sqlite3
 import time
+
+from . import permissions
 
 # sqlite translation of src/schema.sql
 SCHEMA = """
@@ -116,6 +119,100 @@ CREATE TABLE IF NOT EXISTS savedSignins (
     leaseHolder TEXT NULL,
     createdAt TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    email TEXT NULL,
+    emailVerified INTEGER NOT NULL DEFAULT 0,
+    name TEXT NULL,
+    idpGroups TEXT NULL,
+    groupsOverage INTEGER NOT NULL DEFAULT 0,
+    createdAt TEXT NOT NULL,
+    lastSignInAt TEXT NULL,
+    lastSeenAt TEXT NULL,
+    disabledAt TEXT NULL,
+    disabledBy TEXT NULL,
+    UNIQUE (issuer, subject)
+);
+CREATE TABLE IF NOT EXISTS roles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NULL,
+    permissions TEXT NOT NULL DEFAULT '',
+    createdAt TEXT NOT NULL,
+    createdBy TEXT NULL,
+    updatedAt TEXT NULL,
+    updatedBy TEXT NULL
+);
+CREATE TABLE IF NOT EXISTS userRoles (
+    userId INTEGER NOT NULL,
+    roleId INTEGER NOT NULL,
+    grantedAt TEXT NOT NULL,
+    grantedBy TEXT NULL,
+    PRIMARY KEY (userId, roleId)
+);
+CREATE TABLE IF NOT EXISTS groupRoles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    groupName TEXT NOT NULL,
+    roleId INTEGER NOT NULL,
+    note TEXT NULL,
+    createdAt TEXT NOT NULL,
+    createdBy TEXT NULL,
+    UNIQUE (groupName, roleId)
+);
+CREATE TABLE IF NOT EXISTS userSessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tokenHash TEXT NOT NULL UNIQUE,
+    userId INTEGER NOT NULL,
+    createdAt TEXT NOT NULL,
+    lastSeenAt TEXT NOT NULL,
+    expiresAt TEXT NOT NULL,
+    revokedAt TEXT NULL,
+    revokedBy TEXT NULL,
+    address TEXT NULL,
+    userAgent TEXT NULL
+);
+CREATE TABLE IF NOT EXISTS oidcLogins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stateHash TEXT NOT NULL UNIQUE,
+    browserHash TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    codeVerifier TEXT NOT NULL,
+    returnTo TEXT NULL,
+    createdAt TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS itemOwners (
+    itemKind TEXT NOT NULL,
+    itemId INTEGER NOT NULL,
+    userId INTEGER NOT NULL,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY (itemKind, itemId)
+);
+CREATE TABLE IF NOT EXISTS itemShares (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    itemKind TEXT NOT NULL,
+    itemId INTEGER NOT NULL,
+    granteeKind TEXT NOT NULL,
+    granteeId INTEGER NOT NULL,
+    sharedAt TEXT NOT NULL,
+    sharedBy TEXT NULL,
+    vouchedFor TEXT NULL,
+    UNIQUE (itemKind, itemId, granteeKind, granteeId)
+);
+CREATE TABLE IF NOT EXISTS auditLog (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurredAt TEXT NOT NULL,
+    actorId INTEGER NULL,
+    actorName TEXT NOT NULL,
+    actorMethod TEXT NOT NULL,
+    address TEXT NULL,
+    action TEXT NOT NULL,
+    targetKind TEXT NULL,
+    targetId INTEGER NULL,
+    targetName TEXT NULL,
+    details TEXT NULL
+);
 """
 
 # name, online, platform, browsers, address, last seen (s ago), connected (s ago),
@@ -155,6 +252,46 @@ TOKENS = [
     ("Spare Linux hosts", "agent", None, 2 * DAY, -28 * DAY, None, None, []),
     ("Old build farm", "agent", None, 200 * DAY, None, 2 * DAY + 3600, 2 * DAY, ["MAC-QA-02"]),
     ("Staging checks 2025", "client", None, 375 * DAY, 10 * DAY, 11 * DAY, None, []),
+]
+
+# People who signed in with single sign-on, for the Admin page: name, subject, email, whether the provider
+# verified it, the groups their last sign-in carried, and first sign-in / last sign-in / disabled as seconds ago
+# (None: never). Roles given by hand are the audit log's user.role_added rows below. They own nothing and have
+# no sessions: the tokens above stay the admins'.
+ISSUER = "https://login.example.com"
+PEOPLE = [
+    ("Robin Hale", "00udemo1", "robin.hale@example.com", True, [], 30 * DAY + 600, 3600, None),
+    ("Dana Lee", "00udemo2", "dana.lee@example.com", True, ["grid-operators", "qa"], 31 * DAY, 3 * DAY, None),
+    ("Priya Kumar", "00udemo3", "priya.kumar@example.com", True, [], 30 * DAY - 600, 26 * 3600, None),
+    ("Lee Chen", "00udemo4", "lee.chen@example.com", True, [], 9 * DAY + 600, 2 * DAY + 3600, 2 * DAY),
+    ("Alex Moreno", "00udemo5", "alex.moreno@example.com", False, [], 5 * 3600, 5 * 3600, None),
+]
+# A custom role: name, description, permissions. Then the groups that give roles: group, role name.
+ROLES = [("QA leads", "Leads testing: sees the grid, uses shared MFA secrets and sign-ins, and reads the audit log.",
+          "grid.view mfa.use signins.use audit.view")]
+MAPPINGS = [("grid-operators", "Operator"), ("qa", "QA leads")]
+# The audit log: seconds ago, who (a person's name, or None for the admin token), their address, the action,
+# what it was about (its kind, and its name, by which its id is looked up), and details, in which a role is
+# named and stands for {"id", "name"}.
+ADMIN_ADDRESS, ROBIN_ADDRESS = "10.20.4.2", "10.20.4.31"
+AUDIT = [
+    (32 * DAY - 60, None, ADMIN_ADDRESS, "role.created", "role", "QA leads",
+     {"permissions": ["audit.view", "grid.view", "mfa.use", "signins.use"]}),
+    (32 * DAY - 120, None, ADMIN_ADDRESS, "group.mapped", "group", "grid-operators",
+     {"group": "grid-operators", "role": "Operator"}),
+    (32 * DAY - 180, None, ADMIN_ADDRESS, "group.mapped", "group", "qa", {"group": "qa", "role": "QA leads"}),
+    (30 * DAY, None, ADMIN_ADDRESS, "user.role_added", "user", "Robin Hale", {"role": "Admin"}),
+    (30 * DAY - 300, "Robin Hale", ROBIN_ADDRESS, "user.role_added", "user", "Priya Kumar", {"role": "Tester"}),
+    (12 * DAY, None, ADMIN_ADDRESS, "token.created", "token", "Example checks", {"kind": "client", "owner": None}),
+    (9 * DAY, "Robin Hale", ROBIN_ADDRESS, "user.role_added", "user", "Lee Chen", {"role": "Viewer"}),
+    (3 * DAY, "Dana Lee", "10.20.6.12", "auth.signin", "user", "Dana Lee", None),
+    (2 * DAY, "Robin Hale", ROBIN_ADDRESS, "user.disabled", "user", "Lee Chen",
+     {"sessions": 1, "clientTokens": 0, "agentTokens": 0}),
+    (26 * 3600, "Lee Chen", "10.20.7.3", "auth.signin_refused", "user", "Lee Chen", {"reason": "disabled"}),
+    (5 * 3600, "Alex Moreno", "10.20.6.40", "user.created", "user", "Alex Moreno", None),
+    (5 * 3600, "Alex Moreno", "10.20.6.40", "auth.signin", "user", "Alex Moreno", None),
+    (3600, "Robin Hale", ROBIN_ADDRESS, "auth.signin", "user", "Robin Hale", None),
+    (1800, "Robin Hale", ROBIN_ADDRESS, "grid.slot_reset", "slot", "runner-b81e04:3", None),
 ]
 
 
@@ -209,7 +346,53 @@ def seed(con, now=None):
         """, (name, kind, hashlib.sha256(token.encode()).hexdigest(), token[:12], node_name,
               _ts(now, created), _ts(now, expires), _ts(now, used), _ts(now, revoked)))
         cur.executemany("UPDATE nodes SET tokenId = ? WHERE name = ?", [(cur.lastrowid, user) for user in users])
+    _add_people(cur, now)
     con.commit()
+
+
+def _add_people(cur, now):
+    """The Admin page's people, the custom role and the group mappings, and the audit log's rows about them."""
+    roles = {name: role_id for role_id, (name, _, _) in permissions.BUILTIN_ROLES.items()}
+    for name, description, perms in ROLES:
+        cur.execute("INSERT INTO roles (name, description, permissions, createdAt, createdBy) VALUES (?, ?, ?, ?, 'Admin')",
+                    (name, description, perms, _ts(now, 32 * DAY)))
+        roles[name] = cur.lastrowid
+    groups = {}
+    for group, role in MAPPINGS:
+        cur.execute("INSERT INTO groupRoles (groupName, roleId, createdAt, createdBy) VALUES (?, ?, ?, 'Admin')",
+                    (group, roles[role], _ts(now, 32 * DAY)))
+        groups[group] = cur.lastrowid
+    people = {}
+    for name, subject, email, verified, idp_groups, created, signed_in, disabled in PEOPLE:
+        cur.execute("""
+            INSERT INTO users (issuer, subject, email, emailVerified, name, idpGroups, createdAt, lastSignInAt, lastSeenAt,
+                               disabledAt, disabledBy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ISSUER, subject, email, int(verified), name, json.dumps(idp_groups), _ts(now, created), _ts(now, signed_in),
+              _ts(now, signed_in), _ts(now, disabled), "Robin Hale" if disabled else None))
+        people[name] = cur.lastrowid
+
+    def target_id(kind, name):
+        if kind in ("user", "role", "group"):
+            return {"user": people, "role": roles, "group": groups}[kind][name]
+        if kind == "token":
+            return cur.execute("SELECT id FROM accessTokens WHERE name = ?", (name,)).fetchone()[0]
+        if kind == "slot":
+            host, port = name.split(":")
+            return cur.execute("SELECT id FROM portStatus WHERE PortServer = ? AND PortNumber = ?", (host, int(port))).fetchone()[0]
+        return None
+
+    for when, by, address, action, kind, target, details in AUDIT:
+        if details and isinstance(details.get("role"), str):
+            details = dict(details, role={"id": roles[details["role"]], "name": details["role"]})
+        cur.execute("""
+            INSERT INTO auditLog (occurredAt, actorId, actorName, actorMethod, address, action, targetKind, targetId, targetName, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (_ts(now, when), people.get(by), by or "Admin", "oidc" if by else "token", address, action, kind,
+              target_id(kind, target), target, json.dumps(details, separators=(",", ":")) if details else None))
+        if action == "user.role_added":
+            cur.execute("INSERT INTO userRoles (userId, roleId, grantedAt, grantedBy) VALUES (?, ?, ?, ?)",
+                        (people[target], details["role"]["id"], _ts(now, when), by or "Admin"))
 
 
 def _selectable(con, fail_threshold=3):

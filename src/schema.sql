@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 -- may take that name until the bound token is revoked or expires. A token is valid while
 -- revokedAt is NULL and expiresAt is NULL or still in the future. Any row of a kind, revoked or
 -- expired included, makes the hub require a token of that kind (unless GATEWAY_ALLOW_OPEN_AGENTS /
--- GATEWAY_ALLOW_OPEN_CLIENTS is set), so revoking the last token never lets tokenless callers in.
+-- GATEWAY_ALLOW_OPEN_CLIENTS is set), so revoking the last token never lets tokenless callers in. The
+-- Grid UI records who made a token in itemOwners; the hub ignores that.
 CREATE TABLE IF NOT EXISTS accessTokens (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(128) NOT NULL,
@@ -99,7 +100,8 @@ CREATE TABLE IF NOT EXISTS hubs (
 -- with 'mfa:<name>' as associated data, so a ciphertext copied to another row doesn't decrypt. The seed
 -- itself is never stored, logged or sent anywhere: checks get codes. lastStep is the newest time step
 -- whose code was handed out; each step is handed out once (sites accept each code once), so checks
--- running at the same time never get the same code.
+-- running at the same time never get the same code. Who owns one and who it is shared with is in
+-- itemOwners and itemShares.
 CREATE TABLE IF NOT EXISTS mfaSecrets (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(128) NOT NULL,
@@ -141,7 +143,8 @@ CREATE TABLE IF NOT EXISTS mfaIssues (
 -- AUTO_INCREMENT ids since MySQL 8.0), and checks send the id with the version. domains (the
 -- cookies' domains, comma separated) and the counts are for display. While a check signs in, it holds
 -- the lease: leaseHash is the sha256 of its lease token, and nobody else signs in for that name until
--- it saves, releases it, or leaseUntil passes.
+-- it saves, releases it, or leaseUntil passes. Who owns one and who it is shared with is in itemOwners
+-- and itemShares; a check uses one only when its token's owner owns it or it is shared with them.
 CREATE TABLE IF NOT EXISTS savedSignins (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(64) NOT NULL,
@@ -166,4 +169,161 @@ CREATE TABLE IF NOT EXISTS savedSignins (
     createdAt DATETIME NOT NULL,
     UNIQUE KEY uq_signin_name (name)
 )
+;
+-- People who signed in to the Grid UI through its OpenID Connect identity provider (GRID_OIDC_ISSUER). Only the
+-- Grid UI reads and writes them. issuer and subject are the ID token's iss and sub: who they are, compared byte
+-- for byte (a sub is unique only within its issuer, so changing GRID_OIDC_ISSUER makes new users). email,
+-- emailVerified and name are what the provider said at the last sign-in, for display and for GRID_OIDC_ADMINS
+-- (verified emails only). idpGroups is the JSON list (at most 500 values) of the groups claim of that sign-in,
+-- which groupRoles maps to roles; groupsOverage is 1 when the provider said there were too many groups to list,
+-- and then none count. A disabled user can't sign in, their sessions end, and their client tokens get nothing
+-- from the Grid UI (the hub accepts them for /connect until they are revoked). Users are never deleted: owners
+-- and the audit log refer to them.
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    issuer VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    subject VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    email VARCHAR(255) NULL,
+    emailVerified TINYINT NOT NULL DEFAULT 0,
+    name VARCHAR(255) NULL,
+    idpGroups MEDIUMTEXT NULL,
+    groupsOverage TINYINT NOT NULL DEFAULT 0,
+    createdAt DATETIME NOT NULL,
+    lastSignInAt DATETIME NULL,
+    lastSeenAt DATETIME NULL,
+    disabledAt DATETIME NULL,
+    disabledBy VARCHAR(255) NULL,
+    UNIQUE KEY uq_user_identity (issuer, subject),
+    KEY idx_user_email (email)
+) DEFAULT CHARSET=utf8mb4
+;
+-- Custom roles: a name and a set of the Grid UI's fixed permissions (ui/permissions.py), space separated; ones
+-- this version doesn't know are ignored. The built-in roles (Admin, Operator, Tester, Viewer) aren't rows: they
+-- have fixed negative ids and their permissions are in the code, so nobody can change them.
+CREATE TABLE IF NOT EXISTS roles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(64) NOT NULL,
+    description VARCHAR(255) NULL,
+    permissions VARCHAR(1024) NOT NULL DEFAULT '',
+    createdAt DATETIME NOT NULL,
+    createdBy VARCHAR(255) NULL,
+    updatedAt DATETIME NULL,
+    updatedBy VARCHAR(255) NULL,
+    UNIQUE KEY uq_role_name (name)
+) DEFAULT CHARSET=utf8mb4
+;
+-- Roles an admin gave a user on the Admin page. roleId is a roles.id or a built-in role's negative id. Roles
+-- from groupRoles and GRID_OIDC_ADMINS aren't stored: they are worked out on every request.
+CREATE TABLE IF NOT EXISTS userRoles (
+    userId INT NOT NULL,
+    roleId INT NOT NULL,
+    grantedAt DATETIME NOT NULL,
+    grantedBy VARCHAR(255) NULL,
+    PRIMARY KEY (userId, roleId),
+    KEY idx_user_roles_role (roleId)
+) DEFAULT CHARSET=utf8mb4
+;
+-- Identity-provider groups (values of the GRID_OIDC_GROUPS_CLAIM claims) whose members get a role, compared
+-- exactly with each user's idpGroups; '*' is everyone who signs in. note is the admin's name for the value (an
+-- Entra group's object id says nothing by itself).
+CREATE TABLE IF NOT EXISTS groupRoles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    groupName VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    roleId INT NOT NULL,
+    note VARCHAR(128) NULL,
+    createdAt DATETIME NOT NULL,
+    createdBy VARCHAR(255) NULL,
+    UNIQUE KEY uq_group_role (groupName, roleId)
+) DEFAULT CHARSET=utf8mb4
+;
+-- Browsers signed in to the Grid UI. tokenHash is the lower-case hex sha256 of the session cookie's value, which
+-- is never stored. A session works while revokedAt is NULL, expiresAt is in the future, lastSeenAt is within
+-- GRID_SESSION_IDLE_MINUTES and its user isn't disabled. lastSeenAt is renewed at most once a minute. Sessions
+-- that ended more than 7 days ago are deleted as new ones start. address and userAgent are for the Admin page.
+CREATE TABLE IF NOT EXISTS userSessions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    tokenHash CHAR(64) NOT NULL,
+    userId INT NOT NULL,
+    createdAt DATETIME NOT NULL,
+    lastSeenAt DATETIME NOT NULL,
+    expiresAt DATETIME NOT NULL,
+    revokedAt DATETIME NULL,
+    revokedBy VARCHAR(255) NULL,
+    address VARCHAR(64) NULL,
+    userAgent VARCHAR(255) NULL,
+    UNIQUE KEY uq_session_token (tokenHash),
+    KEY idx_sessions_user (userId)
+) DEFAULT CHARSET=utf8mb4
+;
+-- Sign-ins on their way through the identity provider, so the callback can land on any Grid UI worker.
+-- stateHash is the sha256 of the state sent to the provider, browserHash the sha256 of the grid-login cookie of
+-- the browser that started it: the callback finds the row by the state, accepts it only from that browser, and
+-- deletes it, so a sign-in can't be finished twice or in another browser. Rows older than 10 minutes are
+-- deleted as new ones are added.
+CREATE TABLE IF NOT EXISTS oidcLogins (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    stateHash CHAR(64) NOT NULL,
+    browserHash CHAR(64) NOT NULL,
+    nonce VARCHAR(64) NOT NULL,
+    codeVerifier VARCHAR(128) NOT NULL,
+    returnTo VARCHAR(512) NULL,
+    createdAt DATETIME NOT NULL,
+    UNIQUE KEY uq_login_state (stateHash),
+    KEY idx_login_browser (browserHash)
+) DEFAULT CHARSET=utf8mb4
+;
+-- Who owns an MFA secret (itemKind 'mfa', mfaSecrets.id), a saved sign-in ('signin', savedSignins.id) or an
+-- access token ('token', accessTokens.id), as a users.id. No row: it is the admins' (made before users existed,
+-- or with GRID_ADMIN_TOKEN, GATEWAY_CLIENT_TOKEN or a token without an owner), and a client token without one
+-- acts as an admin. Deleting the item deletes its row.
+CREATE TABLE IF NOT EXISTS itemOwners (
+    itemKind VARCHAR(8) NOT NULL,
+    itemId INT NOT NULL,
+    userId INT NOT NULL,
+    createdAt DATETIME NOT NULL,
+    PRIMARY KEY (itemKind, itemId),
+    KEY idx_item_owners_user (userId)
+) DEFAULT CHARSET=utf8mb4
+;
+-- Who else may use an MFA secret or a saved sign-in: one user (granteeKind 'user', a users.id) or everyone with
+-- a role ('role', a role id; built-in roles are negative). They get codes and states, never the seed. Deleting
+-- the item or the role deletes its rows; forgetting a sign-in keeps them. vouchedFor is set when whoever shared a
+-- saved sign-in could see every one: what its owner could do then, as roles.permissions lists permissions (every
+-- one for the admins'). Only such a share reaches people who may do something its owner may not, since their
+-- checks would run as whatever account the owner's checks saved, and only while the owner may still do all of
+-- that. NULL otherwise.
+CREATE TABLE IF NOT EXISTS itemShares (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    itemKind VARCHAR(8) NOT NULL,
+    itemId INT NOT NULL,
+    granteeKind VARCHAR(8) NOT NULL,
+    granteeId INT NOT NULL,
+    sharedAt DATETIME NOT NULL,
+    sharedBy VARCHAR(255) NULL,
+    vouchedFor VARCHAR(1024) NULL,
+    UNIQUE KEY uq_item_share (itemKind, itemId, granteeKind, granteeId),
+    KEY idx_item_shares_grantee (granteeKind, granteeId)
+) DEFAULT CHARSET=utf8mb4
+;
+-- What people changed on the Grid UI: sign-ins, users, roles, group mappings, sharing, access tokens, MFA
+-- secrets, saved sign-ins and grid actions, written in the same transaction as the change. actorName and
+-- targetName are copies, so the log reads the same after renames; actorId is the users.id (NULL for
+-- GRID_ADMIN_TOKEN and tokens without an owner). details is a short JSON object and never holds a secret, code,
+-- token, cookie or state. Rows older than GRID_AUDIT_DAYS are deleted as new ones are added.
+CREATE TABLE IF NOT EXISTS auditLog (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    occurredAt DATETIME NOT NULL,
+    actorId INT NULL,
+    actorName VARCHAR(255) NOT NULL,
+    actorMethod VARCHAR(32) NOT NULL,
+    address VARCHAR(64) NULL,
+    action VARCHAR(48) NOT NULL,
+    targetKind VARCHAR(16) NULL,
+    targetId INT NULL,
+    targetName VARCHAR(255) NULL,
+    details TEXT NULL,
+    KEY idx_audit_time (occurredAt),
+    KEY idx_audit_actor (actorId),
+    KEY idx_audit_target (targetKind, targetId)
+) DEFAULT CHARSET=utf8mb4
 ;

@@ -8,6 +8,7 @@ import { agentCommand, connectUrl, duration, parseTime, plural, slotName } from 
 import { createTimeline } from "../ui/timeline.js";
 import { createMatrix } from "../ui/matrix.js";
 import { hubField, wireHubFields } from "../ui/hub.js";
+import { refusedPanel } from "../ui/refused.js";
 import { toast } from "../ui/toast.js";
 
 const SEVERITY = { failing: 0, unhealthy: 1, stale: 2, offline: 3 };
@@ -164,6 +165,7 @@ export function createOverview(section) {
       <p class="verdict-sub" id="verdict-sub"></p>
     </header>
     <div id="ov-error"></div>
+    <div id="ov-state"></div>
     <section class="summary" id="summary" aria-labelledby="cap-title" hidden>
       <div class="summary-grid">
         <div class="panel cap-card">
@@ -259,6 +261,7 @@ export function createOverview(section) {
     if (!empty || !data) return;
     const s = auth.state();
     const token = firstRun && firstRun.token;
+    const barred = !needsSignIn() && !auth.can("tokens.agents");
     const agent = firstRunCommand();
     // Typing in the hub field must not rebuild the panel under the cursor.
     if (box.contains(document.activeElement) && document.activeElement.matches("[data-hub-input]")) return;
@@ -282,8 +285,8 @@ export function createOverview(section) {
           <button type="button" class="icon-btn tiny" data-copy="${connectUrl(app.hub())}" data-copy-label="the connect address" aria-label="Copy the connect address">${icon("i-copy")}</button></div></li>
       </ol>
       ${token ? "" : s.adminConfigured
-        ? html`<p class="first-run-actions"><button type="button" class="btn primary" data-first-token>${needsSignIn() ? icon("i-lock") : icon("i-plus")}Create agent token</button>
-            <span class="dim">Makes a token for this command${needsSignIn() ? " (sign in first)" : ""}.</span></p>`
+        ? html`<p class="first-run-actions"><button type="button" class="btn primary" data-first-token${barred ? html` disabled title="Your roles don't let you add hosts"` : ""}>${needsSignIn() || barred ? icon("i-lock") : icon("i-plus")}Create agent token</button>
+            <span class="dim">Makes a token for this command${needsSignIn() ? " (sign in first)" : barred ? " (it needs “Add hosts”)" : ""}.</span></p>`
         : html`<p class="hint">Set GRID_ADMIN_TOKEN to create agent tokens here; until then hosts use the hub's GATEWAY_AGENT_TOKEN.</p>`}
     </div>`);
     wireHubFields(box);
@@ -349,7 +352,10 @@ export function createOverview(section) {
   function update(msg) {
     const data = msg.data, live = msg.live;
     const items = attentionItems(data);
-    const v = verdict(data, live.error, items, live.errorKind);
+    // Reading the grid needs a sign-in or a role this page doesn't have: the panel says which.
+    const v = live.refused ? { h1: live.refused === "forbidden" ? "No access to the grid" : "Signed out", chip: "No data", tone: "off" }
+      : verdict(data, live.error, items, live.errorKind);
+    setHTML(section.querySelector("#ov-state"), live.refused ? refusedPanel(live.refused) : html``);
     setText(section.querySelector("#verdict-word"), v.h1);
     section.querySelector("#verdict-glyph").className = "glyph g-" + v.tone;
     section.querySelector("#ov-h1").className = "verdict t-" + v.tone;

@@ -37,8 +37,13 @@ like MFA seeds, and lets one check sign in at a time; the others wait for that c
         expect(s.page.get_by_role("link", name="Runbooks")).to_be_visible()
 
 The saved cookies sign in as the account for as long as the site takes them, like the password and a
-code together, and any client token can check them out. An admin lists them with GET /api/signins and
-makes the next run sign in again with POST /api/signins/<id>/forget.
+code together, and a client token can check out the sign-ins its owner can use (see the README's Saved
+sign-ins): the ones the owner's own checks started, the admins' ones when the token acts as an admin or
+its owner sees every sign-in, and those shared with the owner. Only the owner's checks sign in fresh and
+save (any admin's, for the admins' ones); for one that is merely shared and has nothing usable saved, the
+checkout raises SigninError with status 409 (owner_signs_in) until the owner's own check has signed in.
+The Grid UI's MFA page lists them, and makes the next run sign in again with POST
+/api/signins/<id>/forget.
 
 Settings, from the environment, as for src/mfa.py:
   GRID_UI_URL     the Grid UI, as the check reaches it (default http://grid_ui:4444, its compose name)
@@ -96,7 +101,8 @@ def checkout(name, rejected_version=None, lease_s=None, signin_id=None, url=None
       "wait"     another caller is signing in: ask again in "retryAfterS" seconds
     rejected_version is the version of a state the site refused (it asked to sign in again), and signin_id
     the "id" it came with: the Grid UI drops it, unless someone saved a newer one meanwhile, which comes
-    back instead."""
+    back instead. A sign-in the token's owner can't use raises SigninError with status 403 (not_shared),
+    and one only shared with them that has nothing usable saved, status 409 (owner_signs_in)."""
     body = {"name": name}
     if rejected_version is not None:
         body["rejectedVersion"] = rejected_version
@@ -113,8 +119,10 @@ def save(name, state, lease_token=None, base_version=None, max_age_s=None, signi
     of a "sign-in" checkout, or the same sign-in with its cookies rolled on, with base_version and signin_id,
     the "version" and "id" it was checked out as. The answer is {"saved": True, "version"}, or {"saved":
     False, "reason": "newer", "version"} when someone saved since base_version (or an admin deleted the
-    sign-in it was checked out from). A lease that ran out raises SigninError with status 409. The Grid UI
-    hands the state out for max_age_s from now (default 30 days, at most 90)."""
+    sign-in it was checked out from), or {"saved": False, "reason": "shared", "version"} when the sign-in
+    is only shared with the token's owner: only its owner's checks save it again. A lease that ran out
+    raises SigninError with status 409. The Grid UI hands the state out for max_age_s from now (default 30
+    days, at most 90)."""
     body = {"name": name, "state": state}
     if lease_token is not None:
         body["leaseToken"] = lease_token
@@ -239,7 +247,8 @@ def _refresh(session, max_age_s, url, token):
         return
     if answer.get("saved"):
         session.version = answer["version"]
-    elif answer.get("reason") != "newer":
-        # "newer": another check saved a fresher state meanwhile, which is kept.
+    elif answer.get("reason") not in ("newer", "shared"):
+        # "newer": another check saved a fresher state meanwhile, which is kept. "shared": the sign-in is
+        # shared with the token's owner, and only its owner's checks save it.
         warnings.warn("The Grid UI didn't save the sign-in {!r} again after the check: {}"
                       .format(session.name, answer.get("reason")))

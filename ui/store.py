@@ -21,6 +21,7 @@ The connection settings match the orchestrator's: the mysql section of
 src/database.yaml (or ORCHESTRATOR_CONFIG), overridden by DB_HOST, DB_PORT,
 DB_USER, DB_PASSWORD and DB_NAME.
 """
+import collections
 import contextlib
 import datetime
 import hashlib
@@ -38,7 +39,7 @@ import zlib
 
 import yaml
 
-from . import mfa
+from . import mfa, permissions
 
 DB_ENGINE = os.environ.get("GRID_DB_ENGINE", "mysql").lower()
 SQLITE_PATH = os.environ.get("GRID_DB_PATH", "src/runner.db")
@@ -64,6 +65,25 @@ HUB_LEASE_S = int(os.environ.get("GATEWAY_HUB_LEASE_S") or "90")
 ONLINE_WINDOW_S = 60  # same window as the checks' slot selection in src/database.py
 
 log = logging.getLogger(__name__)
+_warned = set()
+_warned_lock = threading.Lock()
+
+
+def warn_once(text, logger=log):
+    """Log a warning once per process, for what would otherwise be said on every request: a setting that is
+    wrong, a table that is missing. logger is the module it is about (this one's by default)."""
+    with _warned_lock:
+        if text in _warned:
+            return
+        _warned.add(text)
+    logger.warning("%s", text)
+
+
+def reset_warnings():
+    """Forget which warnings were logged: one test's must not keep another's from being logged."""
+    with _warned_lock:
+        _warned.clear()
+
 
 _ENV_OVERRIDES = {
     "host": "DB_HOST",
@@ -135,6 +155,23 @@ class SigninsFull(Exception):
 
 class SigninsUnavailable(Exception):
     """The database has no savedSignins table (and the UI couldn't create it)."""
+
+
+class NotShared(Exception):
+    """A check asked by name for an MFA secret or a saved sign-in that belongs to someone else and isn't shared
+    with its token's owner; the message says so. Names are shared by everyone on the grid, so this tells nothing
+    that "the name is taken" doesn't."""
+
+
+class NotPermitted(Exception):
+    """Someone may see this, but not do it to it; the message says why. rule is set when one of the rules that
+    stop people giving themselves or others more than they have refused it (accounts.py), and permission names
+    what they lacked, for the audit log."""
+
+    def __init__(self, message, rule=None, permission=None):
+        super().__init__(message)
+        self.rule = rule
+        self.permission = permission
 
 
 # ER_DBACCESS_DENIED_ERROR, ER_TABLEACCESS_DENIED_ERROR, ER_COLUMNACCESS_DENIED_ERROR
@@ -549,15 +586,6 @@ def snapshot():
     }
 
 
-def _execute(sql, params):
-    try:
-        with _session() as cur:
-            cur.execute(_sql(sql), params)
-            return cur.rowcount
-    except _MissingTables:
-        return 0
-
-
 def _release_sql(cur):
     """The SET clause that frees a slot. It also clears claimedBy, as every release does. A hub whose
     session still runs on the slot claims it again (it never hands a slot it pipes to a second
@@ -566,17 +594,30 @@ def _release_sql(cur):
     return "UPDATE portUsage SET inUse = 0, LastRunDate = {}{} WHERE id = ?".format(_now_sql(), clear)
 
 
-def release_slot(slot_id):
-    """Force a stuck slot back to free."""
+def _audit_slot(cur, actor, action, slot_id):
+    # Named by its host and port, which say more in the audit log than an id, and outlive the slot.
+    if actor is None:
+        return
+    cur.execute(_sql("SELECT PortServer, PortNumber FROM portStatus WHERE id = ?"), (slot_id,))
+    row = cur.fetchone()
+    _audit(cur, actor, action, "slot", slot_id, "{}:{}".format(*row) if row else None)
+
+
+def release_slot(slot_id, actor=None):
+    """Force a stuck slot back to free. actor is who did it, for the audit log (the grid actions record only
+    what changed)."""
     try:
         with _session() as cur:
             cur.execute(_sql(_release_sql(cur)), (slot_id,))
-            return cur.rowcount
+            released = cur.rowcount
+            if released:
+                _audit_slot(cur, actor, "grid.slot_released", slot_id)
+            return released
     except _MissingTables:
         return 0
 
 
-def release_claim(slot_id, claimed_at):
+def release_claim(slot_id, claimed_at, actor=None):
     """Release a slot only if it still holds the claim the caller looked at (claimed_at: the
     session's "started" as /api/status reports it). A check that finished and a new one that claimed
     the slot meanwhile must not be cut off by a confirm that described the old one.
@@ -598,22 +639,42 @@ def release_claim(slot_id, claimed_at):
             if _iso(_parse_time(row[1])) != claimed_at:
                 return "reclaimed", 0
             cur.execute(_sql(_release_sql(cur)), (slot_id,))
-            return "released", cur.rowcount
+            released = cur.rowcount
+            if released:
+                _audit_slot(cur, actor, "grid.slot_released", slot_id)
+            return "released", released
     except _MissingTables:
         return "not_found", 0
 
 
-def reset_slot_failures(slot_id):
-    return _execute("UPDATE portUsage SET failCount = 0 WHERE id = ?", (slot_id,))
+def reset_slot_failures(slot_id, actor=None):
+    # Only counts that aren't 0 already (here and for a node): MySQL's rowcount is the rows an UPDATE changed,
+    # sqlite's the rows it matched, and the answer and the audit log should be the same on both.
+    try:
+        with _session() as cur:
+            cur.execute(_sql("UPDATE portUsage SET failCount = 0 WHERE id = ? AND failCount <> 0"), (slot_id,))
+            updated = cur.rowcount
+            if updated:
+                _audit_slot(cur, actor, "grid.slot_reset", slot_id)
+            return updated
+    except _MissingTables:
+        return 0
 
 
-def reset_node_failures(host):
-    return _execute(
-        "UPDATE portUsage SET failCount = 0 WHERE id IN (SELECT id FROM portStatus WHERE PortServer = ?)",
-        (host,))
+def reset_node_failures(host, actor=None):
+    try:
+        with _session() as cur:
+            cur.execute(_sql("UPDATE portUsage SET failCount = 0 WHERE id IN (SELECT id FROM portStatus WHERE PortServer = ?) "
+                             "AND failCount <> 0"), (host,))
+            updated = cur.rowcount
+            if updated:
+                _audit(cur, actor, "grid.node_reset", "node", None, host)
+            return updated
+    except _MissingTables:
+        return 0
 
 
-def forget_node(name):
+def forget_node(name, actor=None):
     """Delete an offline gateway node and its slots.
 
     Returns ("forgotten", slots_deleted), ("not_found", 0), ("online", 0) or ("in_use", busy_count).
@@ -644,16 +705,333 @@ def forget_node(name):
             cur.execute(_sql("DELETE FROM portStatus WHERE PortServer = ?"), (name,))
             deleted = cur.rowcount
             cur.execute(_sql("DELETE FROM nodes WHERE name = ?"), (name,))
+            _audit(cur, actor, "grid.node_forgotten", "node", None, name, {"slots": deleted})
             return "forgotten", deleted
     except _MissingTables:
         return "not_found", 0
+
+
+# ---- owners and sharing ---------------------------------------------------------
+#
+# Who owns an MFA secret, a saved sign-in or an access token is its row in itemOwners (itemKind 'mfa', 'signin'
+# or 'token'); without one it is the admins'. Who else may use a secret or a sign-in is in itemShares: a user, or
+# everyone with a role. Both tables came with single sign-on, so a database may not have them yet: everything is
+# the admins' then, and only admins see it. An item is checked in Python on its own row, already selected (and
+# locked when it will be written), with plain reads of its owner and share rows, which are never locked.
+
+# Who is asking, for what MFA secrets, saved sign-ins and tokens it may see: user_id (None for admins without a
+# user: the admin token, ownerless client tokens), their effective role ids (an admin's include the Admin role's)
+# and permissions.
+Access = collections.namedtuple("Access", "user_id role_ids permissions")
+# Who made a change, for the audit log: users.id or None, the name the page shows, the provider id, the address
+# and their permissions (for the subset rules, which work them out again inside the lock).
+Actor = collections.namedtuple("Actor", "user_id name method address permissions")
+# itemKind -> the prefix of the permissions that govern it (mfa.use, mfa.add, mfa.all; signins.use, ...).
+_PERMISSION_GROUPS = {"mfa": "mfa", "signin": "signins"}
+# itemKind -> the table its items are rows of.
+_ITEM_TABLES = {"mfa": "mfaSecrets", "signin": "savedSignins"}
+# Why someone with a user can't add a token, an MFA secret or a saved sign-in to a database without itemOwners: the
+# row would have no owner, so it would be the admins' (and a client token without an owner acts as an admin).
+_NO_OWNER_TABLE = ("This database has no itemOwners table yet, so only admins can add this. The grid UI creates it on "
+                   "MySQL when its database user may create tables, and so does the gateway hub when it starts.")
+
+
+def _owner_tables(cur, tables=None):
+    """(whether the database has itemOwners, whether it has itemShares)."""
+    tables = _tables(cur) if tables is None else tables
+    return "itemowners" in tables, "itemshares" in tables
+
+
+def _owner(cur, kind, item_id, tables=None):
+    """The users.id that owns the item, or None: it is the admins' (always, without an itemOwners table)."""
+    if not _owner_tables(cur, tables)[0]:
+        return None
+    cur.execute(_sql("SELECT userId FROM itemOwners WHERE itemKind = ? AND itemId = ?"), (kind, item_id))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _grantees(access):
+    """(condition, params): what picks the itemShares rows of the viewer's user and of its roles ("" when it has
+    neither). Role ids go in as numbers, not parameters, so the list can be any length."""
+    branches, params = [], []
+    if access.user_id is not None:
+        branches.append("(granteeKind = 'user' AND granteeId = ?)")
+        params.append(access.user_id)
+    roles = sorted({int(r) for r in access.role_ids})
+    if roles:
+        branches.append("(granteeKind = 'role' AND granteeId IN ({}))".format(", ".join(str(r) for r in roles)))
+    return " OR ".join(branches), params
+
+
+def _vouched_for(text):
+    """An itemShares.vouchedFor value as a set of permissions, or None for a share nobody vouched for."""
+    return None if text is None else permissions.parse(text)
+
+
+def _shared_with(cur, kind, item_id, access, tables=None):
+    """(shared, vouches): whether the item is shared with the viewer or with one of its roles, and for each of those
+    shares that someone who could see every item of its kind made, what its owner could do then
+    (itemShares.vouchedFor, as a set of permissions)."""
+    grantees, params = _grantees(access)
+    if not grantees or not _owner_tables(cur, tables)[1]:
+        return False, []
+    cur.execute(_sql("SELECT vouchedFor FROM itemShares WHERE itemKind = ? AND itemId = ? AND (" + grantees + ")"),
+                [kind, item_id] + params)
+    rows = cur.fetchall()
+    return bool(rows), [_vouched_for(text) for (text,) in rows if text is not None]
+
+
+def _owner_permissions(cur, owner_id, owners=None):
+    """What the item's owner may do, counted as if enabled (disabling someone keeps their shares), or None when
+    they are no user. owners caches it by owner for a listing, which fills it for all of them at once
+    (accounts.user_accesses). accounts works out what a user may do, and it imports this module, so it is
+    imported here."""
+    owners = {} if owners is None else owners
+    if owner_id not in owners:
+        from . import accounts
+        found = accounts.user_access(owner_id, cur, as_enabled=True)
+        owners[owner_id] = None if found is None else found["permissions"]
+    return owners[owner_id]
+
+
+def _vouch_holds(vouched_for, owner_perms):
+    """Whether a share someone who could see every sign-in made (vouched_for: what its owner could do then) still
+    stands for its owner, who may now do owner_perms (None: they are no user). It stands while they may still do
+    all of that: a vouch for an admin's account says nothing of the account they save once they are a Tester."""
+    return vouched_for is not None and owner_perms is not None and vouched_for <= owner_perms
+
+
+def _reaches(cur, kind, owner_id, shared, vouches, access, owners=None):
+    """Whether the item's shares with the viewer let its checks use it. Any share of an MFA secret does: a code for
+    the wrong seed signs nobody in, and so does any share of what nobody owns, the admins'. A saved sign-in's checks
+    run as whatever account its owner's checks saved, so its shares reach a viewer who may do something its owner
+    may not only through one that someone who could see every sign-in made (vouches, from _shared_with), and only
+    while its owner may still do all they could then: otherwise its owner could put an account of their own on the
+    checks of someone who has more, through a role they also have (the one everyone gets, say), by sharing before
+    they were given more, or by being given less after an admin shared it. owners caches what owners may do, for
+    a listing (_owner_permissions)."""
+    if not shared or kind != "signin" or owner_id is None:
+        return shared
+    held = _owner_permissions(cur, owner_id, owners)
+    return held is not None and (access.permissions <= held or any(_vouch_holds(v, held) for v in vouches))
+
+
+def _rights(kind, owner_id, shared, reaches, access):
+    """(visible, manageable, steward, usable): what the viewer may do with an item that owner has.
+
+    visible: listed, its codes shown and used: everyone's with k.all, else with k.use its own and those shared
+    with it. manageable: shared, forgotten and deleted: everyone's with k.all, else with k.add its own. The last
+    two matter for sign-ins. steward: its checks sign in fresh and save: the owner's, and for one nobody owns,
+    those of whoever has signins.all. usable: its checks may use it at all, as a steward or through a share that
+    reaches them (_reaches), with signins.use. signins.all shows everyone's on the page, but never makes a check
+    use one someone else controls."""
+    group = _PERMISSION_GROUPS[kind]
+    perms = access.permissions
+    mine = owner_id is not None and owner_id == access.user_id
+    every = group + ".all" in perms
+    visible = every or (group + ".use" in perms and (mine or shared))
+    manageable = every or (group + ".add" in perms and mine)
+    steward = mine or (owner_id is None and every)
+    usable = group + ".use" in perms and (steward or reaches)
+    return visible, manageable, steward, usable
+
+
+def _item_access(cur, kind, item_id, access):
+    """(owner_id, visible, manageable, steward, usable) of one item for the viewer (see _rights)."""
+    tables = _tables(cur)
+    owner_id = _owner(cur, kind, item_id, tables)
+    shared, vouches = _shared_with(cur, kind, item_id, access, tables)
+    reaches = _reaches(cur, kind, owner_id, shared, vouches, access)
+    return (owner_id,) + _rights(kind, owner_id, shared, reaches, access)
+
+
+def _visible_clause(kind, alias, access, tables):
+    """(" AND (...)", params): what a listing adds to its WHERE so that only the items the viewer may see come
+    back; alias is the item table's in the query. Nothing to add with k.all. Without k.use, or without both
+    itemOwners and itemShares, nothing comes back."""
+    group = _PERMISSION_GROUPS[kind]
+    if group + ".all" in access.permissions:
+        return "", []
+    has_owners, has_shares = "itemowners" in tables, "itemshares" in tables
+    branches, params = [], []
+    if group + ".use" in access.permissions:
+        if has_owners and access.user_id is not None:
+            branches.append("{}.id IN (SELECT itemId FROM itemOwners WHERE itemKind = ? AND userId = ?)".format(alias))
+            params += [kind, access.user_id]
+        grantees, grantee_params = _grantees(access)
+        if has_shares and grantees:
+            branches.append("{}.id IN (SELECT itemId FROM itemShares WHERE itemKind = ? AND ({}))".format(alias, grantees))
+            params += [kind] + grantee_params
+    if not branches:
+        return " AND 1 = 0", []
+    return " AND (" + " OR ".join(branches) + ")", params
+
+
+def _managed(cur, kind, item_id, access, verb):
+    """Whether the viewer may see the item it wants to `verb` (False: answer as if it weren't there). Raises
+    NotPermitted when it may see it, but not manage it. Without access (the store's own callers), it may."""
+    if access is None:
+        return True
+    _, visible, manageable, _, _ = _item_access(cur, kind, item_id, access)
+    if visible and not manageable:
+        raise NotPermitted("Only its owner or an admin can {} it.".format(verb))
+    return visible
+
+
+def _add_owner(cur, kind, item_id, owner_id):
+    """Record who made the item, in the transaction that adds it (_NO_OWNER_TABLE was checked before)."""
+    cur.execute(_sql("INSERT INTO itemOwners (itemKind, itemId, userId, createdAt) VALUES (?, ?, ?, {})"
+                     .format(_now_sql())), (kind, item_id, owner_id))
+
+
+def _drop_item_rows(cur, kind, item_id, tables=None):
+    """Delete the item's owner and share rows, in the transaction that deletes the item: a namesake added later
+    starts unshared, and owned by whoever adds it."""
+    has_owners, has_shares = _owner_tables(cur, tables)
+    if has_owners:
+        cur.execute(_sql("DELETE FROM itemOwners WHERE itemKind = ? AND itemId = ?"), (kind, item_id))
+    if has_shares:
+        cur.execute(_sql("DELETE FROM itemShares WHERE itemKind = ? AND itemId = ?"), (kind, item_id))
+
+
+def _ownership(cur, kind, rows, access):
+    """Add to each listed item (a dict with its "id") who has it, as far as the viewer may know: ownerId (a
+    users.id, or None: the admins'), access ("owner", "shared" or "all": why the viewer sees it), canManage,
+    usable (sign-ins only: whether checks acting as the viewer may use it) and shares ([{"kind": "user" or
+    "role", "id", "vouchedFor"}], vouchedFor being a set of permissions or None as _shared_with reads it, only for
+    those who may manage it, else []). accounts.annotate puts names to the ids. Returns rows."""
+    has_owners, has_shares = _owner_tables(cur)
+    ids = ", ".join(str(int(row["id"])) for row in rows)
+    owners, shares = {}, collections.defaultdict(list)
+    if ids and has_owners:
+        cur.execute(_sql("SELECT itemId, userId FROM itemOwners WHERE itemKind = ? AND itemId IN ({})".format(ids)),
+                    (kind,))
+        owners = dict(cur.fetchall())
+    if ids and has_shares:
+        cur.execute(_sql("SELECT itemId, granteeKind, granteeId, vouchedFor FROM itemShares WHERE itemKind = ? "
+                         "AND itemId IN ({}) ORDER BY id".format(ids)), (kind,))
+        for item_id, grantee_kind, grantee_id, vouched_for in cur.fetchall():
+            shares[item_id].append({"kind": grantee_kind, "id": grantee_id, "vouchedFor": _vouched_for(vouched_for)})
+    roles = set(access.role_ids)
+    mine = {row["id"]: [s for s in shares.get(row["id"], ())
+                        if (s["id"] == access.user_id if s["kind"] == "user" else s["id"] in roles)] for row in rows}
+    # What the owners of the sign-ins shared with the viewer may do, all in the same few queries: the page asks
+    # for the listing every few seconds.
+    judged = {owners.get(row["id"]) for row in rows if kind == "signin" and mine[row["id"]]} - {None}
+    known = {}
+    if judged:
+        from . import accounts
+        found = accounts.user_accesses(cur, judged, as_enabled=True)
+        known = {owner_id: found[owner_id]["permissions"] if owner_id in found else None for owner_id in judged}
+    for row in rows:
+        owner_id, item_shares = owners.get(row["id"]), shares.get(row["id"], [])
+        shared = bool(mine[row["id"]])
+        vouches = [s["vouchedFor"] for s in mine[row["id"]] if s["vouchedFor"] is not None]
+        reaches = _reaches(cur, kind, owner_id, shared, vouches, access, known)
+        _, manageable, _, usable = _rights(kind, owner_id, shared, reaches, access)
+        row["ownerId"] = owner_id
+        row["access"] = "owner" if owner_id is not None and owner_id == access.user_id else "shared" if shared else "all"
+        row["canManage"] = manageable
+        if kind == "signin":
+            row["usable"] = usable
+        row["shares"] = item_shares if manageable else []
+    return rows
+
+
+def ownership(kind, rows, access):
+    """_ownership in a transaction of its own, for rows a change answered with (a new MFA secret)."""
+    ensure_schema()
+    with _session() as cur:
+        return _ownership(cur, kind, rows, access)
+
+
+def _listed_item(cur, kind, item_id, access):
+    """One MFA secret ('mfa') or saved sign-in ('signin') as its listing shows it to the viewer, with who has it
+    (_ownership), or None when there is no such item: for a change to who has it to answer with."""
+    if kind == "mfa":
+        cur.execute(_sql("SELECT " + _MFA_COLUMNS + " FROM mfaSecrets WHERE id = ?"), (item_id,))
+        row = cur.fetchone()
+        item = None if row is None else _mfa(row)
+    else:
+        cur.execute(_sql("SELECT {}, {} FROM savedSignins WHERE id = ?".format(_now_sql(), _SIGNIN_COLUMNS)), (item_id,))
+        row = cur.fetchone()
+        item = None if row is None else _signin(row[1:], _parse_time(row[0]))
+    return None if item is None else _ownership(cur, kind, [item], access)[0]
+
+
+# ---- audit log ------------------------------------------------------------------
+#
+# What people changed on the Grid UI. A change writes its row in the same transaction, so the two commit or roll
+# back together (audit_alone is for rows that must outlive a change that rolled back). No row holds a seed, code,
+# state, token or cookie. Rows older than GRID_AUDIT_DAYS are deleted as new ones are added.
+
+AUDIT_DAYS = 365
+AUDIT_DAYS_RANGE = (30, 3650)
+AUDIT_DETAILS_LIMIT = 4000
+_AUDIT_PURGE_LIMIT = 500
+
+
+def audit_days():
+    """How many days the audit log keeps: GRID_AUDIT_DAYS, read now. Anything but a whole number from 30 to
+    3650 means 365 (logged once)."""
+    text = os.environ.get("GRID_AUDIT_DAYS", "").strip()
+    low, high = AUDIT_DAYS_RANGE
+    if text:
+        try:
+            if low <= int(text) <= high:
+                return int(text)
+        except ValueError:
+            pass
+        warn_once("GRID_AUDIT_DAYS is a number of days from {} to {}; the audit log keeps {} days meanwhile."
+                  .format(low, high, AUDIT_DAYS))
+    return AUDIT_DAYS
+
+
+def _audit(cur, actor, action, target_kind=None, target_id=None, target_name=None, details=None):
+    """Record a change, in the transaction that makes it. Nothing is recorded without an actor (a grid with no
+    sign-in configured), or while the database has no auditLog table (logged once). details is a small object,
+    kept as compact JSON; past AUDIT_DETAILS_LIMIT characters it is cut, so callers keep lists short."""
+    if actor is None:
+        return
+    if "auditlog" not in _tables(cur):
+        warn_once("the database has no auditLog table yet; changes aren't being recorded")
+        return
+    text = None if details is None else json.dumps(details, separators=(",", ":"))[:AUDIT_DETAILS_LIMIT]
+    cur.execute(_sql("""
+        INSERT INTO auditLog (occurredAt, actorId, actorName, actorMethod, address, action, targetKind, targetId,
+                              targetName, details)
+        VALUES ({}, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """.format(_now_sql())), (actor.user_id, str(actor.name or "?")[:255], str(actor.method or "?")[:32],
+                              actor.address[:64] if actor.address else None, action, target_kind, target_id,
+                              target_name[:255] if target_name else None, text))
+    # By id, like the MFA hand-outs: on MySQL, a DELETE by occurredAt would lock every row it scans.
+    cur.execute("SELECT id FROM auditLog WHERE occurredAt < {} LIMIT {}".format(
+        _days_ago_sql(audit_days()), _AUDIT_PURGE_LIMIT))
+    old = [str(int(i)) for (i,) in cur.fetchall()]
+    if old:
+        cur.execute("DELETE FROM auditLog WHERE id IN ({})".format(", ".join(old)))
+
+
+def audit_alone(actor, action, target_kind=None, target_id=None, target_name=None, details=None):
+    """_audit in a transaction of its own, for a row that must outlive a change that rolled back (a refusal), or
+    must never fail what it records (a read). A failure is logged, never raised."""
+    if actor is None:
+        return
+    try:
+        ensure_schema()
+        with _session() as cur:
+            _audit(cur, actor, action, target_kind, target_id, target_name, details)
+    except Exception as e:
+        log.warning("couldn't record %s in the audit log: %s", action, e)
 
 
 # ---- managed access tokens ----------------------------------------------------
 #
 # The hub accepts these besides its env bootstrap tokens (GATEWAY_AGENT_TOKEN and
 # GATEWAY_CLIENT_TOKEN). Only the UI makes them and only their sha256 is stored: the plaintext
-# is returned once, by create_token, and never logged.
+# is returned once, by create_token, and never logged. Whoever made one owns it (itemOwners, which
+# the hub ignores): checks using a client token act as its owner, or as an admin when it has none.
 
 TOKEN_PREFIXES = {"agent": "pwga_", "client": "pwgc_"}
 _MAX_TOKEN_ID = 2 ** 31 - 1  # accessTokens.id is an INT; sqlite can't even bind a much larger number
@@ -661,6 +1039,15 @@ _NODE_NAME = re.compile(r"[a-z0-9._-]{1,128}\Z")
 _TOKEN_COLUMNS = "id, name, kind, prefix, nodeName, createdAt, expiresAt, lastUsedAt, revokedAt"
 _NO_TOKEN_TABLE = ("This database has no accessTokens table yet. The gateway hub creates it when it starts, "
                    "and so does the grid UI on MySQL when its database user may create tables.")
+_NO_TOKEN_OWNERS = ("This database has users but no itemOwners table, so the Grid UI can't tell whose client token this "
+                    "is, and won't take it for an admin's. The grid UI creates the table on MySQL when its database user "
+                    "may create tables, and so does the gateway hub when it starts.")
+# The hub turns away checks without a client token as soon as any client token row exists, revoked or expired
+# ones too, so the first row and the last are switches for the whole grid.
+FIRST_CLIENT_TOKEN = ("This would be the grid's first client token: from then on the hub turns away checks that don't "
+                      "send one. Ask someone whose roles include “Every access token” to make the first one.")
+LAST_CLIENT_TOKEN = ("It's the last client token on record: deleting it lets checks without a token back in after the "
+                     "hub's next restart. Ask someone whose roles include “Every access token” to delete it.")
 
 
 def token_hash(token):
@@ -690,19 +1077,51 @@ def _token(row, now):
     }
 
 
-def list_tokens():
+def _token_rights(kind, owner_id, access):
+    """Whether the viewer may see, revoke and delete a token that owner made (None: an admin did): everyone's with
+    tokens.all; else its own with tokens.own, and every agent token with tokens.agents."""
+    perms = access.permissions
+    if "tokens.all" in perms or (kind == "agent" and "tokens.agents" in perms):
+        return True
+    return "tokens.own" in perms and owner_id is not None and owner_id == access.user_id
+
+
+def _may_switch_client_tokens(access):
+    """Whether the viewer may make the grid's first client token or delete its last row: with tokens.all, or
+    anyone while the UI is given GATEWAY_CLIENT_TOKEN (the hub has it too, so it requires a token anyway).
+    Without access (the store's own callers), it may."""
+    return access is None or "tokens.all" in access.permissions or bool(os.environ.get("GATEWAY_CLIENT_TOKEN"))
+
+
+def _kind_counts(tokens):
+    """{kind: {"rows", "active", "revoked"}} over every token, whatever a viewer may see of them: the page warns
+    about the first and the last of a kind by these."""
+    counts = {kind: {"rows": 0, "active": 0, "revoked": 0} for kind in TOKEN_PREFIXES}
+    for token in tokens:
+        kind = counts.setdefault(token["kind"], {"rows": 0, "active": 0, "revoked": 0})
+        kind["rows"] += 1
+        if token["status"] in ("active", "revoked"):
+            kind[token["status"]] += 1
+    return counts
+
+
+def list_tokens(access=None):
     """{"ready": bool, "generated": ISO, "tokens": [...]}, newest first.
 
     ready is False while the database has no accessTokens table (an older demo database, or a
-    MySQL user that can't create it). Each token lists the nodes that last registered with it."""
+    MySQL user that can't create it). Each token lists the nodes that last registered with it.
+
+    With access (who asks), only the tokens it may see (_token_rights) are listed, each with its "ownerId", and
+    "kindCounts" counts every token of each kind."""
     ensure_schema()
+    owners = {}
     try:
         with _session() as cur:
             cur.execute("SELECT " + _now_sql())
             now = _parse_time(cur.fetchone()[0])
             tables = _tables(cur)
             if "accesstokens" not in tables:
-                return {"ready": False, "generated": _iso(now), "tokens": []}
+                return _no_tokens(_iso(now), access)
             cur.execute("SELECT " + _TOKEN_COLUMNS + " FROM accessTokens ORDER BY createdAt DESC, id DESC")
             tokens = [_token(row, now) for row in cur.fetchall()]
             users = []
@@ -710,8 +1129,11 @@ def list_tokens():
             if "nodes" in tables and "tokenid" in _columns(cur, "nodes"):
                 cur.execute("SELECT tokenId, name, online, lastSeen FROM nodes WHERE tokenId IS NOT NULL")
                 users = cur.fetchall()
+            if access is not None and "itemowners" in tables:
+                cur.execute("SELECT itemId, userId FROM itemOwners WHERE itemKind = 'token'")
+                owners = dict(cur.fetchall())
     except _MissingTables:  # dropped between queries
-        return {"ready": False, "generated": _iso(datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)), "tokens": []}
+        return _no_tokens(_iso(datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)), access)
     by_id = {t["id"]: t for t in tokens}
     for token_id, name, online, last_seen in sorted(users, key=lambda u: str(u[1]).casefold()):
         token = by_id.get(token_id)
@@ -721,7 +1143,20 @@ def list_tokens():
         seen = _parse_time(last_seen)
         if online and seen is not None and (now - seen).total_seconds() <= ONLINE_WINDOW_S:
             token["nodesOnline"].append(name)
-    return {"ready": True, "generated": _iso(now), "tokens": tokens}
+    if access is None:
+        return {"ready": True, "generated": _iso(now), "tokens": tokens}
+    counts = _kind_counts(tokens)
+    tokens = [t for t in tokens if _token_rights(t["kind"], owners.get(t["id"]), access)]
+    for token in tokens:
+        token["ownerId"] = owners.get(token["id"])
+    return {"ready": True, "generated": _iso(now), "tokens": tokens, "kindCounts": counts}
+
+
+def _no_tokens(generated, access):
+    listing = {"ready": False, "generated": generated, "tokens": []}
+    if access is not None:
+        listing["kindCounts"] = _kind_counts([])
+    return listing
 
 
 def _validate_token_request(name, kind, node_name, expires_in_days):
@@ -745,10 +1180,14 @@ def _validate_token_request(name, kind, node_name, expires_in_days):
     return name.strip(), kind, node_name, expires_in_days
 
 
-def create_token(name, kind, node_name=None, expires_in_days=None):
-    """Make a managed token. The result's "token" is the plaintext: the only time it's available.
+def create_token(name, kind, node_name=None, expires_in_days=None, owner_id=None, access=None, actor=None):
+    """Make a managed token, owned by owner_id (a users.id; None: the admins'). The result's "token" is the
+    plaintext: the only time it's available. With access (who asks), the result has its "ownerId", and a client
+    token that would be the grid's first needs _may_switch_client_tokens (NotPermitted). actor is who made it,
+    for the audit log.
 
-    Raises InvalidToken for a bad request and TokensUnavailable without an accessTokens table."""
+    Raises InvalidToken for a bad request and TokensUnavailable without an accessTokens table (or, for a token
+    someone owns, without an itemOwners table)."""
     name, kind, node_name, expires_in_days = _validate_token_request(name, kind, node_name, expires_in_days)
     ensure_schema()
     token = TOKEN_PREFIXES[kind] + secrets.token_urlsafe(32)
@@ -757,64 +1196,112 @@ def create_token(name, kind, node_name=None, expires_in_days=None):
             cur.execute("SELECT " + _now_sql())
             now = _parse_time(cur.fetchone()[0]).replace(microsecond=0)
             expires = now + datetime.timedelta(days=expires_in_days) if expires_in_days else None
+            tables = _tables(cur)
+            if owner_id is not None and "accesstokens" in tables and "itemowners" not in tables:
+                raise TokensUnavailable(_NO_OWNER_TABLE)
+            if kind == "client" and not _may_switch_client_tokens(access):
+                cur.execute("SELECT COUNT(*) FROM accessTokens WHERE kind = 'client'")
+                if not cur.fetchone()[0]:
+                    raise NotPermitted(FIRST_CLIENT_TOKEN, permission="tokens.all")
             cur.execute(_sql("""
                 INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """), (name, kind, token_hash(token), token[:12], node_name, _db_time(now), _db_time(expires)))
             token_id = cur.lastrowid
+            if owner_id is not None:
+                _add_owner(cur, "token", token_id, owner_id)
+            _audit(cur, actor, "token.created", "token", token_id, name, {"kind": kind, "owner": owner_id})
     except _MissingTables as e:
         raise TokensUnavailable(_NO_TOKEN_TABLE) from e
     result = _token((token_id, name, kind, token[:12], node_name, now, expires, None, None), now)
+    if access is not None:
+        result["ownerId"] = owner_id
     result["token"] = token
     return result
 
 
-def revoke_token(token_id):
-    """Revoke a token (revoking it again keeps the first time). Returns the token, or None if unknown."""
+def _visible_token(cur, token_id, access, lock=""):
+    """(kind, name, owner id) of a token the viewer may see (all of them without access), or None."""
+    cur.execute(_sql("SELECT kind, name FROM accessTokens WHERE id = ?" + lock), (token_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    owner_id = _owner(cur, "token", token_id) if access is not None else None
+    if access is not None and not _token_rights(row[0], owner_id, access):
+        return None
+    return row[0], row[1], owner_id
+
+
+def revoke_token(token_id, access=None, actor=None):
+    """Revoke a token (revoking it again keeps the first time). Returns the token, or None if unknown (or, with
+    access, one the viewer may not see). Revoking is never refused otherwise: someone must always be able to stop
+    their own leaked token, and a revoked row keeps the hub requiring a token like an active one."""
     if not 1 <= token_id <= _MAX_TOKEN_ID:
         return None
     try:
         with _session() as cur:
+            found = _visible_token(cur, token_id, access)
+            if found is None:
+                return None
             cur.execute(_sql("UPDATE accessTokens SET revokedAt = {} WHERE id = ? AND revokedAt IS NULL".format(_now_sql())),
                         (token_id,))
+            if cur.rowcount:
+                _audit(cur, actor, "token.revoked", "token", token_id, found[1])
             cur.execute(_sql("SELECT {}, {} FROM accessTokens WHERE id = ?".format(_now_sql(), _TOKEN_COLUMNS)), (token_id,))
             row = cur.fetchone()
     except _MissingTables:
         return None
-    return _token(row[1:], _parse_time(row[0])) if row else None
+    if row is None:
+        return None
+    result = _token(row[1:], _parse_time(row[0]))
+    if access is not None:
+        result["ownerId"] = found[2]
+    return result
 
 
-def delete_token(token_id):
-    """Delete a revoked or expired token and forget which nodes used it.
+def delete_token(token_id, access=None, actor=None):
+    """Delete a revoked or expired token, its owner row, and forget which nodes used it.
 
-    Returns "deleted", "not_found" or "active" (revoke it first)."""
+    Returns "deleted", "not_found" (with access, for one the viewer may not see too) or "active" (revoke it
+    first). With access, deleting the last client token row needs _may_switch_client_tokens (NotPermitted)."""
     if not 1 <= token_id <= _MAX_TOKEN_ID:
         return "not_found"
+    switch = _may_switch_client_tokens(access)
     try:
         with _session() as cur:
-            if DB_ENGINE == "mysql":
-                lock = " FOR UPDATE"
-            else:
-                cur.execute("BEGIN IMMEDIATE")  # hold the write lock across check and delete
-                lock = ""
-            cur.execute(_sql("SELECT " + _now_sql() + ", expiresAt, revokedAt FROM accessTokens WHERE id = ?" + lock),
-                        (token_id,))
-            row = cur.fetchone()
-            if row is None:
+            lock = _lock(cur)  # held across check and delete
+            if not switch:
+                # Every client row, locked in id order before anything else: two people deleting the last two at
+                # once would otherwise each count the other's as still there. In one order, they wait in turn.
+                cur.execute("SELECT id FROM accessTokens WHERE kind = 'client' ORDER BY id" + lock)
+                clients = [row[0] for row in cur.fetchall()]
+            found = _visible_token(cur, token_id, access, lock)
+            if found is None:
                 return "not_found"
-            if _token_status(*(_parse_time(v) for v in row)) == "active":
+            cur.execute(_sql("SELECT {}, expiresAt, revokedAt FROM accessTokens WHERE id = ?".format(_now_sql())),
+                        (token_id,))
+            if _token_status(*(_parse_time(v) for v in cur.fetchone())) == "active":
                 return "active"
+            if found[0] == "client" and not switch and not any(i != token_id for i in clients):
+                raise NotPermitted(LAST_CLIENT_TOKEN, permission="tokens.all")
             if "tokenid" in _columns(cur, "nodes"):
                 cur.execute(_sql("UPDATE nodes SET tokenId = NULL WHERE tokenId = ?"), (token_id,))
             cur.execute(_sql("DELETE FROM accessTokens WHERE id = ?"), (token_id,))
+            _drop_item_rows(cur, "token", token_id)
+            _audit(cur, actor, "token.deleted", "token", token_id, found[1])
             return "deleted"
     except _MissingTables:
         return "not_found"
 
 
-def client_token_name(token):
-    """The name of the active managed client token `token` is, or None. Stamps the token's lastUsedAt,
-    as the hub does when a check connects with it."""
+def client_token(token):
+    """The active managed client token `token` is, as {"id", "name", "ownerId"}, or None. ownerId is the users.id
+    of the person who made it, or None when an admin did (with the admin token, or before there were users):
+    checks using it act as an admin. Stamps the token's lastUsedAt, as the hub does when a check connects with it.
+
+    Raises TokensUnavailable when the database has users but no itemOwners table (or the UI's database user can't
+    see it): people may have made tokens, and without their owner rows none can be told from an admin's, so none
+    is taken for one."""
     if not token:
         return None
     try:
@@ -824,18 +1311,27 @@ def client_token_name(token):
             row = cur.fetchone()
             if row is None or _token_status(_parse_time(row[0]), _parse_time(row[3]), _parse_time(row[4])) != "active":
                 return None
+            tables = _tables(cur)
+            if "users" in tables and "itemowners" not in tables:
+                raise TokensUnavailable(_NO_TOKEN_OWNERS)
             cur.execute(_sql("UPDATE accessTokens SET lastUsedAt = {} WHERE id = ?".format(_now_sql())), (row[1],))
-            return row[2]
+            return {"id": row[1], "name": row[2], "ownerId": _owner(cur, "token", row[1], tables)}
     except _MissingTables:
         return None
+
+
+def client_token_name(token):
+    """The name of the active managed client token `token` is, or None (see client_token)."""
+    return (client_token(token) or {}).get("name")
 
 
 # ---- MFA secrets ----------------------------------------------------------------
 #
 # Authenticator-app enrolments (TOTP seeds) for checks that sign in with two-step verification. The
 # seed is encrypted before it reaches the database (see mfa.py) and never leaves this process: checks
-# and admins get codes. Each time step is handed out once, like sites accept each code once, so checks
-# that sign in to the same account at the same time never get the same code.
+# and people get codes. Each time step is handed out once, like sites accept each code once, so checks
+# that sign in to the same account at the same time never get the same code. Whoever adds a secret owns
+# it; it is used by them, by those they share it with, and by whoever may see every secret (mfa.all).
 
 _MFA_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _MFA_COLUMNS = "id, name, issuer, account, algorithm, digits, period, createdAt, lastStep, lastIssuedAt, lastIssuedTo, issuedCount"
@@ -879,45 +1375,68 @@ def _is_duplicate_key(error):
 
 
 def _lock(cur):
-    """The row lock for a read-then-write transaction: FOR UPDATE on MySQL, the write lock on sqlite."""
+    """The row lock for a read-then-write transaction: FOR UPDATE on MySQL, the write lock on sqlite (which a
+    transaction that changes access holds already)."""
     if DB_ENGINE == "mysql":
         return " FOR UPDATE"
-    cur.execute("BEGIN IMMEDIATE")
+    if not cur.connection.in_transaction:
+        cur.execute("BEGIN IMMEDIATE")
     return ""
 
 
-def list_mfa():
+def list_mfa(access=None):
     """{"ready", "generated", "secrets": [...], "issues": [the newest MFA_LOG_LIMIT hand-outs]}, without seeds.
 
-    ready is False while the database has no MFA tables."""
+    ready is False while the database has no MFA tables. With access (who asks), only the secrets it may see
+    and their hand-outs are listed, each secret with who has it (_ownership)."""
     ensure_schema()
     try:
         with _session() as cur:
             cur.execute("SELECT " + _now_sql())
             now = _parse_time(cur.fetchone()[0])
-            if not {"mfasecrets", "mfaissues"} <= _tables(cur):
+            tables = _tables(cur)
+            if not {"mfasecrets", "mfaissues"} <= tables:
                 return {"ready": False, "generated": _iso(now), "secrets": [], "issues": []}
-            cur.execute("SELECT " + _MFA_COLUMNS + " FROM mfaSecrets ORDER BY name")
+            visible, params = ("", []) if access is None else _visible_clause("mfa", "s", access, tables)
+            cur.execute(_sql("SELECT " + _MFA_COLUMNS + " FROM mfaSecrets s WHERE 1 = 1" + visible + " ORDER BY name"),
+                        params)
             secrets_ = [_mfa(row) for row in cur.fetchall()]
             # The page says "last 7 days": rows not purged yet don't count.
-            cur.execute("""
+            cur.execute(_sql("""
                 SELECT i.id, i.secretId, s.name, i.step, i.issuedAt, i.issuedTo, i.label
                 FROM mfaIssues i JOIN mfaSecrets s ON s.id = i.secretId
-                WHERE i.issuedAt >= {}
+                WHERE i.issuedAt >= {}{}
                 ORDER BY i.id DESC LIMIT {}
-            """.format(_days_ago_sql(MFA_LOG_DAYS), MFA_LOG_LIMIT))
+            """.format(_days_ago_sql(MFA_LOG_DAYS), visible, MFA_LOG_LIMIT)), params)
             issues = [{"id": i, "secretId": sid, "name": name, "step": step, "issuedAt": _iso(_parse_time(at)),
                        "issuedTo": to, "label": label} for i, sid, name, step, at, to, label in cur.fetchall()]
+            if access is not None:
+                _ownership(cur, "mfa", secrets_, access)
     except _MissingTables:
         return {"ready": False, "generated": None, "secrets": [], "issues": []}
     return {"ready": True, "generated": _iso(now), "secrets": secrets_, "issues": issues}
 
 
-def create_mfa(name, secret, issuer=None, account=None, algorithm=None, digits=None, period=None):
-    """Store a secret. `secret` is a base32 seed or an otpauth://totp/ URI (whose issuer, account and
-    settings are used unless given here). Returns the secret as list_mfa shows it, never the seed.
+def _mfa_taken(cur, name, access):
+    """The refusal of a name another secret has. It says how to replace that secret to whoever may see it, and
+    only that the name is taken to anyone else: names are shared by everyone on the grid."""
+    cur.execute(_sql("SELECT id FROM mfaSecrets WHERE name = ?"), (name,))
+    row = cur.fetchone()
+    if access is None or (row is not None and _item_access(cur, "mfa", row[0], access)[1]):
+        return mfa.InvalidSecret("There is already a secret called {!r}. Delete it first to replace it.".format(name))
+    return mfa.InvalidSecret("The name {!r} is taken. Names are shared by everyone on the grid: choose another."
+                             .format(name))
 
-    Raises mfa.InvalidSecret, mfa.SecretsKeyMissing or MfaUnavailable."""
+
+def create_mfa(name, secret, issuer=None, account=None, algorithm=None, digits=None, period=None, owner_id=None,
+               actor=None, access=None):
+    """Store a secret, owned by owner_id (a users.id; None: the admins'). `secret` is a base32 seed or an
+    otpauth://totp/ URI (whose issuer, account and settings are used unless given here). Returns the secret as
+    list_mfa shows it without access, never the seed. access (who asks) decides how a taken name is refused;
+    actor is who added it, for the audit log.
+
+    Raises mfa.InvalidSecret, mfa.SecretsKeyMissing or MfaUnavailable (also for a secret someone owns, on a
+    database without itemOwners)."""
     if not isinstance(name, str) or not _MFA_NAME.match(name.strip()):
         raise mfa.InvalidSecret("A secret's name is 1 to 64 characters: letters, digits, '.', '_' and '-'. "
                                 "Checks ask for codes by this name.")
@@ -936,7 +1455,6 @@ def create_mfa(name, secret, issuer=None, account=None, algorithm=None, digits=N
     issuer = _optional_text(issuer, "The issuer", 128)
     account = _optional_text(account, "The account", 255)
     cipher = mfa.encrypt(seed, name)  # SecretsKeyMissing before anything is written
-    taken = mfa.InvalidSecret("There is already a secret called {!r}. Delete it first to replace it.".format(name))
     ensure_schema()
     try:
         with _session() as cur:
@@ -944,7 +1462,9 @@ def create_mfa(name, secret, issuer=None, account=None, algorithm=None, digits=N
             # holding it deadlock on their INSERTs. uq_mfa_name decides a race; this is the common case.
             cur.execute(_sql("SELECT id FROM mfaSecrets WHERE name = ?"), (name,))
             if cur.fetchone() is not None:
-                raise taken
+                raise _mfa_taken(cur, name, access)
+            if owner_id is not None and not _owner_tables(cur)[0]:
+                raise MfaUnavailable(_NO_OWNER_TABLE)
             try:
                 cur.execute(_sql("""
                     INSERT INTO mfaSecrets (name, issuer, account, algorithm, digits, period, seedCipher, createdAt)
@@ -953,23 +1473,35 @@ def create_mfa(name, secret, issuer=None, account=None, algorithm=None, digits=N
             except Exception as e:
                 if not _is_duplicate_key(e):
                     raise
-                raise taken from None
-            cur.execute(_sql("SELECT " + _MFA_COLUMNS + " FROM mfaSecrets WHERE id = ?"), (cur.lastrowid,))
+                raise _mfa_taken(cur, name, access) from None
+            secret_id = cur.lastrowid
+            if owner_id is not None:
+                _add_owner(cur, "mfa", secret_id, owner_id)
+            _audit(cur, actor, "mfa.created", "mfa", secret_id, name)
+            cur.execute(_sql("SELECT " + _MFA_COLUMNS + " FROM mfaSecrets WHERE id = ?"), (secret_id,))
             return _mfa(cur.fetchone())
     except _MissingTables as e:
         raise MfaUnavailable(_NO_MFA_TABLE) from e
 
 
-def delete_mfa(secret_id):
-    """Delete a secret and its hand-out log. Returns False if there is no such secret."""
+def delete_mfa(secret_id, access=None, actor=None):
+    """Delete a secret, its hand-out log, and its owner and share rows. Returns False if there is no such secret
+    (or, with access, none the viewer may see); NotPermitted when the viewer may see it but not delete it. actor
+    is who deleted it, for the audit log."""
     if not 1 <= secret_id <= _MAX_TOKEN_ID:
         return False
     try:
         with _session() as cur:
+            lock = _lock(cur)
+            cur.execute(_sql("SELECT name FROM mfaSecrets WHERE id = ?" + lock), (secret_id,))
+            row = cur.fetchone()
+            if row is None or not _managed(cur, "mfa", secret_id, access, "delete"):
+                return False
             cur.execute(_sql("DELETE FROM mfaSecrets WHERE id = ?"), (secret_id,))
-            deleted = cur.rowcount
             cur.execute(_sql("DELETE FROM mfaIssues WHERE secretId = ?"), (secret_id,))
-            return bool(deleted)
+            _drop_item_rows(cur, "mfa", secret_id)
+            _audit(cur, actor, "mfa.deleted", "mfa", secret_id, row[0])
+            return True
     except _MissingTables:
         return False
 
@@ -979,12 +1511,22 @@ def _window(t, step, period):
     return round(max(0.0, step * period - t), 3), round((step + 1) * period - t, 3)
 
 
-def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s=None, now=None):
+def _not_shared(what, name):
+    return NotShared("The {} {!r} belongs to someone else and isn't shared with this client token's owner."
+                     .format(what, name))
+
+
+def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s=None, now=None, access=None,
+                   actor=None):
     """Hand out the code of a time step nobody has had yet, for the secret called `name` (or with id
     `secret_id`): the current step if it has at least min_valid_s left and is still free, else the next
     free one. A code from a later step is handed out before its window opens: waitS says how long to
     wait before typing it, validForS how long until it stops working (both from now, by this server's
     clock, which must be in sync with the site's).
+
+    With access (who asks), a secret it may not see is answered before its seed is even decrypted, as if it
+    weren't there when asked by id (the page), and with NotShared when asked by name (a check). actor is who
+    took a code on the page, for the audit log (checks' hand-outs are in mfaIssues already).
 
     Returns {"id", "name", "code", "step", "waitS", "validForS", "period", "digits"}, or None for an
     unknown secret. Raises MfaBusy when MFA_MAX_AHEAD_STEPS steps ahead are taken, mfa.CannotDecrypt
@@ -1001,6 +1543,10 @@ def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s
             row = cur.fetchone()
             if row is None:
                 return None
+            if access is not None and not _item_access(cur, "mfa", row[0], access)[1]:
+                if secret_id is not None:
+                    return None
+                raise _not_shared("MFA secret", name)
             sid, name, algorithm, digits, period, cipher, last_step = row
             seed = mfa.decrypt(cipher, name)
             t = time.time() if now is None else now
@@ -1017,6 +1563,7 @@ def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s
                              "issuedCount = issuedCount + 1 WHERE id = ?".format(now=_now_sql())), (step, issued_to, sid))
             cur.execute(_sql("INSERT INTO mfaIssues (secretId, step, issuedAt, issuedTo, label) VALUES (?, ?, {}, ?, ?)"
                              .format(_now_sql())), (sid, step, issued_to, label))
+            _audit(cur, actor, "mfa.code_used", "mfa", sid, name)
             # Every secret's old hand-outs, not only this one's: a secret nobody asks for again keeps none.
             # By id: on MySQL, a DELETE by issuedAt would lock every row it scans, other secrets' new ones too.
             cur.execute("SELECT id FROM mfaIssues WHERE issuedAt < " + _days_ago_sql(MFA_LOG_DAYS))
@@ -1030,11 +1577,12 @@ def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s
             "waitS": wait_s, "validForS": valid_for_s, "period": period, "digits": digits}
 
 
-def peek_mfa_code(secret_id, now=None):
-    """The current step's code for an admin to look at, using nothing up. "issued" says whether that
+def peek_mfa_code(secret_id, now=None, access=None):
+    """The current step's code for someone to look at on the page, using nothing up. "issued" says whether that
     step was already handed out (a site would refuse it from a second sign-in).
 
-    Returns {"id", "name", "code", "step", "secondsLeft", "period", "digits", "issued"} or None."""
+    Returns {"id", "name", "code", "step", "secondsLeft", "period", "digits", "issued"} or None (also, with
+    access, for a secret the viewer may not see: before its seed is even decrypted)."""
     if not 1 <= secret_id <= _MAX_TOKEN_ID:
         return None
     try:
@@ -1042,6 +1590,8 @@ def peek_mfa_code(secret_id, now=None):
             cur.execute(_sql("SELECT id, name, algorithm, digits, period, seedCipher, lastStep FROM mfaSecrets WHERE id = ?"),
                         (secret_id,))
             row = cur.fetchone()
+            if row is not None and access is not None and not _item_access(cur, "mfa", secret_id, access)[1]:
+                return None
     except _MissingTables:
         return None
     if row is None:
@@ -1059,16 +1609,23 @@ def peek_mfa_code(secret_id, now=None):
 #
 # Signed-in browser states (Playwright's storage_state: cookies and local storage) that checks reuse from
 # run to run, so most runs skip the sign-in and its MFA prompt, and the site sees few sign-ins. A state is
-# encrypted before it reaches the database (see mfa.seal) and only checks get it back: admins see what is
+# encrypted before it reaches the database (see mfa.seal) and only checks get it back: people see what is
 # saved and who used it, never a cookie. When nothing usable is saved for a name, one check at a time signs
 # in (it holds the lease) and the others wait for the state it saves.
+#
+# A sign-in is owned by the owner of the client token whose check first checked its name out (the admins',
+# for a token without an owner). Names are shared by everyone on the grid, so a check uses a sign-in only
+# when its token's owner is a steward of it (the owner, or for the admins' one, whoever may see every
+# sign-in) or it is shared with them. Only stewards' checks sign in fresh and save: nobody can make another
+# person's checks type their credentials into a row they control, or save a state over the owner's.
 
 _SIGNIN_COLUMNS = ("id, name, version, stateCipher IS NOT NULL, domains, cookieCount, originCount, savedAt, savedBy, "
                    "expiresAt, signInCount, refreshCount, useCount, lastUsedAt, lastUsedBy, rejectedCount, lastRejectedAt, "
                    "leaseHash IS NOT NULL, leaseUntil, leaseHolder")
-# Checks add names themselves (a name's first checkout adds it), so their number is capped. Checks adding
-# names at the very same moment can get a few past it.
+# Checks add names themselves (a name's first checkout adds it), so their number is capped, in all and for each
+# person who doesn't see every sign-in. Checks adding names at the very same moment can get a few past it.
 SIGNIN_MAX_COUNT = 200
+SIGNIN_MAX_PER_OWNER = 50
 SIGNIN_MAX_STATE_BYTES = 2 * 1024 * 1024  # the state as compact JSON
 # A request may carry the state with spacing and escapes the stored form doesn't have.
 SIGNIN_MAX_BODY_BYTES = 4 * SIGNIN_MAX_STATE_BYTES
@@ -1185,27 +1742,40 @@ def _signin(row, now):
             "leaseForS": max(1, int((lease_until - now).total_seconds())) if live else None}
 
 
-def list_signins():
+def list_signins(access=None):
     """{"ready", "generated", "signins": [...]}: what is saved for each name and who used it, never a state.
 
-    ready is False while the database has no savedSignins table."""
+    ready is False while the database has no savedSignins table. With access (who asks), only the sign-ins it
+    may see are listed, each with who has it and whether checks acting as it may use it (_ownership)."""
     ensure_schema()
     try:
         with _session() as cur:
             cur.execute("SELECT " + _now_sql())
             now = _parse_time(cur.fetchone()[0])
-            if "savedsignins" not in _tables(cur):
+            tables = _tables(cur)
+            if "savedsignins" not in tables:
                 return {"ready": False, "generated": _iso(now), "signins": []}
-            cur.execute("SELECT " + _SIGNIN_COLUMNS + " FROM savedSignins ORDER BY name")
+            visible, params = ("", []) if access is None else _visible_clause("signin", "s", access, tables)
+            cur.execute(_sql("SELECT " + _SIGNIN_COLUMNS + " FROM savedSignins s WHERE 1 = 1" + visible + " ORDER BY name"),
+                        params)
             signins = [_signin(row, now) for row in cur.fetchall()]
+            if access is not None:
+                _ownership(cur, "signin", signins, access)
     except _MissingTables:
         return {"ready": False, "generated": None, "signins": []}
     return {"ready": True, "generated": _iso(now), "signins": signins}
 
 
-def _add_signin(name):
-    """Drop every state past its expiresAt, and add the row of a name no check used yet (SigninsFull past
-    SIGNIN_MAX_COUNT names)."""
+def _may_add_signins(access):
+    # A name's first checkout adds it, for checks whose token's owner may add sign-ins (and the store's own callers).
+    return access is None or "signins.add" in access.permissions
+
+
+def _add_signin(name, access=None, actor=None):
+    """Drop every state past its expiresAt, and add the row of a name no check used yet when the check may
+    (_may_add_signins), owned by its token's owner (access.user_id; None: the admins'). SigninsFull past
+    SIGNIN_MAX_COUNT names, or past SIGNIN_MAX_PER_OWNER for an owner who doesn't see every sign-in.
+    actor is the check, for the audit log."""
     with _session() as cur:
         # Every name's, not only this one's: a name nobody checks out again keeps nothing. By id: on MySQL, an
         # UPDATE by expiresAt would lock every row it scans, the rows other checkouts hold too.
@@ -1217,20 +1787,33 @@ def _add_signin(name):
         # No locking read: on MySQL, FOR UPDATE on a name nobody has locks a gap, and two checkouts holding it
         # deadlock on their INSERTs. uq_signin_name decides a race.
         cur.execute(_sql("SELECT id FROM savedSignins WHERE name = ?"), (name,))
-        if cur.fetchone() is not None:
+        if cur.fetchone() is not None or not _may_add_signins(access):
             return
+        owner_id = access.user_id if access is not None else None
+        if owner_id is not None and not _owner_tables(cur)[0]:
+            raise SigninsUnavailable(_NO_OWNER_TABLE)
         cur.execute("SELECT COUNT(*) FROM savedSignins")
         if cur.fetchone()[0] >= SIGNIN_MAX_COUNT:
             raise SigninsFull("There are {} saved sign-ins already, the most the grid keeps. Delete some on the Grid UI "
                               "to use new names.".format(SIGNIN_MAX_COUNT))
+        if owner_id is not None and "signins.all" not in access.permissions:
+            cur.execute(_sql("SELECT COUNT(*) FROM itemOwners WHERE itemKind = 'signin' AND userId = ?"), (owner_id,))
+            if cur.fetchone()[0] >= SIGNIN_MAX_PER_OWNER:
+                raise SigninsFull("This client token's owner has {} saved sign-ins already, the most one person's checks "
+                                  "may add. Delete some on the Grid UI to use new names.".format(SIGNIN_MAX_PER_OWNER))
         try:
             cur.execute(_sql("INSERT INTO savedSignins (name, createdAt) VALUES (?, {})".format(_now_sql())), (name,))
         except Exception as e:
             if not _is_duplicate_key(e):
                 raise
+            return
+        signin_id = cur.lastrowid
+        if owner_id is not None:
+            _add_owner(cur, "signin", signin_id, owner_id)
+        _audit(cur, actor, "signin.created", "signin", signin_id, name, {"owner": owner_id})
 
 
-def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_id=None):
+def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_id=None, access=None, actor=None):
     """What a check should do to be signed in as `name`:
 
     {"status": "saved", "id", "name", "version", "state", "savedAt", "expiresAt"}: open a context with that
@@ -1243,6 +1826,11 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
     rejected_version is the version of a state the site refused (it asked to sign in again), and signin_id
     the id it was checked out with: while that is still the saved one, it is dropped, else the newer one is
     answered. A name no check used yet is added.
+
+    With access (who the check acts as), a sign-in it may not use raises NotShared, and two more answers can
+    come: {"status": "missing"} for a name nobody added when it may not add names, and {"status":
+    "owner-signs-in", "name"} when nothing usable is saved and it isn't a steward, so it may not sign in for
+    it. actor is the check, for the audit log.
     Raises InvalidSignin, SigninsFull, mfa.SecretsKeyMissing (before anything is written) and SigninsUnavailable."""
     name = _signin_name(name)
     rejected_version = _version(rejected_version, "rejectedVersion")
@@ -1254,7 +1842,7 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
     ensure_schema()
     try:
         while True:
-            _add_signin(name)
+            _add_signin(name, access, actor)
             with _session() as cur:
                 lock = _lock(cur)
                 cur.execute("SELECT " + _now_sql())
@@ -1263,13 +1851,22 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
                                  "FROM savedSignins WHERE name = ?" + lock), (name,))
                 row = cur.fetchone()
                 if row is not None:
-                    return _checkout(cur, now, row, used_by, rejected_version, signin_id, lease_s)
+                    steward = True
+                    if access is not None:
+                        # Before anything else, the drop of a rejected state included; and never round the loop
+                        # again: a row someone else owns is there, it just isn't this check's.
+                        _, _, _, steward, usable = _item_access(cur, "signin", row[0], access)
+                        if not usable:
+                            raise _not_shared("saved sign-in", name)
+                    return _checkout(cur, now, row, used_by, rejected_version, signin_id, lease_s, steward)
+                if not _may_add_signins(access):
+                    return {"status": "missing"}
             # An admin deleted it in between: add it again.
     except _MissingTables as e:
         raise SigninsUnavailable(_NO_SIGNIN_TABLE) from e
 
 
-def _checkout(cur, now, row, used_by, rejected_version, rejected_id, lease_s):
+def _checkout(cur, now, row, used_by, rejected_version, rejected_id, lease_s, may_lease=True):
     signin_id, name, version, cipher, saved_at, expires, lease_hash, lease_until = row
     expires, lease_until = _parse_time(expires), _parse_time(lease_until)
     # The refused state by its version and the id it came with (a name deleted and added again starts over at
@@ -1294,6 +1891,9 @@ def _checkout(cur, now, row, used_by, rejected_version, rejected_id, lease_s):
         low, high = SIGNIN_RETRY_RANGE_S
         return {"status": "wait", "name": name,
                 "retryAfterS": min(max(int((lease_until - now).total_seconds()), low), high)}
+    if not may_lease:
+        # Returned, not raised: the drop of a rejected state above must commit.
+        return {"status": "owner-signs-in", "name": name}
     token = secrets.token_urlsafe(32)
     cur.execute(_sql("UPDATE savedSignins SET leaseHash = ?, leaseUntil = ?, leaseHolder = ? WHERE id = ?"),
                 (token_hash(token), _db_time(now + datetime.timedelta(seconds=lease_s)), used_by, signin_id))
@@ -1301,7 +1901,8 @@ def _checkout(cur, now, row, used_by, rejected_version, rejected_id, lease_s):
             "leaseForS": lease_s}
 
 
-def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_age_s=None, signin_id=None):
+def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_age_s=None, signin_id=None,
+                access=None):
     """Keep the state a check is signed in with, for max_age_s seconds (SIGNIN_MAX_AGE_S by default):
 
     with lease_token, the state of the sign-in that lease was for, which ends the lease;
@@ -1310,9 +1911,15 @@ def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_
     one and nobody is signing in. The id tells a state from one of the same version an admin deleted:
     a name added again starts over at version 0.
 
-    Returns {"saved": True, "version"}, {"saved": False, "reason": "newer" or "signing-in", "version"}, or
-    None for an unknown name. Raises InvalidSignin (SigninTooLarge), LeaseLost, mfa.SecretsKeyMissing and
-    SigninsUnavailable."""
+    With access (who the check acts as), a sign-in it may not use raises NotShared, and only a steward's
+    check saves a newer state: anyone else's is answered with the reason "shared", and the owner's state
+    stays as it was. A check that held a lease as a steward and is no longer one (its token's owner lost
+    “Every saved sign-in”, say) saves nothing either: its lease ends, and it gets LeaseLost, or NotShared when it
+    may no longer use the sign-in at all.
+
+    Returns {"saved": True, "version"}, {"saved": False, "reason": "newer", "signing-in" or "shared",
+    "version"}, or None for an unknown name. Raises InvalidSignin (SigninTooLarge), LeaseLost,
+    mfa.SecretsKeyMissing and SigninsUnavailable."""
     name = _signin_name(name)
     if lease_token is not None and (not isinstance(lease_token, str) or not lease_token):
         raise InvalidSignin("leaseToken is the token the checkout answered.")
@@ -1329,6 +1936,7 @@ def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_
         raise InvalidSignin("maxAgeS is a number of seconds from {} to {} ({} days).".format(low, high, high // 86400))
     packed, domains, cookies, origins = _pack_state(state)
     _need_signin_key()
+    ended = None  # what a check that held the lease and may no longer save with it is told, once its lease ends
     try:
         with _session() as cur:
             lock = _lock(cur)
@@ -1339,37 +1947,61 @@ def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_
             row = cur.fetchone()
             if row is None:
                 return None
+            steward, refused = True, None  # refused: why a check that may not use it at all is turned away
+            if access is not None:
+                _, _, _, steward, usable = _item_access(cur, "signin", row[0], access)
+                if not usable:
+                    refused = _not_shared("saved sign-in", name)
             row_id, name, version, lease_hash, lease_until = row
             leased = _lease_live(lease_hash, _parse_time(lease_until), now)
-            if lease_token is not None:
-                if not leased or not _holds(lease_hash, lease_token):
+            held = lease_token is not None and leased and _holds(lease_hash, lease_token)
+            if held and (refused is not None or not steward):
+                # Only a steward's check is given a lease, and only a steward's saves with it: one that has stopped
+                # being a steward since (it lost “Every saved sign-in”, say, and maybe the share that reached it
+                # too) ends it here, so that the next steward's check signs in at once rather than wait for it.
+                # Committed, then raised.
+                cur.execute(_sql("UPDATE savedSignins SET leaseHash = NULL, leaseUntil = NULL, leaseHolder = NULL "
+                                 "WHERE id = ?"), (row_id,))
+                ended = refused or LeaseLost("Checks using this client token may no longer sign in fresh for {!r}, so "
+                                             "its lease ended. Nothing was saved.".format(name))
+            elif refused is not None:
+                raise refused
+            elif lease_token is not None:
+                if not held:
                     raise LeaseLost("The lease for {!r} isn't yours any more: it ran out, or an admin forgot the sign-in. "
                                     "Nothing was saved.".format(name))
                 counter = "signInCount"
+            elif not steward:
+                return {"saved": False, "reason": "shared", "version": version}
             elif base_version != version or signin_id != row_id:
                 return {"saved": False, "reason": "newer", "version": version}
             elif leased:
                 return {"saved": False, "reason": "signing-in", "version": version}
             else:
                 counter = "refreshCount"
-            expires = now + datetime.timedelta(seconds=int(max_age_s))
-            cur.execute(_sql("""
-                UPDATE savedSignins SET stateCipher = ?, version = version + 1, domains = ?, cookieCount = ?,
-                       originCount = ?, savedAt = ?, savedBy = ?, expiresAt = ?, {counter} = {counter} + 1,
-                       leaseHash = NULL, leaseUntil = NULL, leaseHolder = NULL
-                WHERE id = ?
-            """.format(counter=counter)), (mfa.seal(packed, name, "signin"), domains, cookies, origins, _db_time(now),
-                                           saved_by, _db_time(expires), row_id))
+            if ended is None:
+                expires = now + datetime.timedelta(seconds=int(max_age_s))
+                cur.execute(_sql("""
+                    UPDATE savedSignins SET stateCipher = ?, version = version + 1, domains = ?, cookieCount = ?,
+                           originCount = ?, savedAt = ?, savedBy = ?, expiresAt = ?, {counter} = {counter} + 1,
+                           leaseHash = NULL, leaseUntil = NULL, leaseHolder = NULL
+                    WHERE id = ?
+                """.format(counter=counter)), (mfa.seal(packed, name, "signin"), domains, cookies, origins,
+                                               _db_time(now), saved_by, _db_time(expires), row_id))
     except _MissingTables as e:
         raise SigninsUnavailable(_NO_SIGNIN_TABLE) from e
+    if ended is not None:
+        raise ended
     if lease_token is not None:
         log.info("saved sign-in %r: signed in by %s (version %d)", name, saved_by, version + 1)
     return {"saved": True, "version": version + 1}
 
 
-def release_signin(name, lease_token):
+def release_signin(name, lease_token, access=None):
     """End a lease without saving (the sign-in failed), so the next check signs in at once. Returns whether the
-    lease was the token's, or None for an unknown name."""
+    lease was the token's, or None for an unknown name. With access (who the check acts as), a sign-in it may
+    not use raises NotShared, unless the token holds its lease: a check that may no longer use it still ends
+    the lease it was given, and ending it is all that token can do."""
     name = _signin_name(name)
     if not isinstance(lease_token, str) or not lease_token:
         raise InvalidSignin("leaseToken is the token the checkout answered.")
@@ -1381,6 +2013,8 @@ def release_signin(name, lease_token):
             if row is None:
                 return None
             if not _holds(row[1], lease_token):
+                if access is not None and not _item_access(cur, "signin", row[0], access)[4]:
+                    raise _not_shared("saved sign-in", name)
                 return False
             cur.execute(_sql("UPDATE savedSignins SET leaseHash = NULL, leaseUntil = NULL, leaseHolder = NULL WHERE id = ?"),
                         (row[0],))
@@ -1389,34 +2023,54 @@ def release_signin(name, lease_token):
         raise SigninsUnavailable(_NO_SIGNIN_TABLE) from e
 
 
-def forget_signin(signin_id):
+def forget_signin(signin_id, access=None, actor=None):
     """Drop the saved state and any lease, so the next check signs in again. The version goes up, so a check
-    still using the old state can't save it back. Returns the sign-in as list_signins shows it, or None."""
+    still using the old state can't save it back. Its owner and its shares stay. Returns the sign-in as
+    list_signins shows it, or None (with access, also for one the viewer may not see); NotPermitted when the
+    viewer may see it but not forget it. actor is who forgot it, for the audit log."""
     if not 1 <= signin_id <= _MAX_TOKEN_ID:
         return None
     try:
         with _session() as cur:
+            lock = _lock(cur)
+            cur.execute(_sql("SELECT name FROM savedSignins WHERE id = ?" + lock), (signin_id,))
+            found = cur.fetchone()
+            if found is None or not _managed(cur, "signin", signin_id, access, "forget"):
+                return None
             # expiresAt goes too: nothing is left to expire, and the page tells a forgotten state from an expired
             # one by it.
             cur.execute(_sql("UPDATE savedSignins SET stateCipher = NULL, version = version + 1, expiresAt = NULL, "
                              "leaseHash = NULL, leaseUntil = NULL, leaseHolder = NULL WHERE id = ?"), (signin_id,))
+            _audit(cur, actor, "signin.forgotten", "signin", signin_id, found[0])
             cur.execute(_sql("SELECT {}, {} FROM savedSignins WHERE id = ?".format(_now_sql(), _SIGNIN_COLUMNS)),
                         (signin_id,))
             row = cur.fetchone()
+            signin = _signin(row[1:], _parse_time(row[0]))
+            if access is not None:
+                _ownership(cur, "signin", [signin], access)
+            return signin
     except _MissingTables:
         return None
-    return _signin(row[1:], _parse_time(row[0])) if row else None
 
 
-def delete_signin(signin_id):
-    """Delete a sign-in and its state. Returns False if there is no such sign-in. A check that checks out the
-    name again adds a new row, starting over at version 0 under a new id (ids aren't reused), so a check
-    still holding the old state can't save it back over the new one's version: save_signin compares both."""
+def delete_signin(signin_id, access=None, actor=None):
+    """Delete a sign-in, its state, and its owner and share rows. Returns False if there is no such sign-in (with
+    access, also for one the viewer may not see); NotPermitted when the viewer may see it but not delete it.
+    A check that checks out the name again adds a new row, starting over at version 0 under a new id (ids
+    aren't reused), so a check still holding the old state can't save it back over the new one's version:
+    save_signin compares both. actor is who deleted it, for the audit log."""
     if not 1 <= signin_id <= _MAX_TOKEN_ID:
         return False
     try:
         with _session() as cur:
+            lock = _lock(cur)
+            cur.execute(_sql("SELECT name FROM savedSignins WHERE id = ?" + lock), (signin_id,))
+            found = cur.fetchone()
+            if found is None or not _managed(cur, "signin", signin_id, access, "delete"):
+                return False
             cur.execute(_sql("DELETE FROM savedSignins WHERE id = ?"), (signin_id,))
-            return bool(cur.rowcount)
+            _drop_item_rows(cur, "signin", signin_id)
+            _audit(cur, actor, "signin.deleted", "signin", signin_id, found[0])
+            return True
     except _MissingTables:
         return False

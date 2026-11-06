@@ -90,16 +90,17 @@ services:
     command: python3 /app/main.py --fil poc_long_session.py --fol /app/poc/ -i ${POC_INTERVAL_S:-600}
 
   # Sign-in with a password and an authenticator (TOTP) code. Every code comes from the Grid UI's MFA
-  # secret POC_TOTP_SECRET_NAME (default poc-intranet), asked for with GATEWAY_CLIENT_TOKEN. The fake site
-  # checks codes against its own copy of the enrolment, POC_TOTP_SEED (base32), which must be the seed
-  # stored in that secret; the check fails while it is unset. The password is made up per run unless
-  # POC_TOTP_PASSWORD is set.
+  # secret POC_TOTP_SECRET_NAME (default poc-intranet), asked for with GRID_MFA_TOKEN, else
+  # GATEWAY_CLIENT_TOKEN. The fake site checks codes against its own copy of the enrolment, POC_TOTP_SEED
+  # (base32), which must be the seed stored in that secret; the check fails while it is unset. The password
+  # is made up per run unless POC_TOTP_PASSWORD is set.
   poc_totp_login:
     <<: *poc-check
     container_name: poc_totp_login
     environment:
       <<: *poc-env
       GRID_UI_URL: ${GRID_UI_URL:-http://grid_ui:4444}
+      GRID_MFA_TOKEN: ${GRID_MFA_TOKEN:-}
       POC_TOTP_SECRET_NAME: ${POC_TOTP_SECRET_NAME:-poc-intranet}
       POC_TOTP_SEED: ${POC_TOTP_SEED:-}
       POC_TOTP_PASSWORD: ${POC_TOTP_PASSWORD:-}
@@ -117,12 +118,14 @@ services:
   # poc-idp-session). The fake IdP checks codes against POC_TOTP_SEED (base32), which must be that secret's
   # seed; the check fails while it is unset. No other run may use the same POC_SIGNIN_NAME while this one
   # runs: the rounds of two runs at once break each other's (full/poc/run_poc.sh uses poc-idp-session-manual).
+  # It asks the Grid UI with GRID_MFA_TOKEN, else GATEWAY_CLIENT_TOKEN.
   poc_signin_reuse:
     <<: *poc-check
     container_name: poc_signin_reuse
     environment:
       <<: *poc-env
       GRID_UI_URL: ${GRID_UI_URL:-http://grid_ui:4444}
+      GRID_MFA_TOKEN: ${GRID_MFA_TOKEN:-}
       POC_SIGNIN_SECRET_NAME: ${POC_SIGNIN_SECRET_NAME:-poc-idp}
       POC_SIGNIN_NAME: ${POC_SIGNIN_NAME:-poc-idp-session}
       POC_TOTP_SEED: ${POC_TOTP_SEED:-}

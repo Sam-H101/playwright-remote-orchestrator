@@ -237,6 +237,10 @@ def test_token_routes_check_the_admin_token(db):
     body = r.get_json()
     assert body["ready"] is True and [t["name"] for t in body["tokens"]] == ["t"]
     assert body["bootstrap"] == {"agent": False, "client": False}
+    # An agent token made before there were owners: nobody's, and checks don't use it to act as anyone.
+    assert (body["tokens"][0]["owner"], body["tokens"][0]["actsAs"]) == (None, None)
+    assert body["kindCounts"] == {"agent": {"rows": 1, "active": 1, "revoked": 0},
+                                  "client": {"rows": 0, "active": 0, "revoked": 0}}
 
 
 def test_create_revoke_and_delete_through_the_api(db, monkeypatch):

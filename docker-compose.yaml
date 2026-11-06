@@ -125,20 +125,51 @@ services:
       <<: [*db-env, *slot-env]
       ORCHESTRATOR_CONFIG: /app/src/database.yaml
       GATEWAY_URL: ${GATEWAY_URL:-ws://hub:4500}
-      # Optional: the rest of the UI works without it, and the Access page stays locked until it is set.
+      # Needed for management actions when the UI is exposed, and for the Access, MFA and Admin pages, unless
+      # single sign-on is set up; with single sign-on, a break-glass sign-in with every permission. Optional:
+      # without it (or single sign-on) the rest of the UI works, and those pages stay locked.
       GRID_ADMIN_TOKEN: ${GRID_ADMIN_TOKEN:-}
       GRID_UI_ALLOWED_HOSTS: ${GRID_UI_ALLOWED_HOSTS:-}
+      # Single sign-on for people, through your OpenID Connect identity provider (see the README's Users and
+      # roles). All optional: left empty, the UI signs in with GRID_ADMIN_TOKEN alone, as before. Setting
+      # GRID_OIDC_ISSUER turns it on; it then needs the client id and secret and GRID_UI_PUBLIC_URL too.
+      GRID_OIDC_ISSUER: ${GRID_OIDC_ISSUER:-}
+      GRID_OIDC_CLIENT_ID: ${GRID_OIDC_CLIENT_ID:-}
+      GRID_OIDC_CLIENT_SECRET: ${GRID_OIDC_CLIENT_SECRET:-}
+      GRID_UI_PUBLIC_URL: ${GRID_UI_PUBLIC_URL:-}
+      GRID_OIDC_ADMINS: ${GRID_OIDC_ADMINS:-}
+      GRID_OIDC_LABEL: ${GRID_OIDC_LABEL:-}
+      GRID_OIDC_SCOPES: ${GRID_OIDC_SCOPES:-}
+      GRID_OIDC_GROUPS_CLAIM: ${GRID_OIDC_GROUPS_CLAIM:-}
+      GRID_OIDC_CLIENT_AUTH: ${GRID_OIDC_CLIENT_AUTH:-}
+      GRID_OIDC_END_SESSION: ${GRID_OIDC_END_SESSION:-}
+      GRID_OIDC_CA_FILE: ${GRID_OIDC_CA_FILE:-}
+      GRID_OIDC_ALLOW_HTTP: ${GRID_OIDC_ALLOW_HTTP:-}
+      GRID_OIDC_CLOCK_SKEW_S: ${GRID_OIDC_CLOCK_SKEW_S:-}
+      GRID_SESSION_HOURS: ${GRID_SESSION_HOURS:-}
+      GRID_SESSION_IDLE_MINUTES: ${GRID_SESSION_IDLE_MINUTES:-}
+      # Whether the overview, activity and sessions need sign-in (empty: they do with single sign-on), how
+      # many reverse proxies are in front of the UI, and how many days its audit log keeps.
+      GRID_UI_READS: ${GRID_UI_READS:-}
+      GRID_UI_PROXY_HOPS: ${GRID_UI_PROXY_HOPS:-}
+      GRID_AUDIT_DAYS: ${GRID_AUDIT_DAYS:-}
       # Encrypts the seeds on the MFA page and the sign-ins checks save there. Until it is set the page
       # takes no seeds and gives no codes, and checks can't save or reuse sign-ins. Seeds and sign-ins stored
       # under one key don't decrypt under another.
       GRID_SECRETS_KEY: ${GRID_SECRETS_KEY:-}
       # The agent token only tells the Access page that the hub has one ("set"), never its value. The
-      # client token's value lets checks that connect with it also ask for MFA codes and use saved sign-ins
-      # (the UI can make client tokens anyway, so knowing this one gives it no access it lacked).
+      # client token's value lets checks that connect with it also ask for MFA codes and use saved sign-ins,
+      # acting as an admin: they get every MFA secret, and the sign-ins that are Admins' or shared with Admin
+      # (while such a share still reaches admins: see Sharing in the README).
+      # Once people use client tokens of their own, it can be left out here, after giving the checks in
+      # docker-compose.poc.yaml that ask the UI a GRID_MFA_TOKEN of their own (in .env). The Access page then
+      # asks for "Every access token" to make the grid's first client token or delete its last.
       GATEWAY_AGENT_TOKEN: ${GATEWAY_AGENT_TOKEN:+set}
       GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:-}
     volumes:
       - ./src/database.yaml:/app/src/database.yaml:ro
+      # A provider behind a private CA:
+      # - ./certs/idp-ca.pem:/app/certs/idp-ca.pem:ro   # then GRID_OIDC_CA_FILE=/app/certs/idp-ca.pem
 
 
 networks:

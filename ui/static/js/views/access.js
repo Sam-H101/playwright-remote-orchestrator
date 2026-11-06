@@ -1,11 +1,14 @@
 // Access: the hub's managed agent and client tokens (a gateway feature, separate from admin
 // sign-in), plus "Add a host", which makes a bound agent token and its one install command.
+// With single sign-on, each token has an owner: a client token's checks act as them. Tokens made
+// before that, or with the admin token, act as an admin until someone gives each to a person.
 import { app } from "../app.js";
 import * as api from "../api.js";
 import * as auth from "../auth.js";
 import { html, icon, patchList, setHTML, setText } from "../html.js";
 import { agentCommand, ago, connectUrl, fullDate, inTime, parseTime, plural, shortDate } from "../format.js";
 import { confirm, dismissible } from "../ui/dialog.js";
+import { createPicker, directory } from "../ui/picker.js";
 import { copy, toast } from "../ui/toast.js";
 import { hubField, wireHubFields } from "../ui/hub.js";
 
@@ -13,9 +16,15 @@ const TOKEN_TONE = { active: "ok", expired: "warn", revoked: "off" };
 const TOKEN_RANK = { active: 0, expired: 1, revoked: 2 };
 const KIND_LABEL = { agent: "Agent", client: "Client" };
 const TOKEN_ENV = { agent: "GATEWAY_AGENT_TOKEN", client: "GATEWAY_CLIENT_TOKEN" };
+// Any one of these shows the page: everyone's tokens, their own client tokens, or every agent token.
+const TOKEN_PERMISSIONS = ["tokens.own", "tokens.agents", "tokens.all"];
 const NODE_NAME = /^[a-z0-9._-]{1,128}$/;
 const PLATFORMS = [["windows", "Windows", "i-windows"], ["linux", "Linux", "i-linux"], ["macos", "macOS", "i-mac"], ["docker", "Docker", "i-docker"]];
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const ACTS_AS_ADMIN = "Made before single sign-on, or with the admin token. Give it to the person whose checks use it.";
+const LAST_CLIENT_ROW = "It's the last client token on record: deleting it lets checks without a token back in after the hub's next restart. " +
+  "Someone whose roles include “Every access token” can delete it.";
+const FIRST_CLIENT = "The grid's first client token makes the hub turn away checks without one, so someone whose roles include “Every access token” makes it.";
 
 export function createAccess(section) {
   setHTML(section, html`
@@ -31,6 +40,7 @@ export function createAccess(section) {
       </div>
     </header>
     <div class="banner" id="access-banner" role="status" hidden></div>
+    <div class="banner" id="acts-banner" role="status" hidden></div>
     <div id="reveal"></div>
     <section class="panel add-host" id="add-host" aria-labelledby="ah-title" hidden></section>
     <div class="toolbar" id="token-toolbar" hidden>
@@ -53,7 +63,7 @@ export function createAccess(section) {
       <table class="table tokens">
         <caption class="sr-only">Managed access tokens</caption>
         <thead><tr>
-          <th scope="col">Token</th><th scope="col">Kind</th><th scope="col">Bound to</th><th scope="col">Used by</th>
+          <th scope="col">Token</th><th scope="col">Kind</th><th scope="col" id="token-owner-col" hidden>Owner</th><th scope="col">Bound to</th><th scope="col">Used by</th>
           <th scope="col">Created</th><th scope="col">Last used</th><th scope="col">Expires</th><th scope="col">Status</th>
           <th scope="col"><span class="sr-only">Actions</span></th>
         </tr></thead>
@@ -66,7 +76,7 @@ export function createAccess(section) {
   const $ = (sel) => section.querySelector(sel);
   const dlg = document.getElementById("new-token-dialog");
   dismissible(dlg);
-  // ok, signedout, unconfigured, error, loading
+  // ok, signedout, unconfigured, forbidden, error, loading
   const access = { state: "loading", data: null, sig: null, error: null, kind: "all", status: "all", reveal: null, loading: false, loadedAt: 0, note: "", refused: false };
   const host = { platform: "windows", pending: null, done: null, open: false, confirmDup: null };
   let visible = false;
@@ -77,6 +87,8 @@ export function createAccess(section) {
     if (!s.known) { access.state = "loading"; return render(); }
     if (!s.adminConfigured) { access.state = "unconfigured"; access.data = access.sig = null; return render(); }
     if (!s.signedIn) { access.state = "signedout"; access.data = access.sig = null; return render(); }
+    // Roles without any token permission: asking would only be refused.
+    if (!TOKEN_PERMISSIONS.some((p) => auth.can(p))) { access.state = "forbidden"; access.data = access.sig = null; return render(); }
     if (access.loading || (!force && Date.now() - access.loadedAt < 4000)) return;
     access.loading = true;
     const before = access.state + "|" + access.sig + "|" + access.error;
@@ -90,6 +102,7 @@ export function createAccess(section) {
     } catch (err) {
       if (err.body && err.body.admin_token_unset) { access.state = "unconfigured"; access.data = access.sig = null; }
       else if (err.body && err.body.token_required) { access.state = "signedout"; access.refused = true; access.data = access.sig = null; }
+      else if (err.body && err.body.forbidden) { access.state = "forbidden"; access.data = access.sig = null; }
       else { access.error = err.message; if (!access.data) access.state = "error"; }
     } finally {
       access.loading = false;
@@ -114,10 +127,18 @@ export function createAccess(section) {
             <div class="snippet"><code class="mono">docker compose up -d grid_ui</code>
             <button type="button" class="icon-btn tiny" data-copy="docker compose up -d grid_ui" data-copy-label="the command" aria-label="Copy the command">${icon("i-copy")}</button></div></li>
         </ol></div>`;
-      case "signedout": return html`<div class="empty calm">${icon("i-lock", "empty-mark")}
-        <h2>${access.refused ? "Sign in again to manage access tokens" : "Sign in to manage access tokens"}</h2>
-        <p>Only admins can see and change the hub's agent and client tokens. Everything else on this page works without signing in.</p>
-        <button type="button" class="btn primary" data-signin>Sign in</button></div>`;
+      case "signedout": {
+        const s = auth.state();
+        return html`<div class="empty calm">${icon("i-lock", "empty-mark")}
+          <h2>${access.refused ? "Sign in again to manage access tokens" : "Sign in to manage access tokens"}</h2>
+          <p>${s.sso ? "Only people whose roles include access tokens" : "Only admins"} can see and change the hub's agent and client tokens.${s.readsOpen
+            ? " Everything else on this page works without signing in." : ""}</p>
+          <button type="button" class="btn primary" data-signin>Sign in</button></div>`;
+      }
+      case "forbidden": return html`<div class="empty calm">${icon("i-lock", "empty-mark")}
+        <h2>Your roles don't include access tokens</h2>
+        <p>Ask an admin for a role with “Make client tokens” or “Add hosts”.</p>
+        <button type="button" class="btn" data-your-access>Your access</button></div>`;
       case "error": return html`<div class="empty">${icon("i-alert", "empty-mark")}<h2>Can't load the access tokens</h2><p>${access.error}</p>
         <button type="button" class="btn" data-reload-tokens>Try again</button></div>`;
     }
@@ -126,6 +147,12 @@ export function createAccess(section) {
       return html`<div class="empty">${icon("i-key", "empty-mark")}<h2>Access tokens aren't set up in this database yet</h2>
         <p>It has no accessTokens table. The gateway hub creates it when it starts, and so does the Grid UI on MySQL when its database
           user may create tables. Until then the hub relies on its env tokens.</p></div>`;
+    }
+    // Tokens this person may not see are still there, and the hub asks for them.
+    if (kindCount(d, "agent").rows || kindCount(d, "client").rows) {
+      return html`<div class="empty">${icon("i-key", "empty-mark")}<h2>No access tokens of yours yet</h2>
+        <p>Checks that use a client token of yours act as you: they get the MFA secrets and saved sign-ins you can use.</p>
+        <button type="button" class="btn primary" data-new-token>${icon("i-plus")}New token</button></div>`;
     }
     return html`<div class="empty">${icon("i-key", "empty-mark")}<h2>No access tokens yet</h2>
       <p>Until you create one, the hub relies on its env tokens (GATEWAY_AGENT_TOKEN and GATEWAY_CLIENT_TOKEN).
@@ -152,14 +179,28 @@ export function createAccess(section) {
     })}${t.nodes.length > 2 ? html`<span class="more" title="${t.nodes.slice(2).join(", ")}">+${t.nodes.length - 2} more</span>` : ""}</div>`;
   }
 
-  function tokenRow(t, now) {
+  // Who made it, and so who a client token's checks act as. One nobody owns acts as an admin, and whoever
+  // may see every token gives it to the person whose checks use it.
+  function ownerCell(t) {
+    const what = t.owner ? html`<span>${t.owner.name}</span>${t.owner.disabled ? html`<span class="tag">disabled</span>` : ""}`
+      : t.actsAs === "admin" ? html`<span class="tag note" title="${ACTS_AS_ADMIN}">Acts as an admin</span>${t.status === "active" && auth.can("tokens.all")
+        ? html`<button type="button" class="btn small" data-assign-token="${t.id}" data-fk="assign-${t.id}" aria-label="Give ${t.name} to someone">Give to…</button>` : ""}`
+        : html`<span class="dim">Admins</span>`;
+    return html`<td class="cell-owner" data-label="Owner"><span class="tok-owner">${what}</span></td>`;
+  }
+
+  function tokenRow(t, now, owners) {
     const created = parseTime(t.createdAt), used = parseTime(t.lastUsedAt);
+    // The last client row keeps the hub asking for client tokens: deleting it is a grid-wide switch.
+    const switches = t.kind === "client" && !auth.can("tokens.all") && lastOfKind(t, false);
     const action = t.status === "active"
       ? html`<button type="button" class="btn ghost small destructive" data-revoke="${t.id}" data-fk="revoke-${t.id}">Revoke</button>`
-      : html`<button type="button" class="btn ghost small destructive" data-delete-token="${t.id}" data-fk="delete-${t.id}">Delete</button>`;
+      : html`<button type="button" class="btn ghost small destructive" data-delete-token="${t.id}" data-fk="delete-${t.id}"${switches
+        ? html` disabled title="${LAST_CLIENT_ROW}"` : ""}>Delete</button>`;
     return html`<tr data-key="${t.id}" data-token="${t.id}" data-status="${t.status}" data-jk tabindex="-1">
       <td class="cell-token"><span class="tok-name">${t.name}</span><code class="tok-prefix mono" title="The token starts with these characters">${t.prefix}…</code></td>
       <td class="cell-kind" data-label="Kind"><span class="kind k-${t.kind}">${KIND_LABEL[t.kind] || t.kind}</span></td>
+      ${owners ? ownerCell(t) : ""}
       <td class="cell-bound${t.kind !== "agent" ? " na" : ""}" data-label="Bound to">${t.kind !== "agent" ? html`<span class="dim">–</span>`
         : t.nodeName ? html`<code class="mono bound">${t.nodeName}</code>` : html`<span class="dim">Any node</span>`}</td>
       <td class="cell-used${t.kind !== "agent" ? " na" : ""}" data-label="Used by">${nodeRefs(t)}</td>
@@ -169,6 +210,10 @@ export function createAccess(section) {
       <td class="cell-status"><span class="pill p-${TOKEN_TONE[t.status] || "off"}"><span class="glyph g-${TOKEN_TONE[t.status] || "off"}" aria-hidden="true"></span>${cap(t.status)}</span></td>
       <td class="cell-actions">${action}</td></tr>`;
   }
+
+  // How many tokens of a kind the grid has, rows (revoked and expired too), active and revoked: whoever may
+  // see only some of them still gets the counts of all.
+  const kindCount = (d, kind) => (d.kindCounts && d.kindCounts[kind]) || { rows: 0, active: 0, revoked: 0 };
 
   const shownBy = (t, q, kind, status) => (kind === "all" || t.kind === kind) && (status === "all" || t.status === status) &&
     (!q || [t.name, t.prefix, t.nodeName, t.kind].concat(t.nodes).join(" ").toLowerCase().indexOf(q) !== -1);
@@ -197,17 +242,34 @@ export function createAccess(section) {
     empty.hidden = rows.length > 0;
     setHTML(empty, html`<h2>No tokens match</h2><p>${q ? "Nothing matches “" + q + "” with these filters." : "No tokens have this kind and status."}</p>
       <button class="btn small" type="button" data-clear-token-filter>Show all tokens</button>`);
-    patchList($("#token-rows"), rows, (t) => t.id, (t) => tokenRow(t, now));
+    // Who owns each token matters with single sign-on, or once any token has an owner.
+    const owners = auth.state().sso || d.tokens.some((t) => t.owner);
+    $("#token-owner-col").hidden = !owners;
+    patchList($("#token-rows"), rows, (t) => t.id, (t) => tokenRow(t, now, owners));
+  }
+
+  // Client tokens nobody owns act as an admin: their checks get every MFA secret, and the saved sign-ins that are
+  // Admins' or shared with Admin, while such a share still reaches admins (its owner keeps the permissions they had
+  // when it was shared). Whoever may see every token is asked to give each to the person whose checks use it.
+  function actsMarkup(d) {
+    const n = d.tokens.filter((t) => t.actsAs === "admin" && t.status === "active").length, env = !!(d.bootstrap && d.bootstrap.client);
+    if (!n && !env) return null;
+    return html`<div>${n ? html`<strong>${n === 1 ? "1 client token acts" : n + " client tokens act"} as an admin:</strong> ${n === 1 ? "it was" : "they were"} made
+      before single sign-on or with the admin token, so checks using ${n === 1 ? "it get" : "them get"} every MFA secret, and the saved sign-ins
+      that are Admins' or shared with Admin. Give
+      ${n === 1 ? "it" : "each"} to the person whose checks use it.` : ""}${env ? html`${n ? " " : ""}GATEWAY_CLIENT_TOKEN ${n ? "also " : ""}acts as an admin.
+      Once people use client tokens of their own, and the checks that ask the Grid UI for codes and sign-ins send one as GRID_MFA_TOKEN,
+      take it out of the Grid UI's environment.` : ""}</div>`;
   }
 
   function render() {
     const d = access.state === "ok" ? access.data : null, list = !!(d && d.ready && d.tokens.length);
     $("#new-token-btn").hidden = !list;
-    $("#add-host-btn").hidden = !(d && d.ready);
+    $("#add-host-btn").hidden = !(d && d.ready && auth.can("tokens.agents"));
     $("#add-host-btn").setAttribute("aria-expanded", String(host.open));
     $("#token-toolbar").hidden = !list;
     $("#token-panel").hidden = !list;
-    $("#add-host").hidden = !(d && d.ready && host.open);
+    $("#add-host").hidden = $("#add-host-btn").hidden || !host.open;
     setHTML($("#access-state"), list ? html`` : stateMarkup());
     if (list) renderTokens(d);
     if (d && d.ready) renderAddHost();
@@ -216,6 +278,9 @@ export function createAccess(section) {
     if (!banner.hidden) {
       setHTML(banner, html`<div><strong>Can't refresh the access tokens.</strong> Showing the last list. Retrying.<code class="mono">${access.error}</code></div>`);
     }
+    const acts = d && d.ready && auth.can("tokens.all") && auth.state().sso ? actsMarkup(d) : null;
+    $("#acts-banner").hidden = !acts;
+    setHTML($("#acts-banner"), acts || html``);
     if (app.tick) app.tick();
   }
 
@@ -405,10 +470,11 @@ export function createAccess(section) {
   // The hub keeps asking for a token once a managed one of that kind exists, revoked or not. Revoking the
   // last usable one therefore locks out everything without the env token (the UI only knows about that
   // when it was given the same variable), and deleting the last row lets tokenless ones back in after the
-  // next hub restart. `usable` limits the count to tokens that still work.
+  // next hub restart. `usable` limits the count to tokens that still work. The counts are the server's,
+  // of every token: the list may hold only this person's own.
   function lastOfKind(t, usable) {
-    const d = access.data;
-    return !(d.bootstrap && d.bootstrap[t.kind]) && !d.tokens.some((o) => o.id !== t.id && o.kind === t.kind && (!usable || o.status === "active"));
+    const d = access.data, n = kindCount(d, t.kind);
+    return !(d.bootstrap && d.bootstrap[t.kind]) && (usable ? n.active - (t.status === "active" ? 1 : 0) : n.rows - 1) === 0;
   }
 
   async function tokenAction(url, done, origin) {
@@ -472,6 +538,59 @@ export function createAccess(section) {
     }).then((ok) => { if (ok) return tokenAction("api/tokens/" + encodeURIComponent(id) + "/delete", "Deleted “" + t.name + "”.", origin); });
   }
 
+  // ---- giving a token to someone ------------------------------------------------------
+  // Only ever a client token nobody owns, which acts as an admin: given to a person, its checks act as them,
+  // and it never changes hands again.
+  function openGive(id) {
+    const t = findToken(id), box = document.getElementById("token-owner-dialog");
+    if (!t || box.open) return;
+    box.__html = null; // always fresh elements: the listeners below belong to this one dialog
+    setHTML(box, html`<div class="give-token">
+      <h2 id="token-owner-title">Give “${t.name}” to someone</h2>
+      <p class="sheet-sub">Checks using it then act as them: they get the MFA secrets and saved sign-ins that person can use, rather than
+        every one. Once given, it stays theirs.</p>
+      <div class="field">
+        <label for="give-token-input">Person</label>
+        <div id="give-token-pick"></div>
+        <p class="hint" id="give-token-hint">Type 2 letters or more of their name or email.</p>
+      </div>
+      <p class="form-error" id="give-token-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button type="button" class="btn ghost" data-dismiss>Cancel</button></div>
+    </div>`);
+    const error = box.querySelector("#give-token-error");
+    const picker = createPicker(box.querySelector("#give-token-pick"), {
+      id: "give-token", placeholder: "Find a person", describedBy: "give-token-hint",
+      async options(q) {
+        const found = await directory(q);
+        return [{ label: "People", options: found.users.map((u) => ({ key: u.id, label: u.name, meta: u.email || "", user: u })) }];
+      },
+      empty: (q) => (q.length < 2 ? "Type 2 letters or more to find people." : "No one matches “" + q + "”."),
+      async choose(o) {
+        error.hidden = true;
+        try {
+          const res = await api.post("api/tokens/" + encodeURIComponent(t.id) + "/owner", { userId: o.user.id });
+          if (res === null) return false; // sign-in dismissed: the dialog stays as it was
+          box.close();
+          toast("“" + t.name + "” is " + o.user.name + "'s now: checks using it act as them.");
+          return true;
+        } catch (err) {
+          error.textContent = err.message;
+          error.hidden = false;
+          return false;
+        }
+      },
+    });
+    box.querySelector("[data-dismiss]").addEventListener("click", () => box.close());
+    // Focus goes back to the row: to Give to… if it's still there, else to the row itself.
+    box.addEventListener("close", async () => {
+      await load(true);
+      const row = section.querySelector('#token-rows [data-token="' + t.id + '"]');
+      if (row) (row.querySelector("[data-assign-token]") || row).focus();
+    }, { once: true });
+    box.showModal();
+    picker.focus();
+  }
+
   // ---- create dialog --------------------------------------------------------------
   const kindOf = () => { const c = dlg.querySelector('input[name="kind"]:checked'); return c ? c.value : "agent"; };
   function formError(text) {
@@ -479,12 +598,40 @@ export function createAccess(section) {
     el.textContent = text || "";
     el.hidden = !text;
   }
+  // Why this person can't make a kind of token, or "" when they can. The grid's first client token makes the
+  // hub turn away checks without one (any client row does), so it's for whoever may see every token.
+  function barred(kind) {
+    const d = access.data;
+    if (kind === "agent") return auth.can("tokens.agents") ? "" : "Making agent tokens needs “Add hosts”.";
+    if (!auth.can("tokens.own")) return "Making client tokens needs “Make client tokens”.";
+    const first = d && d.ready && kindCount(d, "client").rows === 0 && !(d.bootstrap && d.bootstrap.client);
+    return first && !auth.can("tokens.all") ? FIRST_CLIENT : "";
+  }
   function syncCreate() {
-    const kind = kindOf(), d = access.data;
+    const d = access.data;
+    const why = ["agent", "client"].map((k) => {
+      const input = dlg.querySelector('input[name="kind"][value="' + k + '"]'), text = barred(k);
+      input.disabled = !!text;
+      return text;
+    });
+    // A kind it can't make isn't left chosen: the other one is, if it can make that.
+    const picked = dlg.querySelector('input[name="kind"]:checked');
+    if (picked && picked.disabled) {
+      const other = dlg.querySelector('input[name="kind"]:not(:disabled)');
+      if (other) other.checked = true;
+    }
+    const kind = kindOf(), none = !dlg.querySelector('input[name="kind"]:checked:not(:disabled)');
+    const hint = document.getElementById("nt-kind-hint");
+    hint.hidden = !why.some(Boolean);
+    hint.textContent = why.filter(Boolean).join(" ");
+    document.getElementById("nt-submit").disabled = none;
     document.getElementById("nt-node-field").hidden = kind !== "agent";
     document.getElementById("nt-days-wrap").hidden = document.getElementById("nt-expiry").value !== "custom";
+    // A person's client token acts as them; one made with the admin token, as an admin.
+    document.getElementById("nt-client-note").hidden = !(kind === "client" && auth.state().user);
     // The hub starts asking for a token once one of this kind exists, even without its env token.
-    const first = d && d.ready && !(d.bootstrap && d.bootstrap[kind]) && !d.tokens.some((t) => t.kind === kind && t.status !== "revoked");
+    const n = d && d.ready ? kindCount(d, kind) : null;
+    const first = n && !none && !(d.bootstrap && d.bootstrap[kind]) && n.rows - n.revoked === 0;
     const el = document.getElementById("nt-first");
     el.hidden = !first;
     el.textContent = "This is the first " + kind + " token. From then on the hub turns away " +
@@ -565,6 +712,7 @@ export function createAccess(section) {
     if (e.target.closest("[data-new-token]")) return openCreate();
     if ((el = e.target.closest("[data-revoke]"))) return confirmRevoke(el.dataset.revoke, el);
     if ((el = e.target.closest("[data-delete-token]"))) return confirmDelete(el.dataset.deleteToken, el);
+    if ((el = e.target.closest("[data-assign-token]"))) return openGive(el.dataset.assignToken);
     if (e.target.closest("[data-signin]")) {
       if (await auth.signIn("Sign in to manage access tokens")) load(true);
       return;
@@ -586,7 +734,9 @@ export function createAccess(section) {
   $("#token-kind").addEventListener("click", (e) => { const b = e.target.closest("[data-kind]"); if (b) { access.kind = b.dataset.kind; render(); } });
   $("#token-status").addEventListener("click", (e) => { const b = e.target.closest("[data-status]"); if (b) { access.status = b.dataset.status; render(); } });
 
-  auth.onChange(() => { if (visible) load(true); });
+  // Signed in or out, a role given or taken: the list is asked for again, and what the roles allow (Add a
+  // host, Give to…, the banner) shows at once, whether or not the list turns out to be another.
+  auth.onChange(() => { if (visible) { load(true); render(); } });
 
   return {
     show() { visible = true; load(true); },
@@ -598,6 +748,7 @@ export function createAccess(section) {
       }
       if (visible) load(false);
     },
-    tokens: () => (access.state === "ok" && access.data ? access.data.tokens : []),
+    // For the palette, only while the session may see them: the list stays after signing out until the page shows again.
+    tokens: () => (access.state === "ok" && access.data && auth.state().signedIn && TOKEN_PERMISSIONS.some((p) => auth.can(p)) ? access.data.tokens : []),
   };
 }

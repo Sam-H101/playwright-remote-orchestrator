@@ -40,7 +40,8 @@ def mysql(monkeypatch):
     monkeypatch.setattr(store, "DB_ENGINE", "mysql")
     monkeypatch.setattr(store, "_schema_attempted", False)
     monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
-    sql("DROP TABLE IF EXISTS mfaIssues, mfaSecrets")
+    # The owner and share rows too: ids start over, and old rows would belong to the new secrets.
+    sql("DROP TABLE IF EXISTS mfaIssues, mfaSecrets, itemOwners, itemShares")
 
 
 def ask_from_threads(count, **kwargs):

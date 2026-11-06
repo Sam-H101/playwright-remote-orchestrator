@@ -12,12 +12,14 @@ import { bindActions, forgetNode, resetNode } from "./actions.js";
 import { createInspector } from "./ui/inspector.js";
 import { createPalette } from "./ui/palette.js";
 import { dismissible } from "./ui/dialog.js";
-import { copy, hideTip } from "./ui/toast.js";
+import { copy, hideTip, toast } from "./ui/toast.js";
 import { createOverview, attentionItems, verdict } from "./views/overview.js";
 import { createSessions } from "./views/sessions.js";
 import { createActivity } from "./views/activity.js";
 import { createAccess } from "./views/access.js";
 import { createMfa } from "./views/mfa.js";
+import { createAdmin, TABS as ADMIN_TABS } from "./views/admin.js";
+import { permissionGroups, roleSource } from "./views/admin/common.js";
 
 const $ = (id) => document.getElementById(id);
 const root = document.documentElement;
@@ -33,6 +35,7 @@ const views = {
   sessions: createSessions($("view-sessions")),
   access: createAccess($("view-access")),
   mfa: createMfa($("view-mfa")),
+  admin: createAdmin($("view-admin")),
 };
 const inspector = createInspector({ onClose: () => closeInspector() });
 let route = router.state();
@@ -60,7 +63,9 @@ function showView(view) {
   });
   if (view === "access") views.access.show(); else views.access.hide();
   if (view === "mfa") views.mfa.show(); else views.mfa.hide();
-  document.title = { overview: "Playwright Grid", activity: "Activity · Playwright Grid", sessions: "Sessions · Playwright Grid", access: "Access · Playwright Grid", mfa: "MFA & sign-ins · Playwright Grid" }[view];
+  if (view === "admin") views.admin.show(route.params); else views.admin.hide();
+  document.title = { overview: "Playwright Grid", activity: "Activity · Playwright Grid", sessions: "Sessions · Playwright Grid", access: "Access · Playwright Grid", mfa: "MFA & sign-ins · Playwright Grid",
+    admin: "Admin · Playwright Grid" }[view];
 }
 
 router.onRoute((r) => {
@@ -119,6 +124,10 @@ function freshness() {
     tone = "paused";
     state = "Paused";
     if (age != null) when = duration(age) + " old";
+  } else if (live.refused) {
+    // Not polling: reading the grid needs a sign-in or a role this page doesn't have.
+    tone = "paused";
+    state = live.refused === "forbidden" ? "No access" : "Signed out";
   } else if (age == null) {
     tone = live.error ? "bad" : "wait";
     state = live.error ? "No data" : "Connecting…";
@@ -158,6 +167,9 @@ $("verdict-chip").addEventListener("click", () => {
 
 // ---- account ---------------------------------------------------------------------
 const accountBtn = $("account-btn"), accountMenu = $("account-menu");
+// The Admin page is for people who may see people and roles or read the audit log; on a phone, the
+// account menu is the way there.
+const adminShown = (s) => s.signedIn && (auth.can("users.view") || auth.can("audit.view"));
 function renderAccount() {
   const s = auth.state();
   accountBtn.classList.toggle("signed-in", s.signedIn);
@@ -173,17 +185,29 @@ function renderAccount() {
     setHTML(accountBtn, html`${icon("i-user")}<span class="acct-label">Sign in</span>`);
     accountBtn.setAttribute("aria-haspopup", "dialog");
   }
+  // A long name is cut short on the chip: the whole of it is in the title.
+  if (s.signedIn) accountBtn.title = s.name || "Admin"; else accountBtn.removeAttribute("title");
+  document.querySelector("[data-admin-nav]").hidden = !adminShown(s);
   $("unprotected-btn").hidden = !(s.known && !s.adminConfigured);
   document.body.classList.toggle("signed-in", s.signedIn);
 }
 function openAccountMenu() {
   const s = auth.state();
   const compact = root.dataset.density === "compact";
+  // Someone the identity provider signed in (not the admin token): their roles, what they allow, and
+  // signing out of every browser at once.
+  const person = s.signedIn && !!s.user;
+  const roles = Array.from(new Set(s.roles.map((r) => r.name)));
   setHTML(accountMenu, html`
-    ${s.signedIn ? html`<p class="menu-note" role="none"><span class="acct-dot" aria-hidden="true"></span>${s.summary}</p>`
+    ${s.signedIn ? html`<p class="menu-note" role="none"><span class="acct-dot" aria-hidden="true"></span>${person
+        ? html`<span class="menu-who">${s.summary}<span class="menu-roles">${roles.length ? roles.join(" · ") : "No roles yet: an admin can give you some"}</span></span>`
+        : s.summary}</p>`
       : html`<p class="menu-note" role="none">Admin sign-in isn't configured: anyone who can open this page can manage the grid.</p>`}
+    ${person ? html`<button type="button" role="menuitem" data-menu="access">${icon("i-shield")}Your access</button>` : ""}
+    ${adminShown(s) ? html`<button type="button" role="menuitem" data-menu="admin">${icon("i-users")}Admin</button>` : ""}
     <button type="button" role="menuitemcheckbox" aria-checked="${compact}" data-menu="density">Compact rows</button>
-    ${s.signedIn ? html`<button type="button" role="menuitem" data-menu="signout">${icon("i-logout")}Sign out</button>` : ""}`);
+    ${s.signedIn ? html`<button type="button" role="menuitem" data-menu="signout">${icon("i-logout")}Sign out</button>` : ""}
+    ${person ? html`<button type="button" role="menuitem" data-menu="signout-all">${icon("i-logout")}Sign out everywhere</button>` : ""}`);
   openMenu(accountMenu, accountBtn);
 }
 accountBtn.addEventListener("click", () => {
@@ -197,10 +221,67 @@ accountBtn.addEventListener("click", () => {
 accountMenu.addEventListener("click", (e) => {
   const item = e.target.closest("[data-menu]");
   if (!item) return;
-  if (item.dataset.menu === "signout") { auth.signOut(); closeMenus(); accountBtn.focus(); }
-  if (item.dataset.menu === "density") { toggleDensity(); item.setAttribute("aria-checked", String(root.dataset.density === "compact")); }
+  const menu = item.dataset.menu;
+  if (menu === "signout" || menu === "signout-all") {
+    closeMenus();
+    accountBtn.focus();
+    auth.signOut({ everywhere: menu === "signout-all" }).then(() => {
+      if (menu === "signout-all") toast("Signed out everywhere.");
+    }, (err) => toast(err.message, true));
+  }
+  if (menu === "access") { closeMenus(true); openYourAccess(); }
+  if (menu === "admin") { closeMenus(true); router.go("#/admin"); }
+  if (menu === "density") { toggleDensity(); item.setAttribute("aria-checked", String(root.dataset.density === "compact")); }
 });
 auth.onChange(() => { renderAccount(); renderViews(lastMsg); });
+
+// ---- your access -------------------------------------------------------------------
+// Read only: who the identity provider says you are, your roles and where each came from, and what
+// they let you do. The list of permissions is the same for everyone, so it's fetched once.
+const accessSheet = $("access-sheet");
+dismissible(accessSheet);
+let catalogue = null;
+
+async function openYourAccess() {
+  const s = auth.state();
+  if (!s.signedIn || !s.user || accessSheet.open) return;
+  let perms = [], failed = "";
+  try {
+    catalogue = catalogue || api.get("api/permissions");
+    perms = (await catalogue).permissions || [];
+  } catch (err) {
+    catalogue = null;
+    failed = err.message;
+  }
+  const groups = permissionGroups(perms), u = s.user;
+  accessSheet.__html = null;
+  setHTML(accessSheet, html`
+    <div class="sheet-head"><div><h2 id="access-sheet-title">Your access</h2><p class="sheet-sub">Signed in with ${s.ssoLabel || "single sign-on"}</p></div>
+      <button type="button" class="icon-btn" data-dismiss aria-label="Close">${icon("i-close")}</button></div>
+    <dl class="facts access-facts">
+      <dt>Name</dt><dd>${s.name}</dd>
+      <dt>Email</dt><dd>${u.email ? html`${u.email}${u.emailVerified ? "" : html` <span class="tag">not verified</span>`}` : html`<span class="dim">None given</span>`}</dd>
+      <dt>Subject</dt><dd><span class="copyable"><code class="mono">${u.subject}</code><button type="button" class="icon-btn tiny" data-copy="${u.subject}"
+        data-copy-label="your subject" aria-label="Copy your subject">${icon("i-copy")}</button></span>
+        <p class="hint">An admin can list you as sub:${u.subject} in GRID_OIDC_ADMINS</p></dd>
+    </dl>
+    <section class="access-part" aria-labelledby="access-roles-title">
+      <h3 class="section-label" id="access-roles-title">Roles</h3>
+      ${s.roles.length ? html`<ul class="plain-list access-roles">${s.roles.map((r) => html`<li><strong>${r.name}</strong> <span class="dim">· ${roleSource(r)}</span></li>`)}</ul>`
+        : html`<p class="hint">No roles yet: an admin can give you some.</p>`}
+    </section>
+    <section class="access-part" aria-labelledby="access-perms-title">
+      <h3 class="section-label" id="access-perms-title">What you can do</h3>
+      ${failed ? html`<p class="form-error">${failed}</p>` : html`<div class="perm-groups">${groups.map((g) => html`<div class="perm-group"><h4>${g.name}</h4>
+        <ul class="plain-list">${g.perms.map((x) => {
+          const on = s.permissions.includes(x.id);
+          return html`<li class="${on ? "" : "dim"}"><span class="glyph g-${on ? "ok" : "off"}" aria-hidden="true"></span>${x.label}<span class="sr-only">${on ? ": yes" : ": no"}</span></li>`;
+        })}</ul></div>`)}</div>`}
+    </section>
+    <p class="hint">Need more? Ask an admin of this grid.</p>`);
+  accessSheet.showModal();
+  accessSheet.querySelector("[data-dismiss]").focus();
+}
 
 $("unprotected-btn").addEventListener("click", () => {
   const pop = $("unprotected-pop"), btn = $("unprotected-btn");
@@ -267,19 +348,22 @@ app.rowMenu = (host, btn) => {
   const hasFails = n.slots.some((s) => s.fails);
   const offline = n.kind === "gateway" && !n.online;
   const locked = auth.state().adminConfigured && !auth.state().signedIn;
-  const lock = locked ? icon("i-lock") : "";
+  // Signed in with roles that don't run the grid: the actions stay in the menu, unavailable, and say why.
+  const barred = !locked && !auth.can("grid.operate");
+  const lock = locked || barred ? icon("i-lock") : "";
+  const why = (verb) => (barred ? html` aria-disabled="true" title="Your roles don't let you ${verb}"` : "");
   setHTML(rowMenu, html`
     <button type="button" role="menuitem" data-row-act="inspect">${icon("i-panel")}Inspect ${host}</button>
     <button type="button" role="menuitem" data-row-act="activity">${icon("i-activity")}Activity for this node</button>
     <button type="button" role="menuitem" data-row-act="copy">${icon("i-copy")}Copy connect URL for this node (add your token)</button>
-    ${hasFails ? html`<button type="button" role="menuitem" data-row-act="reset"${locked ? html` aria-label="Sign in to reset node failures"` : ""}>${lock || icon("i-undo")}Reset node failures</button>` : ""}
-    ${offline && !n.busy ? html`<button type="button" role="menuitem" class="destructive" data-row-act="forget"${locked ? html` aria-label="Sign in to forget ${host}"` : ""}>${lock || icon("i-trash")}Forget…</button>` : ""}`);
+    ${hasFails ? html`<button type="button" role="menuitem" data-row-act="reset"${locked ? html` aria-label="Sign in to reset node failures"` : ""}${why("reset node failures")}>${lock || icon("i-undo")}Reset node failures</button>` : ""}
+    ${offline && !n.busy ? html`<button type="button" role="menuitem" class="destructive" data-row-act="forget"${locked ? html` aria-label="Sign in to forget ${host}"` : ""}${why("forget " + host)}>${lock || icon("i-trash")}Forget…</button>` : ""}`);
   rowMenu.dataset.host = host;
   openMenu(rowMenu, btn);
 };
 rowMenu.addEventListener("click", async (e) => {
   const item = e.target.closest("[data-row-act]");
-  if (!item) return;
+  if (!item || item.getAttribute("aria-disabled") === "true") return;
   const host = rowMenu.dataset.host, owner = menuOwner, n = app.findNode(host);
   // Focus goes back to the row's button first: the prompt or confirm an action opens returns it
   // there, and a hidden menu item can't take it back.
@@ -350,6 +434,10 @@ const palette = createPalette({
     view("mfa", "MFA & sign-ins", "#/mfa", "i-shield", "mfa totp codes secrets");
     out.push({ id: "view-signins", group: "View", label: "Saved sign-ins", icon: "i-login", keywords: "signin reuse cookies storage state session",
       run: () => toSignins(null) });
+    if (adminShown(auth.state())) {
+      view("admin", "Admin", "#/admin", "i-users", "people users roles groups audit single sign-on");
+      ADMIN_TABS.filter(([, , perm]) => auth.can(perm)).forEach(([tab, label]) => view("admin-" + tab, "Admin: " + label, "#/admin?tab=" + tab, "i-users"));
+    }
     out.push({ id: "connect", group: "View", label: "Connect to the grid", icon: "i-link", keywords: "connect hub address endpoint snippet token",
       run: () => app.inspect("connect", "grid", null) });
     out.push({ id: "help", group: "View", label: "Keyboard shortcuts", icon: "i-keyboard", run: () => $("shortcuts-dialog").showModal() });
@@ -381,6 +469,15 @@ const palette = createPalette({
       const meta = s.leaseForS != null ? "signing in now" : !s.saved ? "not saved" : s.expired ? "expired" : "saved";
       out.push({ id: "signin-" + s.id, group: "Saved sign-ins", label: s.name, mono: true, icon: "i-login", keywords: "signin sign-in cookies " + s.domains.join(" "),
         meta, run: () => toSignins(s.id) });
+    }
+    // People and roles, once the Admin page has loaded them, for as long as the session may see them.
+    for (const u of views.admin.users()) {
+      out.push({ id: "user-" + u.id, group: "People", label: u.name, icon: "i-user", keywords: "person user " + (u.email || ""), meta: u.email || "",
+        run: () => router.go(router.build("admin", { tab: "users", user: u.id })) });
+    }
+    for (const r of views.admin.roles()) {
+      out.push({ id: "role-" + r.id, group: "Roles", label: r.name, icon: "i-users", keywords: "role " + (r.description || ""), meta: r.builtIn ? "built-in role" : "role",
+        run: () => router.go(router.build("admin", { tab: "roles" })) });
     }
     return out;
   },
@@ -420,6 +517,9 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("click", (e) => {
   const copyBtn = e.target.closest("[data-copy]");
   if (copyBtn) { copy(copyBtn.dataset.copy, copyBtn.dataset.copyLabel, copyBtn); return; }
+  // The panels views show in place of what the session doesn't let them show.
+  if (e.target.closest("[data-your-access]")) { openYourAccess(); return; }
+  if (e.target.closest("#view-overview [data-signin], #view-sessions [data-signin], #view-activity [data-signin]")) { auth.signIn("Sign in to see the grid"); return; }
   const link = e.target.closest("a[data-inspect]");
   if (link && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.button === 0) {
     e.preventDefault();

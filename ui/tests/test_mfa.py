@@ -541,6 +541,9 @@ def test_create_list_peek_use_and_delete_through_the_api(client):
     made = r.get_json()
     assert made["name"] == "intranet" and made["issuer"] == "Intranet" and made["issuedCount"] == 0
     assert "seed" not in made and "secret" not in made and "seedCipher" not in made
+    # Made with the admin token, it is the admins', and the token may do anything with it.
+    assert {k: made[k] for k in ("owner", "access", "canManage", "sharedWith")} == {
+        "owner": None, "access": "all", "canManage": True, "sharedWith": []}
 
     body = private(client.get("/api/mfa", headers=ADMIN)).get_json()
     assert body["ready"] is True and body["keyProblem"] is None and abs(body["serverTime"] - time.time()) < 5

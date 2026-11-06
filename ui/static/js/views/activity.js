@@ -5,6 +5,7 @@ import { html, patchList, setHTML, setText } from "../html.js";
 import { clock, runText } from "../format.js";
 import { describe } from "../live.js";
 import * as router from "../router.js";
+import { refusedPanel } from "../ui/refused.js";
 import { copy, toast } from "../ui/toast.js";
 
 const KINDS = [["claim", "Claims"], ["finish", "Finished runs"], ["failure", "Failures and health"], ["reset", "Resets"], ["node", "Nodes"], ["admin", "Admin actions"]];
@@ -51,7 +52,7 @@ export function createActivity(section) {
       <button type="button" class="btn small" id="act-copy">Copy as JSON</button>
       <button type="button" class="btn ghost small destructive" id="act-clear">Clear</button>
     </div>
-    <div class="panel table-panel">
+    <div class="panel table-panel" id="act-panel">
       <table class="table activity">
         <caption class="sr-only">Events seen by this tab, newest first</caption>
         <thead><tr><th scope="col">Time</th><th scope="col"><span class="sr-only">Kind</span></th><th scope="col">Subject</th><th scope="col">What happened</th><th scope="col">Duration</th></tr></thead>
@@ -59,7 +60,8 @@ export function createActivity(section) {
       </table>
       <div class="empty compact" id="act-empty" hidden></div>
     </div>
-    <p class="hint act-reach" id="act-reach"></p>`);
+    <p class="hint act-reach" id="act-reach"></p>
+    <div id="act-state"></div>`);
 
   const rows = section.querySelector("#act-rows");
   let params = {};
@@ -95,6 +97,11 @@ export function createActivity(section) {
 
   function update(data, p, recorder) {
     params = p || {};
+    // Reading the grid needs a sign-in or a role this page doesn't have: what this browser recorded stays hidden too.
+    const refused = app.live && app.live.refused;
+    [".act-toolbar", "#act-panel", "#act-reach"].forEach((sel) => { section.querySelector(sel).hidden = !!refused; });
+    setHTML(section.querySelector("#act-state"), refused ? refusedPanel(refused) : html``);
+    if (refused) { setText(section.querySelector("#act-sub"), ""); return; }
     const now = app.now();
     const nodes = ((data && data.nodes) || []).map((n) => n.host);
     const known = new Set(nodes);

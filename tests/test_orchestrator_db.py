@@ -226,7 +226,9 @@ def test_lost_connection_reconnects(make_db, monkeypatch):
 def test_schema_statements_split():
     statements = database.schema_statements()
     assert [re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", s).group(1) for s in statements] == \
-        ["portStatus", "portUsage", "nodes", "accessTokens", "hubs", "mfaSecrets", "mfaIssues", "savedSignins"]
+        ["portStatus", "portUsage", "nodes", "accessTokens", "hubs", "mfaSecrets", "mfaIssues", "savedSignins",
+         "users", "roles", "userRoles", "groupRoles", "userSessions", "oidcLogins", "itemOwners", "itemShares",
+         "auditLog"]
     assert not any(line.lstrip().startswith("--") for s in statements for line in s.splitlines())
 
 

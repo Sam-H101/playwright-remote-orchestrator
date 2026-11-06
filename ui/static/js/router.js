@@ -2,7 +2,9 @@
 //   #/overview  #/activity?node=&slot=&kind=&range=  #/sessions?filter=  #/access  #/mfa
 //   #/slot/<id>  #/node/<name>  #/session/<slotId>     (the inspector, over the last view)
 //   #/connect                                         (how checks connect to the grid, in the inspector)
-export const VIEWS = ["overview", "activity", "sessions", "access", "mfa"];
+//   #/admin?tab=users|roles|groups|audit|sso&q=&status=disabled|any&role=&sort=&page=&user=<id>&actor=&category=&target=
+//     (build() drops the value "all", so the Users status filter says "any"; left out, it shows the active ones)
+export const VIEWS = ["overview", "activity", "sessions", "access", "mfa", "admin"];
 const INSPECT = { slot: 1, node: 1, session: 1 };
 const LEGACY = { "#access": "#/access", "#sessions": "#/sessions", "#overview": "#/overview", "#activity": "#/activity" };
 

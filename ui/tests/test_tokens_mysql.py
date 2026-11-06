@@ -43,7 +43,8 @@ def mysql(monkeypatch):
     monkeypatch.setattr(store, "DB_ENGINE", "mysql")
     monkeypatch.setattr(store, "_schema_attempted", False)
     monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
-    sql("DROP TABLE IF EXISTS portUsage, portStatus, nodes, accessTokens")
+    # The owner rows too: ids start over, and old rows would belong to the new tokens.
+    sql("DROP TABLE IF EXISTS portUsage, portStatus, nodes, accessTokens, itemOwners, itemShares")
 
 
 def add_node(name, token_id, online=1):
