@@ -42,6 +42,9 @@ class StubGridUi:
         self.requests = []
         self.answers = []
         self.tokens = {TOKEN}
+        # Names only shared with the token's owner: its checks reuse what is saved, but never sign in for them
+        # or save them again.
+        self.shared = set()
         self.retry_after_s = retry_after_s
         # Set when a caller is told to wait.
         self.waited = threading.Event()
@@ -107,6 +110,10 @@ class StubGridUi:
         if row["lease"] and row["leaseUntil"] > now:
             self.waited.set()
             return 200, {"status": "wait", "name": name, "retryAfterS": self.retry_after_s}
+        if name in self.shared:
+            return 409, {"error": "Nothing usable is saved for {!r}, and only its owner's checks may sign in for it. It "
+                                  "is shared with this client token's owner, who can use it once their own check has "
+                                  "signed in.".format(name), "owner_signs_in": True}
         lease_for = min(max(lease_s or 180, 30), 600)
         row.update(lease=secrets.token_urlsafe(16), leaseUntil=now + lease_for)
         return 200, {"status": "sign-in", "id": row["id"], "name": name, "version": row["version"],
@@ -126,6 +133,8 @@ class StubGridUi:
         elif base_version is not None:
             if signin_id is None:
                 return 400, {"error": "Send the id the checkout answered with baseVersion."}
+            if name in self.shared:
+                return 200, {"saved": False, "reason": "shared", "version": row["version"]}
             if base_version != row["version"] or signin_id != row["id"]:
                 return 200, {"saved": False, "reason": "newer", "version": row["version"]}
             row["refreshes"] += 1
@@ -510,6 +519,35 @@ def test_a_refresh_after_an_admin_deleted_the_sign_in_saves_nothing(grid_ui, clo
     assert grid_ui.bodies(SAVE)[0]["id"] == old_id != grid_ui.rows[NAME]["id"]
     assert grid_ui.answers[-1][2] == {"saved": False, "reason": "newer", "version": 4}
     assert grid_ui.rows[NAME]["state"] == newer and grid_ui.rows[NAME]["refreshes"] == 0
+
+
+def test_a_shared_sign_in_is_reused_and_not_saved_again(grid_ui, clock, site, browser):
+    grid_ui.preset(NAME, site.state(), version=4)
+    grid_ui.shared.add(NAME)
+    with reuse(browser, site, clock) as s:
+        assert s.reused and s.version == 4
+    # Quietly (the module's filter would fail the test on a warning): only the owner's checks save it.
+    assert grid_ui.paths() == [CHECKOUT, SAVE]
+    assert grid_ui.answers[-1][2] == {"saved": False, "reason": "shared", "version": 4}
+    assert s.version == 4 and s.context.closed and grid_ui.rows[NAME]["refreshes"] == 0
+
+
+def test_only_the_owners_checks_sign_in_for_a_shared_sign_in(grid_ui, clock, site, browser):
+    stale = site.state()
+    site.sessions.clear()  # the site asks to sign in again
+    grid_ui.preset(NAME, stale, version=4)
+    grid_ui.shared.add(NAME)
+    with pytest.raises(signin.SigninError) as e:
+        with reuse(browser, site, clock):
+            pytest.fail("the block ran without a sign-in")
+    assert e.value.status == 409 and e.value.answer["owner_signs_in"] is True
+    assert "HTTP 409 Nothing usable is saved for 'contoso-monitor'" in str(e.value)  # the Grid UI's own words
+    # The refusal was still reported, so the owner's next check signs in.
+    assert grid_ui.bodies(CHECKOUT) == [{"name": NAME}, {"name": NAME, "rejectedVersion": 4, "id": 101}]
+    assert grid_ui.rows[NAME]["rejected"] == 1 and grid_ui.rows[NAME]["state"] is None
+    assert browser.events == [("open", 0, True), ("close", 0)] and site.sign_ins == 0
+    assert grid_ui.leases_handed_out() == []
+    assert_no_secrets(e.value)
 
 
 def test_an_error_in_the_block_saves_nothing(grid_ui, clock, site, browser):

@@ -6,12 +6,15 @@ on:
       - 'installer/windows/**'
       - 'gateway/**'
       - 'runner/**'
+      # The gateway's npm test pins the schema's CREATE TABLE statements.
+      - 'src/schema.sql'
       - '.github/workflows/windows-backend-installer.yml'
   pull_request:
     paths:
       - 'installer/windows/**'
       - 'gateway/**'
       - 'runner/**'
+      - 'src/schema.sql'
       - '.github/workflows/windows-backend-installer.yml'
   workflow_dispatch:
 

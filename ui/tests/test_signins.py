@@ -575,8 +575,8 @@ def test_a_check_still_using_a_deleted_sign_in_cannot_save_it_back(db):
 def test_a_checkout_adds_the_name_again_when_it_is_deleted_meanwhile(db, monkeypatch):
     real, calls = store._add_signin, []
 
-    def add_then_an_admin_deletes(name):
-        real(name)
+    def add_then_an_admin_deletes(name, *rest):
+        real(name, *rest)
         calls.append(name)
         if len(calls) == 1:
             run(db, "DELETE FROM savedSignins WHERE name = ?", (name,))
@@ -713,6 +713,8 @@ def test_a_check_signs_in_saves_and_reuses_through_the_api(client, db):
     body = admin(client, "GET").get_json()
     assert body["ready"] is True and body["keyProblem"] is None and abs(body["serverTime"] - time.time()) < 5
     (entry,) = body["signins"]
+    # The bootstrap token's check added it, so it is the admins', and their checks may use it.
+    assert [entry[k] for k in ("owner", "access", "canManage", "usable", "sharedWith")] == [None, "all", True, True, []]
     assert [entry[k] for k in ("name", "version", "saved", "savedBy", "signInCount", "refreshCount", "useCount",
                                "lastUsedBy")] == ["contoso", 2, True, "GATEWAY_CLIENT_TOKEN", 1, 1, 2, "GATEWAY_CLIENT_TOKEN"]
     assert abs(seconds_from_now(entry["expiresAt"][:-1]) - 3600) < 10

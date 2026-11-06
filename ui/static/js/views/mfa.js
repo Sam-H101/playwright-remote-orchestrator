@@ -4,12 +4,15 @@
 // counted down by the server's clock, and who was handed which window's code.
 // Saved sign-ins are the browser states checks save after signing in and reuse on later runs. Checks add
 // them; the page shows what is saved, how it is used and who is signing in now, never a cookie.
+// With single sign-on, each secret and sign-in has an owner, who may share it with people and roles; each
+// part shows what this person's roles let them see, and says so when they let them see none.
 import { app } from "../app.js";
 import * as api from "../api.js";
 import * as auth from "../auth.js";
 import { html, icon, patchList, setHTML, setText } from "../html.js";
 import { duration, fullDate, parseTime, plural } from "../format.js";
 import { confirm, dismissible } from "../ui/dialog.js";
+import { openShare } from "../ui/share.js";
 import { copy, toast } from "../ui/toast.js";
 
 const MFA_NAME = /^[A-Za-z0-9._-]{1,64}$/;
@@ -33,6 +36,22 @@ function codeMarkup(code) {
 
 const settings = (s) => s.digits + " digits · " + s.period + " s · " + s.algorithm;
 const who = (s) => [s.issuer, s.account].filter(Boolean).join(" · ");
+// Whose rows the page lists: the person's own, those shared with them, or (with mfa.all or signins.all)
+// everyone's. Each row's access says why they see it.
+const SCOPES = { mine: (s) => s.access === "owner", shared: (s) => s.access === "shared", all: () => true };
+// Why the checks of whoever looks can't use a sign-in they see (store._rights): it's shared with them, but they
+// may do more than the owner and no share from someone who may see every sign-in reaches them (store._reaches),
+// or they see it only because they may see every one. Admins' checks use what is shared with the Admin role;
+// anyone else's, what is shared with a role of theirs.
+function unusable(s) {
+  if (s.access === "shared") {
+    return "It's shared with you, but you may do things its owner may not, so it only reaches your checks when someone with “Every saved sign-in” shares it. " +
+      "Such a share stops reaching you once its owner may do less than when it was made.";
+  }
+  return auth.state().admin
+    ? "It isn't shared with you or with Admin. Share it with Admin, or give it to Admins, to let your checks use it."
+    : "It isn't shared with you or a role you have. Share it with one of your roles, or give it to Admins, to let your checks use it.";
+}
 
 function snippet(name) {
   return "from src import mfa\n\n" +
@@ -70,6 +89,13 @@ export function createMfa(section) {
       <h1 id="mfa-h1" tabindex="-1">MFA &amp; sign-ins</h1>
     </header>
     <div class="banner" id="mfa-banner" role="status" hidden></div>
+    <div class="toolbar" id="mfa-toolbar" hidden>
+      <div class="segmented" id="mfa-scope" role="group" aria-label="Whose">
+        <button type="button" data-scope="mine" aria-pressed="false">Mine</button>
+        <button type="button" data-scope="shared" aria-pressed="false">Shared with me</button>
+        <button type="button" data-scope="all" aria-pressed="false">All</button>
+      </div>
+    </div>
     <div id="mfa-state"></div>
     <div id="mfa-key"></div>
     <section class="mfa-part" id="mfa-secrets" aria-labelledby="mfa-secrets-title" hidden>
@@ -151,10 +177,13 @@ export function createMfa(section) {
   const field = (id) => document.getElementById(id);
   dismissible(dlg);
   // ok, signedout, unconfigured, error, loading
-  // loading: the load in flight (a promise); again: a forced load asked for meanwhile.
-  const mfa = { state: "loading", data: null, sig: null, error: null, loading: null, again: false, loadedAt: 0, refused: false };
+  // loading: the load in flight (a promise); again: a forced load asked for meanwhile. forbidden: this
+  // person's roles don't let them see the secrets (decided before asking), so that part says so.
+  const mfa = { state: "loading", data: null, sig: null, error: null, loading: null, again: false, loadedAt: 0, refused: false, forbidden: false };
   // The saved sign-ins, loaded with the secrets: data is null until the page state is "ok".
-  const signins = { data: null, sig: null, error: null };
+  const signins = { data: null, sig: null, error: null, forbidden: false };
+  // Whose rows are listed (SCOPES), once a person signed in with single sign-on; null until then.
+  let scope = null;
   // The code on screen: { id, name, mode: "peek" | "used", code, step, issued, period, endsAt, opensAt, shownAt }.
   let shown = null, seq = 0, pending = 0, codeTimer = null, visible = false;
   // Live sign-in leases: sign-in id -> when the lease runs out, on this tab's monotonic clock.
@@ -181,31 +210,35 @@ export function createMfa(section) {
     return mfa.loading;
   }
 
-  const summary = () => [mfa.state, mfa.sig, mfa.error, signins.sig, signins.error].join("|");
+  const summary = () => [mfa.state, mfa.sig, mfa.error, mfa.forbidden, signins.sig, signins.error, signins.forbidden].join("|");
 
   async function fetchList() {
     const before = summary();
-    // Both lists in one poll, so the page changes once.
-    const [secrets, saved] = await Promise.allSettled([api.get("api/mfa"), api.get("api/signins")]);
+    // Both lists in one poll, so the page changes once; only those this person's roles let them see, as
+    // asking for another would only be refused.
+    const ask = { secrets: auth.can("mfa.use"), signins: auth.can("signins.use") };
+    const [secrets, saved] = await Promise.allSettled([ask.secrets && api.get("api/mfa"), ask.signins && api.get("api/signins")]);
     mfa.loadedAt = Date.now();
-    if (secrets.status === "fulfilled") {
-      const body = secrets.value;
-      mfa.state = "ok";
-      mfa.error = null;
-      mfa.refused = false;
-      mfa.data = body;
-      mfa.sig = JSON.stringify(body, (k, v) => (k === "generated" || k === "serverTime" ? undefined : v));
-    } else {
-      const err = secrets.reason;
-      if (err.body && err.body.admin_token_unset) { mfa.state = "unconfigured"; mfa.data = mfa.sig = null; }
-      else if (err.body && err.body.token_required) { mfa.state = "signedout"; mfa.refused = true; mfa.data = mfa.sig = null; }
-      else { mfa.error = err.message; if (!mfa.data) mfa.state = "error"; }
+    mfa.forbidden = !ask.secrets;
+    signins.forbidden = !ask.signins;
+    // The page's own state comes from the secrets, or from the sign-ins for someone who may see only those.
+    const lead = ask.secrets ? secrets : ask.signins ? saved : null, err = lead && lead.status === "rejected" ? lead.reason : null;
+    if (err && err.body && err.body.admin_token_unset) mfa.state = "unconfigured";
+    else if (err && err.body && err.body.token_required) { mfa.state = "signedout"; mfa.refused = true; }
+    else if (err && !(ask.secrets ? mfa.data : signins.data)) { mfa.state = "error"; mfa.error = err.message; }
+    else { mfa.state = "ok"; mfa.refused = false; mfa.error = ask.secrets && err ? err.message : null; }
+    if (!ask.secrets) mfa.data = mfa.sig = null;
+    else if (secrets.status === "fulfilled") {
+      mfa.data = secrets.value;
+      mfa.sig = JSON.stringify(secrets.value, (k, v) => (k === "generated" || k === "serverTime" ? undefined : v));
     }
     // Signed out while the lists were on their way: they don't come back (nor into the palette).
-    if (mfa.state === "ok" && !auth.state().signedIn) { mfa.state = "signedout"; mfa.data = mfa.sig = null; }
-    if (mfa.state !== "ok") { hideCode(); dropSignins(); }
+    if (mfa.state === "ok" && !auth.state().signedIn) mfa.state = "signedout";
+    if (mfa.state !== "ok") { mfa.data = mfa.sig = null; dropSignins(); }
+    else if (!ask.signins) dropSignins();
     else if (saved.status === "fulfilled") takeSignins(saved.value);
     else signins.error = saved.reason.message;
+    if (!mfa.data) hideCode();
     if (summary() !== before) render();
   }
 
@@ -244,13 +277,21 @@ export function createMfa(section) {
         </ol></div>`;
       case "signedout": return html`<div class="empty calm">${icon("i-lock", "empty-mark")}
         <h2>${mfa.refused ? "Sign in again to manage MFA secrets and sign-ins" : "Sign in to manage MFA secrets and sign-ins"}</h2>
-        <p>Only admins can see the MFA secrets, their codes and who was handed them, and the sign-ins checks saved. Checks keep getting codes
-          and their saved sign-ins with their client tokens meanwhile.</p>
+        <p>${auth.state().sso ? "Only people whose roles include “Use MFA secrets” can see the MFA secrets, their codes and who was handed them, " +
+          "and only those whose roles include “Use saved sign-ins” the sign-ins checks saved." : "Only admins can see the MFA secrets, their codes and " +
+          "who was handed them, and the sign-ins checks saved."} Checks keep getting codes and their saved sign-ins with their client tokens meanwhile.</p>
         <button type="button" class="btn primary" data-signin>Sign in</button></div>`;
-      case "error": return html`<div class="empty">${icon("i-alert", "empty-mark")}<h2>Can't load the MFA secrets</h2><p>${mfa.error}</p>
+      case "error": return html`<div class="empty">${icon("i-alert", "empty-mark")}<h2>Can't load the ${mfa.forbidden ? "saved sign-ins" : "MFA secrets"}</h2><p>${mfa.error}</p>
         <button type="button" class="btn" data-reload-mfa>Try again</button></div>`;
     }
     return html``;
+  }
+
+  // A part this person's roles don't let them see, in place of its list.
+  function forbiddenMarkup(permission) {
+    return html`<div class="empty calm">${icon("i-lock", "empty-mark")}<h3>Your roles don't include “${permission}”</h3>
+      <p>Ask an admin for a role that does.</p>
+      <button type="button" class="btn" data-your-access>Your access</button></div>`;
   }
 
   function emptyMarkup(d) {
@@ -259,10 +300,60 @@ export function createMfa(section) {
         <p>It has no mfaSecrets table. The Grid UI creates it on MySQL when its database user may create tables, and so does the gateway hub when it starts.</p></div>`;
     }
     if (d.keyProblem) return html`<div class="empty compact"><p>No MFA secrets yet. Set the secrets key first, as above.</p></div>`;
+    // Someone who may use secrets but not add them sees those shared with them, and none are yet.
+    if (!auth.can("mfa.add")) {
+      return html`<div class="empty">${icon("i-shield", "empty-mark")}<h3>No MFA secrets are shared with you yet</h3>
+        <p>Whoever adds one can share it with you, or with a role of yours. Its codes then show here, and your checks get them.</p></div>`;
+    }
     return html`<div class="empty">${icon("i-shield", "empty-mark")}<h3>No MFA secrets yet</h3>
       <p>Add the setup key a site shows when you turn on an authenticator app for the account your checks sign in with.
         From then on, checks ask the Grid UI for its codes by name.</p>
       <button type="button" class="btn primary" data-add-mfa>${icon("i-plus")}Add secret</button></div>`;
+  }
+
+  // ---- whose rows ---------------------------------------------------------------------
+  // The scope choice is for a person signed in with single sign-on; All only for whoever may see every
+  // secret or sign-in, and then it's where the page starts.
+  function scopes() {
+    const s = auth.state();
+    if (!s.sso || !s.user) return [];
+    return auth.can("mfa.all") || auth.can("signins.all") ? ["mine", "shared", "all"] : ["mine", "shared"];
+  }
+  const inScope = (rows) => (scope ? rows.filter(SCOPES[scope]) : rows);
+
+  function renderScope() {
+    const offered = scopes();
+    if (!offered.includes(scope)) scope = offered.length ? offered[offered.length === 3 ? 2 : 0] : null;
+    const rows = [].concat((mfa.data && mfa.data.secrets) || [], (signins.data && signins.data.signins) || []);
+    $("#mfa-toolbar").hidden = !(mfa.state === "ok" && scope && !(mfa.forbidden && signins.forbidden));
+    section.querySelectorAll("#mfa-scope [data-scope]").forEach((b) => {
+      const label = b.dataset.label || (b.dataset.label = b.textContent), n = rows.filter(SCOPES[b.dataset.scope]).length;
+      b.hidden = !offered.includes(b.dataset.scope);
+      setHTML(b, html`${label}${n ? html`<span class="n">${n}</span>` : ""}`);
+      b.setAttribute("aria-pressed", String(b.dataset.scope === scope));
+    });
+  }
+
+  // A scope that leaves out every row of a part: says so, and offers the rows there are.
+  function scopeEmpty(what) {
+    const to = scopes().includes("all") ? "all" : scope === "mine" ? "shared" : "mine";
+    return html`<div class="empty compact"><p>None of the ${what} are ${scope === "mine" ? "yours" : "shared with you"}.</p>
+      <button type="button" class="btn small" data-scope-to="${to}">${{ all: "Show all", shared: "Show those shared with you", mine: "Show yours" }[to]}</button></div>`;
+  }
+
+  // Whose it is, and who else has it, said once in each row's meta.
+  function ownerLine(s, kind) {
+    if (!auth.state().sso) return "";
+    const o = s.owner, shared = s.sharedWith || [];
+    const whose = s.access === "owner" ? "Yours" : !o ? "Admins'" : o.name + "'s" + (o.disabled ? " (disabled)" : "");
+    return html`<small class="owner-line">${whose}${s.canManage && shared.length
+      ? html` · <span title="${shared.map((g) => g.name).join(", ")}">shared with ${shared.length}</span>` : s.access === "shared" ? " · shared with you" : ""}${
+      kind === "signin" && s.usable === false ? html` · <span title="${unusable(s)}">your checks can't use it</span>` : ""}</small>`;
+  }
+
+  function shareButton(s, kind) {
+    if (!(s.canManage && auth.state().sso)) return "";
+    return html`<button type="button" class="btn ghost small" data-share-${kind}="${s.id}" data-fk="share-${s.id}" aria-label="Share ${s.name}">${icon("i-share")}Share</button> `;
   }
 
   // GRID_SECRETS_KEY unset or too short (or the image lacks the cryptography package): say what to do. The
@@ -291,13 +382,13 @@ export function createMfa(section) {
   function secretRow(s) {
     const on = !!(shown && shown.id === s.id), meta = who(s), locked = !!(mfa.data && mfa.data.keyProblem);
     return html`<tr data-key="${s.id}" data-mfa="${s.id}" data-jk tabindex="-1" class="${on ? "showing" : ""}">
-      <td class="cell-secret"><code class="mfa-name mono">${s.name}</code>${meta ? html`<small>${meta}</small>` : html`<small class="dim">No issuer or account</small>`}</td>
+      <td class="cell-secret"><code class="mfa-name mono">${s.name}</code>${meta ? html`<small>${meta}</small>` : html`<small class="dim">No issuer or account</small>`}${ownerLine(s, "mfa")}</td>
       <td class="cell-settings" data-label="Settings">${settings(s)}</td>
       <td class="cell-last" data-label="Last handed out" title="${fullDate(parseTime(s.lastIssuedAt))}">${lastCell(s)}</td>
       <td class="cell-count num-col" data-label="Handed out">${s.issuedCount}</td>
       <td class="cell-actions">
         <button type="button" class="btn small" data-show-code="${s.id}" data-fk="show-${s.id}" aria-pressed="${String(on)}" aria-controls="mfa-live"${locked ? html` disabled title="Set GRID_SECRETS_KEY to see codes"` : ""}>${icon(on ? "i-eye-off" : "i-eye")}${on ? "Hide code" : "Show code"}</button>
-        <button type="button" class="btn ghost small destructive" data-delete-mfa="${s.id}" data-fk="delete-${s.id}" aria-label="Delete ${s.name}">Delete</button></td></tr>`;
+        ${shareButton(s, "mfa")}${s.canManage !== false ? html`<button type="button" class="btn ghost small destructive" data-delete-mfa="${s.id}" data-fk="delete-${s.id}" aria-label="Delete ${s.name}">Delete</button>` : ""}</td></tr>`;
   }
 
   function issueRow(i) {
@@ -309,7 +400,7 @@ export function createMfa(section) {
   }
 
   function renderSnippet(d) {
-    const pick = (shown && d.secrets.find((s) => s.id === shown.id)) || d.secrets[0];
+    const pick = (shown && d.secrets.find((s) => s.id === shown.id)) || inScope(d.secrets)[0] || d.secrets[0];
     const text = snippet(pick ? pick.name : "intranet");
     setText($("#mfa-snippet"), text);
     $("#mfa-snippet-copy").dataset.copy = text;
@@ -318,16 +409,19 @@ export function createMfa(section) {
   function render() {
     const ok = mfa.state === "ok", d = ok ? mfa.data : null, sd = ok ? signins.data : null;
     const ready = !!(d && d.ready), list = !!(ready && d.secrets.length);
+    renderScope();
+    const rows = list ? inScope(d.secrets) : [];
     $("#mfa-secrets").hidden = !ok;
-    $("#add-mfa-btn").hidden = !(list && !d.keyProblem);
-    $("#mfa-panel").hidden = !list;
+    $("#add-mfa-btn").hidden = !(list && !d.keyProblem && auth.can("mfa.add"));
+    $("#mfa-panel").hidden = !rows.length;
     $("#mfa-lower").hidden = !list;
     setHTML($("#mfa-state"), stateMarkup());
     const problem = (ready && d.keyProblem) || (sd && sd.ready && sd.keyProblem) || null;
     setHTML($("#mfa-key"), problem ? keyMarkup(problem, list, !!(sd && sd.signins.length)) : html``);
-    setHTML($("#mfa-empty"), ok && !list ? emptyMarkup(d) : html``);
+    setHTML($("#mfa-empty"), !ok ? html`` : mfa.forbidden ? forbiddenMarkup("Use MFA secrets") : !list ? emptyMarkup(d)
+      : !rows.length ? scopeEmpty("MFA secrets") : html``);
     // Rows of a list that's gone go too, or focus after the last delete would land on a hidden one.
-    patchList($("#mfa-rows"), list ? d.secrets : [], (s) => s.id, secretRow);
+    patchList($("#mfa-rows"), rows, (s) => s.id, secretRow);
     if (list) {
       $("#mfa-issues-empty").hidden = d.issues.length > 0;
       setText($("#mfa-log-sub"), d.issues.length ? plural(d.issues.length, "code") + (d.issues.length >= 100 ? ", the newest" : "") + " · last 7 days" : "");
@@ -412,9 +506,9 @@ export function createMfa(section) {
   }
 
   function signinRow(s) {
-    const live = leased(s), forgettable = s.saved || live;
+    const live = leased(s), forgettable = s.saved || live, manage = s.canManage !== false;
     return html`<tr data-key="${s.id}" data-signin-row="${s.id}" data-jk tabindex="-1">
-      <td class="cell-signin"><code class="signin-name mono">${s.name}</code>${domainsMarkup(s)}</td>
+      <td class="cell-signin"><code class="signin-name mono">${s.name}</code>${domainsMarkup(s)}${ownerLine(s, "signin")}</td>
       <td class="cell-saved" data-label="Saved" title="${s.saved ? "Saved " + fullDate(parseTime(s.savedAt)) : ""}">${savedCell(s)}</td>
       <td class="cell-expires" data-label="Expires" title="${s.saved ? fullDate(parseTime(s.expiresAt)) : ""}">${s.saved && s.expiresAt
         ? html`<span data-until="${s.expiresAt}"></span>` : html`<span class="dim">–</span>`}</td>
@@ -425,9 +519,9 @@ export function createMfa(section) {
       <td class="cell-asked" data-label="Asked again" title="${fullDate(parseTime(s.lastRejectedAt))}">${s.rejectedCount
         ? html`<div class="stack"><span class="count">${plural(s.rejectedCount, "time")}</span><small>Last <span data-ago="${s.lastRejectedAt}"></span></small></div>`
         : html`<span class="dim">Never</span>`}</td>
-      <td class="cell-actions">
+      <td class="cell-actions">${manage ? html`
         <button type="button" class="btn small" data-forget-signin="${s.id}" data-fk="forget-${s.id}" aria-label="Forget ${s.name}"${forgettable ? "" : html` disabled title="Nothing saved to forget"`}>Forget</button>
-        <button type="button" class="btn ghost small destructive" data-delete-signin="${s.id}" data-fk="delete-${s.id}" aria-label="Delete ${s.name}">Delete</button></td></tr>`;
+        ${shareButton(s, "signin")}<button type="button" class="btn ghost small destructive" data-delete-signin="${s.id}" data-fk="delete-${s.id}" aria-label="Delete ${s.name}">Delete</button>` : ""}</td></tr>`;
   }
 
   function signinStateMarkup(d) {
@@ -439,7 +533,7 @@ export function createMfa(section) {
       return html`<div class="empty">${icon("i-login", "empty-mark")}<h3>Saved sign-ins aren't set up in this database yet</h3>
         <p>It has no savedSignins table. The Grid UI creates it on MySQL when its database user may create tables, and so does the gateway hub when it starts.</p></div>`;
     }
-    if (d.signins.length) return html``;
+    if (d.signins.length) return inScope(d.signins).length ? html`` : scopeEmpty("saved sign-ins");
     return html`<div class="panel signin-intro">
       <div class="signin-intro-head"><span class="reveal-mark">${icon("i-login")}</span>
         <div><h3>No saved sign-ins yet</h3><p>A check adds its sign-in the first time it signs in through <span class="mono">signin.reuse()</span>.</p></div></div>
@@ -447,12 +541,12 @@ export function createMfa(section) {
   }
 
   function renderSignins() {
-    const d = mfa.state === "ok" ? signins.data : null, list = !!(d && d.ready && d.signins.length);
+    const d = mfa.state === "ok" ? signins.data : null, list = !!(d && d.ready && d.signins.length), rows = list ? inScope(d.signins) : [];
     $("#signins").hidden = mfa.state !== "ok";
-    $("#signin-panel").hidden = !list;
+    $("#signin-panel").hidden = !rows.length;
     $("#signin-how").hidden = !list;
-    setHTML($("#signin-state"), mfa.state === "ok" ? signinStateMarkup(d) : html``);
-    patchList($("#signin-rows"), list ? d.signins : [], (s) => s.id, signinRow);
+    setHTML($("#signin-state"), mfa.state !== "ok" ? html`` : signins.forbidden ? forbiddenMarkup("Use saved sign-ins") : signinStateMarkup(d));
+    patchList($("#signin-rows"), rows, (s) => s.id, signinRow);
     if (list) {
       const usable = d.signins.filter((s) => s.saved && !s.expired).length, live = d.signins.filter(leased).length;
       setText($("#signin-sub"), plural(d.signins.length, "sign-in") + " · " + usable + " saved" + (live ? " · " + live + " signing in now" : ""));
@@ -500,12 +594,32 @@ export function createMfa(section) {
     const row = rows.find((r) => r.dataset.signinRow === String(id)) || rows[Math.min(Math.max(at, 0), rows.length - 1)];
     if (!row) return $("#signin-title").focus();
     const forget = row.querySelector("[data-forget-signin]");
-    (forget.disabled ? row : forget).focus();
+    (forget && !forget.disabled ? forget : row).focus();
+  }
+
+  // After the share dialog closes, focus goes back to the row's Share (the row itself, if it can't be
+  // shared any more), or to the part's title when the row has left the list.
+  function focusShared(kind, id) {
+    const row = kind === "mfa" ? section.querySelector('#mfa-rows [data-mfa="' + id + '"]') : section.querySelector('#signin-rows [data-signin-row="' + id + '"]');
+    const btn = row && row.querySelector("[data-share-" + kind + "]");
+    (btn || row || $(kind === "mfa" ? "#mfa-h1" : "#signin-title")).focus();
+  }
+
+  function share(kind, id) {
+    const item = kind === "mfa" ? findSecret(id) : findSignin(id);
+    if (!item) return;
+    openShare({ kind, item, onDone: async () => { await load(true); focusShared(kind, item.id); } });
   }
 
   // The sign-in (or, for null, the part) the palette asked for: shown once the view is open and its list in.
   function reveal() {
     if (wanted === undefined || !visible) return;
+    // A sign-in the scope leaves out comes into it.
+    const s = wanted != null && findSignin(wanted);
+    if (s && scope && !SCOPES[scope](s)) {
+      scope = scopes().includes("all") ? "all" : s.access === "owner" ? "mine" : "shared";
+      render();
+    }
     const row = wanted != null && section.querySelector('#signin-rows [data-signin-row="' + wanted + '"]');
     const target = row || $("#signin-title");
     wanted = undefined;
@@ -702,7 +816,7 @@ export function createMfa(section) {
 
   function renderRowsAndSnippet() {
     if (mfa.state !== "ok" || !mfa.data || !mfa.data.ready) return;
-    patchList($("#mfa-rows"), mfa.data.secrets, (s) => s.id, secretRow);
+    patchList($("#mfa-rows"), inScope(mfa.data.secrets), (s) => s.id, secretRow);
     renderSnippet(mfa.data);
     if (app.tick) app.tick();
   }
@@ -870,6 +984,14 @@ export function createMfa(section) {
     if ((el = e.target.closest("[data-delete-mfa]"))) return confirmDelete(el.dataset.deleteMfa, el);
     if ((el = e.target.closest("[data-forget-signin]"))) return confirmForget(el.dataset.forgetSignin, el);
     if ((el = e.target.closest("[data-delete-signin]"))) return confirmDeleteSignin(el.dataset.deleteSignin, el);
+    if ((el = e.target.closest("[data-share-mfa]"))) return share("mfa", el.dataset.shareMfa);
+    if ((el = e.target.closest("[data-share-signin]"))) return share("signin", el.dataset.shareSignin);
+    if ((el = e.target.closest("[data-scope], [data-scope-to]"))) {
+      scope = el.dataset.scope || el.dataset.scopeTo;
+      render();
+      if (el.dataset.scopeTo) section.querySelector('#mfa-scope [data-scope="' + scope + '"]').focus();
+      return;
+    }
     if (e.target.closest("[data-signin]")) {
       if (await auth.signIn("Sign in to manage MFA secrets and saved sign-ins")) load(true);
       return;
@@ -889,7 +1011,12 @@ export function createMfa(section) {
   auth.onChange((s) => {
     // Signed out from any view: the lists go too, or the palette would keep offering them.
     if (!s.signedIn && (mfa.data || signins.data)) { mfa.state = "signedout"; mfa.data = mfa.sig = null; dropSignins(); hideCode(); }
-    if (visible) load(true);
+    if (!s.signedIn) scope = null; // whoever signs in next starts where the page starts
+    // So does a part whose role was taken; one given comes with the next load.
+    if (mfa.data && !auth.can("mfa.use")) { mfa.forbidden = true; mfa.data = mfa.sig = null; hideCode(); }
+    if (signins.data && !auth.can("signins.use")) { signins.forbidden = true; dropSignins(); }
+    // What the roles allow (Add secret, the scopes) shows at once, whether or not the lists turn out to be others.
+    if (visible) { load(true); render(); }
   });
 
   return {

@@ -3,6 +3,7 @@ import { app } from "../app.js";
 import { html, patchList, setHTML, setText } from "../html.js";
 import { claimWord, clock, duration, fullDate, parseTime, plural } from "../format.js";
 import * as router from "../router.js";
+import { refusedPanel } from "../ui/refused.js";
 
 const FILTERS = [["all", "All"], ["stale", "Stale"], ["offline", "On offline nodes"]];
 const match = {
@@ -40,7 +41,7 @@ export function createSessions(section) {
       <h1 id="sessions-h1" tabindex="-1">Sessions</h1>
       <p class="view-sub" id="sessions-sub"></p>
     </header>
-    <div class="toolbar">
+    <div class="toolbar" id="session-toolbar">
       <div class="chips" role="group" aria-label="Show sessions" id="session-filters">
         ${FILTERS.map(([id, label]) => html`<button type="button" class="chip" data-filter="${id}" aria-pressed="false">${label}<span class="n mono"></span></button>`)}
       </div>
@@ -56,7 +57,8 @@ export function createSessions(section) {
         <tbody id="session-rows"></tbody>
       </table>
       <div class="empty compact" id="sessions-empty" hidden></div>
-    </div>`);
+    </div>
+    <div id="sessions-state"></div>`);
   const rows = section.querySelector("#session-rows");
   let lastNote = "";
 
@@ -66,6 +68,11 @@ export function createSessions(section) {
   });
 
   function update(data, params) {
+    // Reading the grid needs a sign-in or a role this page doesn't have: say so instead of an empty list.
+    const refused = app.live && app.live.refused;
+    section.querySelector("#session-toolbar").hidden = section.querySelector("#sessions-panel").hidden = !!refused;
+    setHTML(section.querySelector("#sessions-state"), refused ? refusedPanel(refused) : html``);
+    if (refused) { setText(section.querySelector("#sessions-sub"), ""); return; }
     const filter = match[params.filter] ? params.filter : "all";
     const all = (data && data.sessions) || [];
     const staleAfter = (data && data.stale_after_s) || 3600;

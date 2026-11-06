@@ -2,12 +2,16 @@
 // never destroys anything.
 import { html, setHTML } from "../html.js";
 
-// opts: { title, text, ok, danger (default true), items: [{ text, tone, label }], note, facts: [[k, v]] }
+// opts: { title, text, ok, danger (default true), items: [{ text, tone, label }], note, facts: [[k, v]],
+// checks: [{ id, label, checked }] }. Resolves true when confirmed; with checks (what else to do along
+// with it), { ok, checked: { id: bool } } instead.
 export function confirm(opts) {
+  const checks = Array.isArray(opts.checks) ? opts.checks : null;
   return new Promise((resolve) => {
     const dlg = document.getElementById("confirm-dialog");
+    const answer = (ok, asked = true) => resolve(checks ? { ok, checked: asked ? ticked(dlg) : {} } : ok);
     // One question at a time: a second one asked over it would share its OK.
-    if (dlg.open) return resolve(false);
+    if (dlg.open) return answer(false, false);
     const danger = opts.danger !== false;
     dlg.__html = null;
     setHTML(dlg, html`
@@ -18,6 +22,8 @@ export function confirm(opts) {
         <ul class="confirm-list" id="confirm-list" ${opts.items && opts.items.length ? "" : "hidden"}>
           ${(opts.items || []).map((it) => html`<li title="${it.label || ""}"><span class="dot ${it.tone || "off"}" aria-hidden="true"></span><span class="confirm-name">${it.text}</span><span class="sr-only">${it.label ? " (" + it.label + ")" : ""}</span></li>`)}
         </ul>
+        ${checks && checks.length ? html`<div class="confirm-checks">${checks.map((c) => html`<label class="check-line">
+          <input type="checkbox" data-check="${c.id}" ${c.checked ? "checked" : ""}><span>${c.label}</span></label>`)}</div>` : ""}
         <p class="confirm-note" id="confirm-note" ${opts.note ? "" : "hidden"}>${opts.note || ""}</p>
         <div class="dialog-actions">
           <button type="button" class="btn ghost" data-dismiss>Cancel</button>
@@ -28,11 +34,18 @@ export function confirm(opts) {
     dlg.querySelector("[data-dismiss]").addEventListener("click", () => dlg.close("cancel"));
     dlg.addEventListener("close", function onClose() {
       dlg.removeEventListener("close", onClose);
-      resolve(dlg.returnValue === "ok");
+      answer(dlg.returnValue === "ok");
     });
     dlg.showModal();
     dlg.querySelector("[data-dismiss]").focus();
   });
+}
+
+// The confirm's checkboxes, by id: ticked or not.
+function ticked(dlg) {
+  const out = {};
+  dlg.querySelectorAll("[data-check]").forEach((el) => { out[el.dataset.check] = el.checked; });
+  return out;
 }
 
 // Wire a static dialog's [data-dismiss] buttons once.

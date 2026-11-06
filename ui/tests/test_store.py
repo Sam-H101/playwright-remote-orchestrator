@@ -151,10 +151,38 @@ def test_forget_node(db):
     assert {n["host"] for n in store.snapshot()["nodes"]} == {"live", "busy"}
 
 
+def test_grid_actions_are_recorded_for_whoever_took_them(db, monkeypatch):
+    """Only what changed, and nothing on a grid with no sign-in configured: there is nobody to name then. A reset
+    of counts that are 0 already changes nothing, and says so as MySQL would (it counts the rows an UPDATE
+    changes, where sqlite counts those it matches)."""
+    add_node(db, "gw", 1, 1, [(1, 60, 2), (1, None, 0), (1, None, 3)])
+    add_node(db, "gone", 0, 900, [(1, None, 1)])
+    client = grid_app.app.test_client()
+    monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "")
+    assert client.post("/api/slots/2/reset-failures", json={}).status_code == 200
+    monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
+    updated = {}
+    for path, body in (("/api/slots/1/release", {}), ("/api/slots/1/reset-failures", {}),
+                       ("/api/nodes/reset-failures", {"host": "gw"}), ("/api/nodes/forget", {"host": "gone"}),
+                       ("/api/slots/99/release", {}), ("/api/nodes/forget", {"host": "nope"}),
+                       ("/api/slots/1/reset-failures", {}), ("/api/nodes/reset-failures", {"host": "gw"})):
+        r = client.post(path, json=body, headers={"X-Grid-Token": "s3cret"})
+        if "reset" in path:
+            updated.setdefault(path, []).append(r.get_json()["updated"])
+    assert updated == {"/api/slots/1/reset-failures": [1, 0], "/api/nodes/reset-failures": [1, 0]}
+    assert run(db, "SELECT actorId, actorName, actorMethod, address, action, targetKind, targetId, targetName, details "
+                   "FROM auditLog ORDER BY id") == [
+        (None, "Admin", "token", "127.0.0.1", "grid.slot_released", "slot", 1, "gw:1", None),
+        (None, "Admin", "token", "127.0.0.1", "grid.slot_reset", "slot", 1, "gw:1", None),
+        (None, "Admin", "token", "127.0.0.1", "grid.node_reset", "node", None, "gw", None),
+        (None, "Admin", "token", "127.0.0.1", "grid.node_forgotten", "node", None, "gone", '{"slots":1}'),
+    ]
+
+
 def test_schema_file_splits_into_statements():
     with open(SCHEMA_SQL) as f:
         statements = [s for s in store._schema_statements(f.read()) if "CREATE TABLE" in s]
-    assert len(statements) == 8
+    assert len(statements) == 17
 
 
 def test_api(db, monkeypatch):
@@ -195,7 +223,9 @@ def test_ensure_schema_runs_each_statement_once_on_mysql(monkeypatch):
     store.ensure_schema()
     store.ensure_schema()
     assert [s.split("(")[0].split()[-1] for s in executed] == ["portStatus", "portUsage", "nodes", "accessTokens", "hubs",
-                                                                     "mfaSecrets", "mfaIssues", "savedSignins"]
+                                                                     "mfaSecrets", "mfaIssues", "savedSignins", "users",
+                                                                     "roles", "userRoles", "groupRoles", "userSessions",
+                                                                     "oidcLogins", "itemOwners", "itemShares", "auditLog"]
     assert not any(line.strip().startswith("--") for s in executed for line in s.splitlines())
 
 
@@ -235,7 +265,7 @@ def test_a_caller_waits_while_another_applies_the_schema(monkeypatch):
         second.join(5)
     finally:
         finish(go_on, first, second)
-    assert seen == [8] and len(executed) == 8  # it returned once every table was made, and made none itself
+    assert seen == [17] and len(executed) == 17  # it returned once every table was made, and made none itself
 
 
 def test_callers_that_waited_on_a_failed_attempt_get_its_error(monkeypatch):

@@ -54,6 +54,9 @@
       <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8 13 3.6v4.1c0 3.1-2.1 5.3-5 6.5-2.9-1.2-5-3.4-5-6.5V3.6z"/><path d="m5.7 8 1.6 1.6 3-3.1"/></symbol>
       <symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.5 8S3.9 3.5 8 3.5 14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></symbol>
       <symbol id="i-eye-off" viewBox="0 0 16 16"><path d="M6.6 3.7A6 6 0 0 1 8 3.5c4.1 0 6.5 4.5 6.5 4.5a11 11 0 0 1-1.6 2.2M4.2 4.9C2.4 6.1 1.5 8 1.5 8S3.9 12.5 8 12.5a6 6 0 0 0 3.2-.9M6.6 6.6a2 2 0 0 0 2.8 2.8M2.5 2.5l11 11"/></symbol>
+      <symbol id="i-users" viewBox="0 0 16 16"><circle cx="6" cy="5.5" r="2.5"/><path d="M1.5 13.5c.6-2.4 2.3-3.5 4.5-3.5s3.9 1.1 4.5 3.5M11.5 3.8a2.2 2.2 0 0 1 0 4.4M12 10.2c1.5.3 2.4 1.4 2.8 3.3"/></symbol>
+      <symbol id="i-share" viewBox="0 0 16 16"><circle cx="4" cy="8" r="2"/><circle cx="12" cy="3.5" r="2"/><circle cx="12" cy="12.5" r="2"/><path d="m5.8 7 4.4-2.5M5.8 9l4.4 2.5"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 16 16"><path d="M10.5 2.5l3 3-8 8h-3v-3zM9 4l3 3"/></symbol>
     </defs>
   </svg>
 
@@ -80,7 +83,7 @@
           <svg class="i" aria-hidden="true"><use href="#i-unlock"></use></svg><span>Unprotected</span></button>
         <div class="popover" id="unprotected-pop" role="note" hidden>
           <p><strong>This grid has no admin sign-in.</strong> Anyone who can open this page can release slots, reset failures and forget nodes.</p>
-          <p>To require sign-in, set <code class="mono">GRID_ADMIN_TOKEN</code> in the Grid UI's environment and restart it.</p>
+          <p>To require sign-in, set <code class="mono">GRID_OIDC_ISSUER</code> (single sign-on) or <code class="mono">GRID_ADMIN_TOKEN</code> in the Grid UI's environment and restart it.</p>
         </div>
       </div>
       <div class="pop-wrap">
@@ -99,6 +102,7 @@
         <li><a href="#/sessions" data-nav-view="sessions" title="Sessions (g s)"><svg class="i" aria-hidden="true"><use href="#i-sessions"></use></svg><span class="rail-label">Sessions</span><span class="nav-count mono" data-session-count hidden></span></a></li>
         <li><a href="#/access" data-nav-view="access" title="Access (g t)"><svg class="i" aria-hidden="true"><use href="#i-key"></use></svg><span class="rail-label">Access</span></a></li>
         <li><a href="#/mfa" data-nav-view="mfa" title="MFA &amp; sign-ins (g m)"><svg class="i" aria-hidden="true"><use href="#i-shield"></use></svg><span class="rail-label">MFA &amp; sign-ins</span></a></li>
+        <li data-admin-nav hidden><a href="#/admin" data-nav-view="admin" title="Admin (g u)"><svg class="i" aria-hidden="true"><use href="#i-users"></use></svg><span class="rail-label">Admin</span></a></li>
       </ul>
       <div class="rail-foot">
         <a class="rail-btn" href="#/connect" data-inspect="connect" data-id="grid" title="How checks connect to the grid"><svg class="i" aria-hidden="true"><use href="#i-link"></use></svg><span class="rail-label">Connect a check</span></a>
@@ -113,6 +117,7 @@
       <section id="view-sessions" class="view" aria-labelledby="sessions-h1" hidden></section>
       <section id="view-access" class="view" aria-labelledby="access-h1" hidden></section>
       <section id="view-mfa" class="view" aria-labelledby="mfa-h1" hidden></section>
+      <section id="view-admin" class="view" aria-labelledby="admin-h1" hidden></section>
     </main>
 
     <aside class="inspector" id="inspector" aria-labelledby="insp-title" hidden>
@@ -143,6 +148,7 @@
   <dialog id="confirm-dialog" class="sheet" aria-labelledby="confirm-title"></dialog>
   <dialog id="signin-dialog" class="sheet signin-sheet" aria-labelledby="signin-prompt-title"></dialog>
   <dialog id="palette" class="palette" aria-label="Jump to"></dialog>
+  <dialog id="access-sheet" class="sheet" aria-labelledby="access-sheet-title"></dialog>
 
   <dialog id="shortcuts-dialog" class="sheet" aria-labelledby="shortcuts-title">
     <div class="sheet-head"><h2 id="shortcuts-title">Keyboard shortcuts</h2>
@@ -159,13 +165,15 @@
         <label for="nt-name">Name</label>
         <input type="text" id="nt-name" maxlength="128" required autocomplete="off" placeholder="Build farm Windows hosts">
       </div>
-      <fieldset class="field">
+      <fieldset class="field" aria-describedby="nt-kind-hint">
         <legend>Kind</legend>
         <div class="choices">
           <label class="choice"><input type="radio" name="kind" value="agent" checked><span><strong>Agent</strong><small>Registers a node with the hub</small></span></label>
           <label class="choice"><input type="radio" name="kind" value="client"><span><strong>Client</strong><small>Lets checks open browser sessions</small></span></label>
         </div>
+        <p class="hint" id="nt-kind-hint" hidden></p>
       </fieldset>
+      <p class="hint field-note" id="nt-client-note" hidden>Checks using this token get the MFA secrets and saved sign-ins you can use, and lose them if you lose access.</p>
       <div class="field" id="nt-node-field">
         <label for="nt-node">Bind to node <span class="optional">optional</span></label>
         <input type="text" id="nt-node" class="mono" maxlength="128" list="node-names" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Any node" aria-describedby="nt-node-hint">
@@ -252,6 +260,12 @@
       </div>
     </form>
   </dialog>
+
+  <dialog id="share-dialog" class="sheet form-sheet" aria-labelledby="share-title"></dialog>
+  <dialog id="user-dialog" class="sheet form-sheet user-sheet" aria-labelledby="user-title"></dialog>
+  <dialog id="role-dialog" class="sheet form-sheet" aria-labelledby="role-title"></dialog>
+  <dialog id="group-dialog" class="sheet form-sheet" aria-labelledby="group-title"></dialog>
+  <dialog id="token-owner-dialog" class="sheet form-sheet" aria-labelledby="token-owner-title"></dialog>
 
   <div class="tip" id="tip" role="tooltip" hidden></div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

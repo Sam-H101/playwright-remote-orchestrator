@@ -48,7 +48,8 @@ def mysql(monkeypatch):
     monkeypatch.setattr(store, "DB_ENGINE", "mysql")
     monkeypatch.setattr(store, "_schema_attempted", False)
     monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
-    sql("DROP TABLE IF EXISTS savedSignins")
+    # The owner and share rows too: ids start over, and old rows would belong to the new sign-ins.
+    sql("DROP TABLE IF EXISTS savedSignins, itemOwners, itemShares")
 
 
 def from_threads(calls):

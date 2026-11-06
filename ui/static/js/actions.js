@@ -18,11 +18,13 @@ export async function ensureSignedIn(reason) {
 }
 
 // A control for an admin action. Signed out, it says so with a lock and an accessible name like
-// "Sign in to release"; it stays visible so people can see what is possible.
-export function adminButton({ label, verb, attrs, cls = "btn ghost small", danger = false, fk }) {
-  const locked = needsSignIn();
-  return html`<button type="button" class="${cls} ${danger ? "destructive" : ""} ${locked ? "locked" : ""}" ${attrs}
-    ${fk ? html`data-fk="${fk}"` : ""} ${locked ? html`aria-label="Sign in to ${verb}" title="Sign in to ${verb}"` : ""}>${locked ? icon("i-lock") : ""}${label}</button>`;
+// "Sign in to release"; it stays visible so people can see what is possible. Signed in with roles
+// that don't allow it, it's disabled and says that instead.
+export function adminButton({ label, verb, attrs, cls = "btn ghost small", danger = false, fk, permission = "grid.operate" }) {
+  const locked = needsSignIn(), barred = !locked && !auth.can(permission);
+  return html`<button type="button" class="${cls} ${danger ? "destructive" : ""} ${locked || barred ? "locked" : ""}" ${attrs}
+    ${fk ? html`data-fk="${fk}"` : ""} ${locked ? html`aria-label="Sign in to ${verb}" title="Sign in to ${verb}"` : ""}${barred
+      ? html` disabled aria-label="Your roles don't let you ${verb}" title="Your roles don't let you ${verb}"` : ""}>${locked || barred ? icon("i-lock") : ""}${label}</button>`;
 }
 
 async function run(url, body, done, expect) {

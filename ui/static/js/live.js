@@ -3,6 +3,7 @@
 // last 15 minutes in its first poll. The Recorder below is this page's copy of that buffer, merged
 // by event id. Against a server that doesn't record, the same diff() runs here instead, and the
 // page labels the history as its own. Views only see { data, events, recorder } through subscribe().
+import * as auth from "./auth.js";
 import { slotName, parseTime, runLength, plural, stateWord } from "./format.js";
 
 export const WINDOW_MS = 15 * 60 * 1000;
@@ -229,8 +230,10 @@ export class Recorder {
         fresh.push(e);
         continue;
       }
-      // The same change, told again: keep the better facts.
+      // The same change, told again: keep the better facts. Who did it may come as "" (to a reader who
+      // isn't signed in, or forgotten here), and a name is better.
       for (const k of Object.keys(e)) if (known[k] == null && e[k] != null) known[k] = e[k];
+      if (e.by && !known.by) known.by = e.by;
       if (known.approx && e.approx === false) Object.assign(known, { approx: false, start: e.start, dur: e.dur });
       if (e.kind === "admin" && known.kind !== "admin") Object.assign(known, { kind: "admin", by: e.by });
     }
@@ -284,6 +287,16 @@ export class Recorder {
     this.save();
   }
 
+  // Who took each action, where that's a person's name: gone once nobody is signed in here, as the
+  // server leaves it out for readers who aren't. "you" (this tab, without the server's recorder) stays.
+  // Returns whether anything went.
+  forgetWho() {
+    let gone = false;
+    for (const e of this.events) if (e.by && e.by !== "you") { e.by = ""; gone = true; }
+    if (gone) this.flush();
+    return gone;
+  }
+
   clear(now = Date.now()) {
     this.floor = now;
     this.events = [];
@@ -299,14 +312,25 @@ export class Recorder {
   }
 }
 
+// Where reading the grid needs sign-in (GRID_UI_READS), whether the session lets this page read it:
+// "signedout" or "forbidden" when it doesn't, so the poll would only be refused, else null. Until the
+// session is known it can't tell, and the first poll waits for it.
+function outOfReach() {
+  const a = auth.state();
+  if (!a.known || a.readsOpen) return null;
+  if (!a.signedIn) return "signedout";
+  return auth.can("grid.view") ? null : "forbidden";
+}
+
 // Polls /api/status every 1.5 s while visible (or the server's poll_ms), every 12 s while hidden,
 // immediately when the tab comes back or after an action. Never a held connection: the production
-// server has two sync workers and a stream would pin one.
+// server has two sync workers and a stream would pin one. Not at all while the session says the grid
+// is out of reach; then refused says why, and the views say so in place of the grid.
 export function createLive({ load, storage, visibleMs = 1500, hiddenMs = 12000 }) {
   const recorder = new Recorder(storage);
   const subs = new Set();
   const mine = { slots: new Map(), nodes: new Map() };
-  const s = { data: null, error: null, errorKind: null, lastOk: 0, skew: 0, paused: false, failures: 0, nextAt: 0, loading: false, cursor: 0 };
+  const s = { data: null, error: null, errorKind: null, lastOk: 0, skew: 0, paused: false, failures: 0, nextAt: 0, loading: false, cursor: 0, refused: null };
   let timer = null, inflight = null;
 
   const serverNow = () => Date.now() + s.skew;
@@ -329,16 +353,33 @@ export function createLive({ load, storage, visibleMs = 1500, hiddenMs = 12000 }
 
   function schedule() {
     clearTimeout(timer);
-    if (s.paused) return;
-    const base = document.hidden ? hiddenMs : visibleMs;
+    if (s.paused || outOfReach()) return;
+    // A refused poll (a session that ended between polls) tries again as slowly as a hidden tab does.
+    const base = document.hidden || s.refused ? hiddenMs : visibleMs;
     // Back off while the grid is unreachable, so the retry countdown is readable.
     const delay = s.error ? Math.min(15000, Math.max(base, 1500 * Math.pow(2, Math.min(s.failures, 4)))) : base;
     s.nextAt = Date.now() + delay;
     timer = setTimeout(poll, delay);
   }
 
+  // The grid is out of this page's reach: nothing of it stays on screen.
+  function refuse(why) {
+    const changed = s.refused !== why || s.data !== null || s.error !== null;
+    s.refused = why;
+    s.data = null;
+    s.error = s.errorKind = null;
+    s.failures = 0;
+    return changed;
+  }
+
   function poll() {
     if (inflight) return inflight;
+    const out = outOfReach();
+    if (out) {
+      clearTimeout(timer);
+      if (refuse(out)) emit([]);
+      return Promise.resolve();
+    }
     s.loading = true;
     inflight = (async () => {
       let events = [];
@@ -365,10 +406,18 @@ export function createLive({ load, storage, visibleMs = 1500, hiddenMs = 12000 }
         s.error = s.errorKind = null;
         s.failures = 0;
         s.lastOk = Date.now();
+        s.refused = null;
       } catch (err) {
-        s.error = err.message || String(err);
-        s.errorKind = err.kind || "network";
-        s.failures += 1;
+        if (err.kind === "refused") {
+          // The session ended, or lost its role, since the page last asked: ask again, which tells the
+          // rest of the page too.
+          if (s.refused !== err.body.refused) auth.refresh();
+          refuse(err.body.refused === "forbidden" ? "forbidden" : "signedout");
+        } else {
+          s.error = err.message || String(err);
+          s.errorKind = err.kind || "network";
+          s.failures += 1;
+        }
       } finally {
         s.loading = false;
         inflight = null;
@@ -388,14 +437,31 @@ export function createLive({ load, storage, visibleMs = 1500, hiddenMs = 12000 }
     get lastOk() { return s.lastOk; },
     get paused() { return s.paused; },
     get nextAt() { return s.nextAt; },
+    // "signedout" or "forbidden" while reading the grid needs a sign-in or a role this page lacks.
+    get refused() { return s.refused; },
     serverNow,
     subscribe(fn) { subs.add(fn); return () => subs.delete(fn); },
     start() {
       document.addEventListener("visibilitychange", () => {
+        // Roles may have changed while the tab was away: the session is asked again, now and then.
+        if (!document.hidden) auth.refresh(30000);
         if (!document.hidden && !s.paused) poll(); else schedule();
       });
       window.addEventListener("pagehide", () => recorder.flush());
-      return poll();
+      // Signed in or out, a role given or taken: the grid may have come into reach or gone out of it. A poll
+      // on its way was asked as whoever was signed in before, so it's decided again once that's in.
+      auth.onChange((a) => {
+        // With single sign-on, who took an action is someone's name, which nobody gets without signing in.
+        if (a.known && a.sso && !a.signedIn && recorder.forgetWho()) emit([]);
+        const decide = () => {
+          if (!s.paused || outOfReach()) poll();
+          else if (s.refused) { s.refused = null; emit([]); } // in reach again: it says so once resumed
+        };
+        if (inflight) inflight.then(decide); else decide();
+      });
+      // The first poll waits for the session (its answer comes as a change), which says whether this
+      // page may read the grid at all.
+      return auth.state().known ? poll() : Promise.resolve();
     },
     refresh() { return s.paused ? Promise.resolve() : poll(); },
     // A refresh the user asked for: runs even while paused.

@@ -5,10 +5,11 @@ import os
 import random
 import re
 import sqlite3
+import types
 
 import pytest
 
-from ui import app as grid_app, auth, demo, store
+from ui import app as grid_app, auth, demo, permissions, store
 
 STATIC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
 TEMPLATE = os.path.join(os.path.dirname(STATIC), "templates", "index.html")
@@ -58,15 +59,57 @@ def test_the_page_has_no_inline_script_or_style(client):
 def test_session_reports_sign_in_state(client, monkeypatch):
     r = client.get("/api/session")
     assert r.headers["Cache-Control"] == "no-store"
-    assert r.get_json() == {"signedIn": False, "name": None, "method": None, "adminConfigured": False, "providers": []}
+    assert r.get_json() == {"signedIn": False, "name": None, "method": None, "adminConfigured": False, "providers": [],
+                            "user": None, "permissions": ["grid.operate", "grid.view"], "roles": [], "admin": False,
+                            "readsOpen": True, "unavailable": False}
 
     monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
     body = client.get("/api/session").get_json()
-    assert body["adminConfigured"] is True and body["signedIn"] is False
+    assert body["adminConfigured"] is True and body["signedIn"] is False and body["permissions"] == []
     assert body["providers"] == [{"id": "token", "kind": "secret", "label": "Admin token"}]
     assert client.get("/api/session", headers={"X-Grid-Token": "wrong"}).get_json()["signedIn"] is False
     body = client.get("/api/session", headers={"X-Grid-Token": "s3cret"}).get_json()
     assert body["signedIn"] is True and body["name"] == "Admin" and body["method"] == "token"
+    assert body["permissions"] == sorted(permissions.ALL) and body["admin"] is True
+    assert (body["user"], body["roles"]) == (None, [])
+
+
+def test_signing_in_with_the_admin_token_is_recorded_at_most_once_an_hour(client, monkeypatch):
+    """Break-glass use shows in the audit log, without a row for every time the page asks who is signed in."""
+    monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
+    clock = [1000.0]
+    monkeypatch.setattr(grid_app, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def recorded():
+        with contextlib.closing(sqlite3.connect(store.SQLITE_PATH)) as con:
+            return con.execute("SELECT actorId, actorName, actorMethod, address FROM auditLog "
+                               "WHERE action = 'auth.breakglass' ORDER BY id").fetchall()
+
+    for headers in ({}, {"X-Grid-Token": "wrong"}, {"X-Grid-Token": "s3cret"}, {"X-Grid-Token": "s3cret"}):
+        client.get("/api/session", headers=headers)
+    assert recorded() == [(None, "Admin", "token", "127.0.0.1")]
+    client.get("/api/session", headers={"X-Grid-Token": "s3cret"}, environ_base={"REMOTE_ADDR": "10.0.0.9"})
+    clock[0] += 3599
+    client.get("/api/session", headers={"X-Grid-Token": "s3cret"})
+    assert recorded() == [(None, "Admin", "token", "127.0.0.1"), (None, "Admin", "token", "10.0.0.9")]
+    clock[0] += 1
+    client.get("/api/session", headers={"X-Grid-Token": "s3cret"})
+    assert len(recorded()) == 3
+
+
+def test_session_offers_single_sign_on_once_it_is_configured(client, monkeypatch):
+    """The admin token stays on offer beside it, and the grid needs sign-in even without the token."""
+    for name, value in (("GRID_OIDC_ISSUER", "https://login.example.com"), ("GRID_OIDC_CLIENT_ID", "grid-ui"),
+                        ("GRID_OIDC_CLIENT_SECRET", "s3cret-client"), ("GRID_UI_PUBLIC_URL", "https://grid.example.com/"),
+                        ("GRID_OIDC_LABEL", "Contoso")):
+        monkeypatch.setenv(name, value)
+    body = client.get("/api/session").get_json()
+    assert body["adminConfigured"] is True and body["readsOpen"] is False and body["permissions"] == []
+    assert body["providers"] == [{"id": "oidc", "kind": "redirect", "label": "Contoso", "start": "auth/login"}]
+    monkeypatch.setattr(grid_app, "ADMIN_TOKEN", "s3cret")
+    assert client.get("/api/session").get_json()["providers"] == [
+        {"id": "token", "kind": "secret", "label": "Admin token"},
+        {"id": "oidc", "kind": "redirect", "label": "Contoso", "start": "auth/login"}]
 
 
 def test_the_one_gate_answers_exactly_as_before(client, monkeypatch):
