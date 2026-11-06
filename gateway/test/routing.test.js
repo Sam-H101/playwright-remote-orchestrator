@@ -36,7 +36,7 @@ async function fakeNode(url, name, { slots = 1, browsers = ['chromium'], playwri
       return ws.send(JSON.stringify({ type: 'open-failed', id: msg.id, message, status: oldAgent ? undefined : node.failStatus }));
     }
     if (node.mode === 'mute') return;
-    const channel = new WebSocket(`${url}/agent/data/${msg.id}`);
+    const channel = new WebSocket(`${url}/agent/data/${encodeURIComponent(msg.id)}`);
     h.cleanups.push(async () => channel.terminate());
     channel.on('error', () => {});
     channel.on('message', (d, isBinary) => {

@@ -166,9 +166,17 @@ def _log_db_error(error):
         log.warning("database unavailable: %s", error)
 
 
+def _db_error_response(error, status):
+    # ?soft=1 (the page's own status polls): the outage as data, not an HTTP error the browser logs every
+    # few seconds. Without it, and on every other route, the 503 (or 403) it has always been.
+    if request.endpoint == "status" and request.args.get("soft") == "1":
+        return _private(jsonify(error=_db_error_text(error), unavailable=True))
+    return jsonify(error=_db_error_text(error)), status
+
+
 @app.errorhandler(store.DatabaseUnavailable)
 def database_unavailable(error):
-    return jsonify(error=_db_error_text(error)), 503
+    return _db_error_response(error, 503)
 
 
 @app.errorhandler(store.TokensUnavailable)
@@ -178,7 +186,7 @@ def tokens_unavailable(error):
 
 @app.errorhandler(store.DatabasePermissionDenied)
 def database_permission_denied(error):
-    return jsonify(error=_db_error_text(error)), 403
+    return _db_error_response(error, 403)
 
 
 @app.errorhandler(store.MfaUnavailable)
@@ -212,14 +220,7 @@ def index():
 @app.get("/api/status")
 def status():
     RECORDER.ensure_running()
-    try:
-        data, _ = RECORDER.observe()
-    except store.DatabaseUnavailable as e:
-        # ?soft=1 (the page's own polls): the outage as data, not an HTTP error the browser logs every
-        # few seconds. Without it the answer is the 503 (or 403) it has always been.
-        if request.args.get("soft") != "1":
-            raise
-        return _private(jsonify(error=_db_error_text(e), unavailable=True))
+    data, _ = RECORDER.observe()  # an outage goes to _db_error_response, which answers ?soft=1 with data
     data = dict(data)  # the recorder keeps the snapshot it was given
     data["grid_name"] = GRID_NAME or None
     data["public_gateway_url"] = PUBLIC_GATEWAY_URL or None
@@ -326,6 +327,11 @@ def forget_node():
     return jsonify(error="{} has {} slot(s) in use. Release them first.".format(host, count)), 409
 
 
+@app.errorhandler(store.InvalidToken)
+def invalid_token(error):
+    return jsonify(error=str(error)), 400
+
+
 @app.get("/api/tokens")
 @auth.admin_required(refuse_when_unconfigured=True)
 def list_tokens():
@@ -343,10 +349,7 @@ def create_token():
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify(error="Send the token's settings as a JSON object."), 400
-    try:
-        token = store.create_token(body.get("name"), body.get("kind"), body.get("nodeName"), body.get("expiresInDays"))
-    except store.InvalidToken as e:
-        return jsonify(error=str(e)), 400
+    token = store.create_token(body.get("name"), body.get("kind"), body.get("nodeName"), body.get("expiresInDays"))
     return _private(jsonify(token), 201)
 
 
@@ -383,7 +386,13 @@ def _mfa_never_cached(response):
     return response
 
 
-def _mfa_busy(error):
+@app.errorhandler(mfa.InvalidSecret)
+def invalid_secret(error):
+    return _private(jsonify(error=str(error)), 400)
+
+
+@app.errorhandler(store.MfaBusy)
+def mfa_busy(error):
     response = jsonify(error=str(error), retry_after_s=round(error.retry_after_s, 1))
     response.headers["Retry-After"] = str(max(1, int(error.retry_after_s + 0.999)))
     return _private(response, 429)
@@ -405,44 +414,39 @@ def create_mfa():
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify(error="Send the secret as a JSON object."), 400
-    try:
-        secret = store.create_mfa(body.get("name"), body.get("secret"), body.get("issuer"), body.get("account"),
-                                  body.get("algorithm"), body.get("digits"), body.get("period"))
-    except mfa.InvalidSecret as e:
-        return _private(jsonify(error=str(e)), 400)
-    log.info("mfa secret %r added by %s", secret["name"], g.principal.name if g.principal else "an open grid")
+    secret = store.create_mfa(body.get("name"), body.get("secret"), body.get("issuer"), body.get("account"),
+                              body.get("algorithm"), body.get("digits"), body.get("period"))
+    # The name as sent (create_mfa checked it): code scanning takes anything create_mfa returns for a password.
+    log.info("mfa secret %r added by %s", body["name"].strip(), g.principal.name if g.principal else "an open grid")
     return _private(jsonify(secret), 201)
 
 
-@app.post("/api/mfa/<int:secret_id>/delete")
+@app.post("/api/mfa/<int:entry_id>/delete")
 @auth.admin_required(refuse_when_unconfigured=True)
-def delete_mfa(secret_id):
-    if not store.delete_mfa(secret_id):
-        return jsonify(error="There is no MFA secret {}.".format(secret_id)), 404
-    log.info("mfa secret %d deleted by %s", secret_id, g.principal.name if g.principal else "an open grid")
-    return _private(jsonify(deleted=True, id=secret_id))
+def delete_mfa(entry_id):
+    if not store.delete_mfa(entry_id):
+        return jsonify(error="There is no MFA secret {}.".format(entry_id)), 404
+    log.info("mfa secret %d deleted by %s", entry_id, g.principal.name if g.principal else "an open grid")
+    return _private(jsonify(deleted=True, id=entry_id))
 
 
-@app.get("/api/mfa/<int:secret_id>/code")
+@app.get("/api/mfa/<int:entry_id>/code")
 @auth.admin_required(refuse_when_unconfigured=True)
-def peek_mfa_code(secret_id):
+def peek_mfa_code(entry_id):
     """The current code, for an admin to read; hands nothing out."""
-    code = store.peek_mfa_code(secret_id)
+    code = store.peek_mfa_code(entry_id)
     if code is None:
-        return jsonify(error="There is no MFA secret {}.".format(secret_id)), 404
+        return jsonify(error="There is no MFA secret {}.".format(entry_id)), 404
     return _private(jsonify(code))
 
 
-@app.post("/api/mfa/<int:secret_id>/use")
+@app.post("/api/mfa/<int:entry_id>/use")
 @auth.admin_required(refuse_when_unconfigured=True)
-def use_mfa_code(secret_id):
+def use_mfa_code(entry_id):
     """A code for an admin to type somewhere, handed out like a check's so no check gets the same one."""
-    try:
-        code = store.issue_mfa_code(g.principal.name if g.principal else "Admin", secret_id=secret_id, label="Grid UI")
-    except store.MfaBusy as e:
-        return _mfa_busy(e)
+    code = store.issue_mfa_code(g.principal.name if g.principal else "Admin", secret_id=entry_id, label="Grid UI")
     if code is None:
-        return jsonify(error="There is no MFA secret {}.".format(secret_id)), 404
+        return jsonify(error="There is no MFA secret {}.".format(entry_id)), 404
     return _private(jsonify(code))
 
 
@@ -459,13 +463,8 @@ def check_mfa_code():
     min_valid = body.get("minValidS")
     if min_valid is not None and (isinstance(min_valid, bool) or not isinstance(min_valid, (int, float)) or min_valid < 0):
         return _private(jsonify(error="minValidS is a number of seconds, 0 or more."), 400)
-    try:
-        code = store.issue_mfa_code(principal.name, name=body["name"].strip(), label=body.get("label"),
-                                    min_valid_s=min_valid)
-    except mfa.InvalidSecret as e:
-        return _private(jsonify(error=str(e)), 400)
-    except store.MfaBusy as e:
-        return _mfa_busy(e)
+    code = store.issue_mfa_code(principal.name, name=body["name"].strip(), label=body.get("label"),
+                                min_valid_s=min_valid)
     if code is None:
         return _private(jsonify(error="There is no MFA secret called {!r}.".format(body["name"].strip())), 404)
     return _private(jsonify(code))

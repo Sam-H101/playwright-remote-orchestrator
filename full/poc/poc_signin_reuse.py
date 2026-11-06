@@ -608,7 +608,6 @@ class Round:
 
     def _add_codes_passwords(self, idp):
         self.totals["codes"] += idp.counts["codes ok"]
-        self.totals["passwords"] += idp.counts["passwords"]
         self.totals["bad passwords"] += idp.counts["bad passwords"]
 
 
@@ -659,9 +658,8 @@ def test_signin_reuse(grid_browser, budget, capture):
     assert not bad_bodies, "code requests carried more than a code: {}".format(bad_bodies)
     assert totals["bad passwords"] == 0, "a password was refused by the fake IdP"
 
-    print("poc_signin_reuse: {} rounds in {:.0f}s; {} reuses and {} sign-ins ({} MFA codes, {} passwords from "
-          "the Grid UI secret {!r}, saved sign-in {!r}); {} saves, {} states rejected, {} silent renewals, "
-          "{} lease waits, {} leases released, {} refresh-saves".format(
-              rounds, budget.elapsed(), totals["reuses"], totals["signins"], totals["codes"], totals["passwords"],
-              SECRET_NAME, NAME, totals["saves"], totals["rejected"], totals["silent"], totals["waits"],
-              totals["released"], totals["refreshes"]))
+    print("poc_signin_reuse: {} rounds in {:.0f}s; {} reuses and {} sign-ins ({} MFA codes from the Grid UI, "
+          "saved sign-in {!r}); {} saves, {} states rejected, {} silent renewals, {} lease waits, "
+          "{} leases released, {} refresh-saves".format(
+              rounds, budget.elapsed(), totals["reuses"], totals["signins"], totals["codes"], NAME, totals["saves"],
+              totals["rejected"], totals["silent"], totals["waits"], totals["released"], totals["refreshes"]))

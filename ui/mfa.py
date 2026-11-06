@@ -24,7 +24,7 @@ DIGITS = (6, 7, 8)
 MIN_PERIOD_S, MAX_PERIOD_S = 10, 300
 # 80 bits is what many sites hand out (16 base32 characters); RFC 4226 asks for at least 128.
 MIN_SEED_BYTES, MAX_SEED_BYTES = 10, 128
-_BASE32 = re.compile(r"[A-Z2-7]+\Z")
+_BASE32 = re.compile(r"[A-Z2-7]+")
 _NONCE_BYTES = 12
 # What GRID_SECRETS_KEY encrypts: kind -> (the HKDF info its key is derived with, the prefix of the associated
 # data, what the key is needed for). A key per kind: a ciphertext of one kind never decrypts as another.
@@ -114,7 +114,7 @@ def normalize_seed(seed):
     if not isinstance(seed, str):
         raise InvalidSecret("Give the secret's seed as text (base32), or an otpauth:// URI.")
     canonical = re.sub(r"[\s=-]", "", seed).upper()
-    if not canonical or not _BASE32.match(canonical):
+    if not canonical or not _BASE32.fullmatch(canonical):
         raise InvalidSecret("The seed must be base32: the letters A-Z and the digits 2-7.")
     size = len(seed_bytes(canonical))
     if not MIN_SEED_BYTES <= size <= MAX_SEED_BYTES:
