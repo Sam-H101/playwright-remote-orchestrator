@@ -12,7 +12,7 @@ ENV LANG=C.UTF-8 \
 # install into the system Python.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 curl git openssh-client gpg \
-        ca-certificates libnss3-tools p11-kit libnss3 \
+        ca-certificates libnss3-tools p11-kit libnss3 libatomic1 \
     && rm /usr/lib/python3.12/EXTERNALLY-MANAGED \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
     && curl -fsSL https://bootstrap.pypa.io/get-pip.py | python - --no-cache-dir \
@@ -20,7 +20,8 @@ RUN apt-get update \
     && useradd --create-home --shell /bin/bash pwuser
 
 # Playwright and its browsers, in a layer only a new pin rebuilds. The browser folders are open to every
-# user, as in Playwright's image. constraints.txt keeps the requirements below from moving Playwright.
+# user, as in Playwright's image. From 1.65 the node bundled with the Python package needs libatomic1 (above),
+# which `install --with-deps` can't add before that node runs. constraints.txt keeps the requirements below from moving Playwright.
 COPY runner/playwright/package.json /tmp/playwright/package.json
 RUN v=$(python -c "import json; print(json.load(open('/tmp/playwright/package.json'))['dependencies']['playwright-core'])") \
     && { python -m pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org \
