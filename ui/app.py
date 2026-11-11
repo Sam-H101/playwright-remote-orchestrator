@@ -15,10 +15,14 @@ import urllib.parse
 
 from flask import Flask, abort, g, jsonify, redirect, render_template, request
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.serving import WSGIRequestHandler
 
-from . import accounts, auth, mfa, oidc, permissions, recorder, store
+from . import accounts, auth, logs, mfa, oidc, permissions, recorder, store
 
-log = logging.getLogger(__name__)
+# Before anything below can log: a setting that is wrong is warned about as this module is read.
+logs.configure()
+# By name: run as python -m ui.app, this module is __main__.
+log = logging.getLogger("ui.app")
 
 # The Windows registry can map .js to text/plain; with nosniff the browser would then refuse the modules.
 mimetypes.add_type("text/javascript", ".js")
@@ -56,6 +60,19 @@ def _proxy_hops():
 # else is taken from forwarded headers: single sign-on's addresses and cookie flags come from GRID_UI_PUBLIC_URL.
 PROXY_HOPS = _proxy_hops()
 
+
+def _access_log():
+    text = (os.environ.get("GRID_UI_ACCESS_LOG") or "0").strip()
+    if text in ("0", "1"):
+        return text == "1"
+    log.warning("GRID_UI_ACCESS_LOG is 1 for a line in the log per request, or 0 for none, not %r: taking 0", text)
+    return False
+
+
+# Whether every request gets a line in the log. Not unless asked for: an open page polls /api/status every
+# POLL_MS.
+ACCESS_LOG = _access_log()
+
 # Where checks ask for MFA codes and saved sign-ins (with their client token rather than the admin's).
 CHECK_CODE_PATH = "/api/mfa/code"
 CHECK_CHECKOUT_PATH = "/api/signins/checkout"
@@ -87,7 +104,59 @@ class _TrustedProxies:
         return self.wsgi_app(environ, start_response)
 
 
-app.wsgi_app = _TrustedProxies(app.wsgi_app)
+class _AccessLog:
+    """The app with a line in the log per request while ACCESS_LOG is on, written once the answer is out: the
+    method, the path, the status, how long it took and the client's address. Never the query string (the sign-in
+    callback's carries the authorization code and the state), nor anything from headers, cookies or bodies. Reads
+    ACCESS_LOG on each request, so a test can change it."""
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        if not ACCESS_LOG:
+            return self.wsgi_app(environ, start_response)
+        started = time.monotonic()
+        answered = [0]
+
+        def start(status, headers, exc_info=None):
+            answered[0] = int(status[:3])
+            return start_response(status, headers, exc_info)
+
+        def done():
+            # PATH_INFO is the path decoded: written percent-encoded again, it has no space and no "?" of its own.
+            path = urllib.parse.quote(environ.get("PATH_INFO", "").encode("latin-1", "replace"))
+            logs.access(environ.get("REQUEST_METHOD", "-"), path, answered[0], time.monotonic() - started,
+                        environ.get("REMOTE_ADDR") or "-")
+
+        return _then(self.wsgi_app(environ, start), done)
+
+
+def _then(parts, done):
+    """An answer's parts, then done(): once the server has taken the last of them, or closes or drops the rest.
+    Not left to close() alone: werkzeug's development server closes nothing once the client has reset the
+    connection, which a client does that hangs up without reading the whole answer."""
+    try:
+        for part in parts:
+            yield part
+    finally:
+        try:
+            if hasattr(parts, "close"):
+                parts.close()
+        finally:
+            done()
+
+
+class _DevServerRequests(WSGIRequestHandler):
+    """python -m ui.app without werkzeug's own line per request, which no setting turns off and which has the
+    query string in it. _AccessLog writes the request log there too."""
+
+    def log_request(self, code="-", size="-"):
+        pass
+
+
+# The request log inside: it gets the address the proxies were asked from.
+app.wsgi_app = _TrustedProxies(_AccessLog(app.wsgi_app))
 
 # One per process. Every status poll feeds it the snapshot it reads anyway; a background thread
 # (GRID_RECORDER_INTERVAL seconds, 0 to turn it off) keeps it going while no page is open.
@@ -530,6 +599,18 @@ def invalid_token(error):
 TOKEN_PERMISSIONS = ("tokens.own", "tokens.agents", "tokens.all")
 # What making each kind of token needs.
 TOKEN_KIND_PERMISSIONS = {"client": "tokens.own", "agent": "tokens.agents"}
+# What each route that makes a token reads from its body. A key that is not here is refused, never ignored:
+# an ignored key is how a token loses its limit.
+TOKEN_SETTINGS = ("name", "kind", "nodeName", "expiresInDays")
+SCOPED_TOKEN_SETTINGS = ("name", "expiresInDays", "scope")
+
+
+def _unknown_setting(body, known):
+    """The 400 for the first key of body that the route doesn't know, or None."""
+    for key in body:
+        if key not in known:
+            return jsonify(error="There is no token setting {!r} here.".format(str(key)[:64])), 400
+    return None
 
 
 @app.get("/api/tokens")
@@ -553,8 +634,34 @@ def create_token():
     kind = body.get("kind")
     if isinstance(kind, str) and kind in TOKEN_KIND_PERMISSIONS:
         auth.require(TOKEN_KIND_PERMISSIONS[kind])
+    if "scope" in body:  # also "scope": null. An older Grid UI would ignore it, so it is never taken here
+        return jsonify(error="A token with a scope is made with POST /api/tokens/scoped."), 400
+    refused = _unknown_setting(body, TOKEN_SETTINGS)
+    if refused:
+        return refused
     token = store.create_token(body.get("name"), kind, body.get("nodeName"), body.get("expiresInDays"),
                                owner_id=g.principal.user_id, access=auth.access(g.principal), actor=g.actor)
+    return _private(jsonify(accounts.annotate("token", [token])[0]), 201)
+
+
+@app.post("/api/tokens/scoped")
+@auth.permission_required("tokens.own", refuse_when_unconfigured=True)
+def create_scoped_token():
+    """Make a client token with a scope. It has an address of its own because a Grid UI from before token
+    scopes ignores a scope sent to POST /api/tokens and makes a token with no limit; it has no route here,
+    so it answers 404 and makes nothing. A body without a scope is refused, never answered with such a token."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="Send the token's settings as a JSON object."), 400
+    refused = _unknown_setting(body, SCOPED_TOKEN_SETTINGS)
+    if refused:
+        return refused
+    if body.get("scope") is None:
+        return jsonify(error="Send scope: the list of scope ids the token is limited to. "
+                             "A token with no limit is made with POST /api/tokens."), 400
+    token = store.create_token(body.get("name"), "client", None, body.get("expiresInDays"),
+                               owner_id=g.principal.user_id, access=auth.access(g.principal), actor=g.actor,
+                               scope=body["scope"])
     return _private(jsonify(accounts.annotate("token", [token])[0]), 201)
 
 
@@ -742,13 +849,14 @@ def start_sign_in():
     if not _start_allowed(request.remote_addr or "?"):
         return _back_to_page(return_to, "busy")
     try:
-        oidc.discovery()
+        oidc.check_client()
     except (oidc.Unavailable, oidc.HttpRefused) as e:
         log.warning("couldn't start a sign-in: %s", e)
         return _back_to_page(return_to, "unavailable")
     except oidc.Misconfigured as e:
         log.warning("couldn't start a sign-in: %s", e)
         return _back_to_page(return_to, "misconfigured")
+    oidc.problem()  # discovery is held now: logs the plain-http warning (once) before anyone is sent off
     login = oidc.new_login(request.cookies.get(oidc.cookie_names().login))
     try:
         accounts.start_login(store.token_hash(login.browser), store.token_hash(login.state), login.nonce,
@@ -781,14 +889,14 @@ def _redeem(login):
     try:
         return oidc.redeem(request.args["code"], login["verifier"]), None
     except oidc.HttpRefused as e:
-        # Only the status and the OAuth error code: nothing else of the answer is kept.
-        log.warning("the identity provider's token endpoint refused a sign-in's code: HTTP %d %s", e.status,
-                    e.error or "")
+        # Only the status, the OAuth error code and the provider's error numbers: nothing else of the answer is kept.
+        client = e.status in (400, 401) and e.error in ("invalid_client", "unauthorized_client")
+        hint = oidc.refusal_hint(e.codes, oidc.hint_method() if client else None)
+        log.warning("the identity provider's token endpoint refused a sign-in's code: %s%s", e,
+                    ". " + hint if hint else "")
         if e.status >= 500:
             return None, "unavailable"
-        if e.status in (400, 401) and e.error in ("invalid_client", "unauthorized_client"):
-            return None, "misconfigured"
-        return None, "failed"
+        return None, "misconfigured" if client else "failed"
     except oidc.Unavailable as e:
         log.warning("couldn't redeem a sign-in's code: %s", e)
         return None, "unavailable"
@@ -1161,11 +1269,17 @@ def admin_audit():
 @app.get("/api/admin/sign-in")
 @_people_gate("users.view")
 def admin_sign_in():
-    """Single sign-on's settings as the Grid UI reads them, and what is wrong with them: never the client secret."""
+    """Single sign-on's settings as the Grid UI reads them, and what is wrong with them or between them and the
+    provider: never the client secret, the platform's token or IDENTITY_HEADER."""
     s = oidc.settings()
+    token = oidc.federated_token_facts()
     return _private(jsonify(
-        configured=oidc.configured(), problem=auth.sign_in_problem(), label=s.label, issuer=s.issuer or None,
-        clientId=s.client_id or None, clientAuth=s.client_auth,
+        configured=oidc.configured(),
+        problem=auth.sign_in_problem() or (token or {}).get("problem") or oidc.provider_problem(),
+        warning=oidc.plain_http_warning(), label=s.label,
+        issuer=s.issuer or None, clientId=s.client_id or None, clientAuth=s.client_auth,
+        clientMethod=oidc.client_method(), clientToken=token,
+        platformTokenUnused=oidc.platform_token_unused(),
         redirectUri=oidc.redirect_uri() if s.public_url else None, scopes=list(oidc.SCOPES + s.scopes),
         groupsClaims=list(s.groups_claims), admins=accounts.named_admins(),
         session={"hours": s.session_hours, "idleMinutes": s.idle_minutes}, readsOpen=reads_open(),
@@ -1270,7 +1384,7 @@ def check_mfa_code():
     The answer's waitS is how long to wait before typing the code (when it comes from the next window)
     and validForS how long it works from now. A secret the token's owner may not use is refused with
     not_shared."""
-    principal = auth.check_principal(accounts.client_token_access, "mfa.use")
+    principal = auth.check_principal(accounts.client_token_access, "mfa.use", "mfa.use")
     body = request.get_json(silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("name"), str) or not body["name"].strip():
         return _private(jsonify(error='Send {"name": "<secret name>"} as JSON.'), 400)
@@ -1334,7 +1448,7 @@ def _check_signin_request():
     """(principal, body) of a check's sign-in request; a 401/429 for a missing or wrong client token, 403 for one
     whose owner may not use sign-ins, 413 for a body over SIGNIN_MAX_BODY_BYTES, 400 for one that isn't a JSON
     object."""
-    principal = auth.check_principal(accounts.client_token_access, "signins.use")
+    principal = auth.check_principal(accounts.client_token_access, "signins.use", "signins.use")
     # By its Content-Length before it is read; a chunked one, by what MAX_CONTENT_LENGTH let through.
     limit = store.SIGNIN_MAX_BODY_BYTES
     if (request.content_length or 0) > limit or len(request.get_data()) > limit:
@@ -1389,11 +1503,17 @@ def checkout_signin():
     "rejectedVersion"?, "id"?, "leaseS"?}; the answer's status is "saved" (with the state), "sign-in" (with a
     lease token) or "wait" (with retryAfterS). rejectedVersion is the version of a state the site refused,
     and id the id it came with. A sign-in the token's owner may not use is refused with not_shared, and one
-    shared with them that has nothing usable saved with owner_signs_in: only its owner's checks sign in for it."""
+    shared with them that has nothing usable saved with owner_signs_in: only its owner's checks sign in for it.
+    A name nobody added is refused with out_of_scope when the token's scope leaves out adding sign-ins."""
     principal, body = _check_signin_request()
     answer = store.checkout_signin(principal.name, body.get("name"), body.get("rejectedVersion"), body.get("leaseS"),
-                                   body.get("id"), access=auth.access(principal), actor=auth.actor(principal))
+                                   body.get("id"), access=auth.access(principal), actor=auth.actor(principal),
+                                   may_add=auth.in_scope(principal, "signins.add"))
     if answer["status"] == "missing":  # a name nobody added, and this check may not add names
+        if not auth.in_scope(principal, "signins.add"):
+            return _private(auth.out_of_scope("signins.add", (
+                "There is no saved sign-in called {!r}, and this client token's scope doesn't include "
+                "“Add saved sign-ins”, so it can't start one.").format(body["name"].strip())), 403)
         return _no_signin(body["name"])
     if answer["status"] == "owner-signs-in":
         return _private(jsonify(error="Nothing usable is saved for {!r}, and only its owner's checks may sign in for "
@@ -1526,4 +1646,5 @@ def give_token(token_id):
 
 
 if __name__ == "__main__":
-    app.run(host=os.environ.get("GRID_UI_HOST", "0.0.0.0"), port=int(os.environ.get("GRID_UI_PORT", "4444")))
+    app.run(host=os.environ.get("GRID_UI_HOST", "0.0.0.0"), port=int(os.environ.get("GRID_UI_PORT", "4444")),
+            request_handler=_DevServerRequests)

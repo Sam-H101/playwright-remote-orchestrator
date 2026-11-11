@@ -2,12 +2,19 @@
 import contextlib
 import datetime
 import hashlib
+import html.parser
+import json
+import os
 import re
+import secrets
 import sqlite3
 
 import pytest
+import werkzeug.exceptions
+import werkzeug.routing
 
-from ui import app as grid_app, demo, store
+from ui import app as grid_app, demo, permissions, store
+from ui.tests.test_accounts import add_role, make_user, oidc_on, sign_in_as
 
 ADMIN = {"X-Grid-Token": "s3cret"}
 
@@ -315,3 +322,405 @@ def test_token_actions_only_from_the_grid_page(db, monkeypatch):
     r = client.post("/api/tokens", base_url="http://127.0.0.1:4444", json={"name": "x", "kind": "client"},
                     headers=dict(ADMIN, Origin="http://127.0.0.1:4444", **{"Sec-Fetch-Site": "same-origin"}))
     assert r.status_code == 201
+
+
+# ---- scopes ------------------------------------------------------------------------
+#
+# A made-up token and what is kept for it: its sha256, and the scoped form, which is "scoped:" and the first 57
+# characters of that.
+T = "pwgc_" + "A" * 43
+T_PLAIN = "1f0bc52f7fa82946861c65a388c72cfdd15561d997682cee0eba9fa2becc4bd0"
+T_SCOPED = "scoped:1f0bc52f7fa82946861c65a388c72cfdd15561d997682cee0eba9fa2b"
+NOT_A_LIST = "Send scope as a list of scope ids, or leave it out for no limit."
+NOTHING_PICKED = "Pick at least one thing the token may do, or leave scope out for no limit."
+ADD_NEEDS_USE = ("A scope with “Add saved sign-ins” needs “Use saved sign-ins” too: a check that adds a sign-in "
+                 "then uses it.")
+NO_SCOPE_SENT = ("Send scope: the list of scope ids the token is limited to. A token with no limit is made with "
+                 "POST /api/tokens.")
+SCOPED_ELSEWHERE = "A token with a scope is made with POST /api/tokens/scoped."
+
+
+def scoped(client, body, headers=ADMIN):
+    return client.post("/api/tokens/scoped", json=body, headers=headers)
+
+
+def add_scoped_row(path, name, scope, plain=False):
+    """A client token's row written straight to the table: in the scoped form unless plain, with that scope
+    column (None: NULL). Returns its id."""
+    value = "pwgc_" + name
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
+        return con.execute(
+            "INSERT INTO accessTokens (name, kind, tokenHash, prefix, createdAt, scope) VALUES (?, 'client', ?, ?, ?, ?)",
+            (name, store.token_hash(value) if plain else store.scoped_token_hash(value), value[:12], ts(3600),
+             scope)).lastrowid
+
+
+def token_count(path):
+    return run(path, "SELECT COUNT(*) FROM accessTokens")[0][0]
+
+
+def audit_details(path):
+    return [(action, name, None if details is None else json.loads(details)) for action, name, details in
+            run(path, "SELECT action, targetName, details FROM auditLog ORDER BY id")]
+
+
+def unknown_setting(key):
+    return "There is no token setting {!r} here.".format(key)
+
+
+# What a Grid UI from before scopes does with a bearer token and which token routes it has, kept as it was
+# released (commit d05b719) and never updated: the tests below run it against what this version stores.
+RELEASED_LOOKUP = "SELECT id FROM accessTokens WHERE tokenHash = ? AND kind = 'client'"
+RELEASED_TOKEN_RULES = [("/api/tokens", ["GET", "POST"]), ("/api/tokens/<int:token_id>/revoke", ["POST"]),
+                        ("/api/tokens/<int:token_id>/delete", ["POST"]), ("/api/tokens/<int:token_id>/owner", ["POST"])]
+
+
+def released_lookup(path, bearer):
+    return run(path, RELEASED_LOOKUP, (hashlib.sha256(bearer.encode()).hexdigest(),))
+
+
+def test_a_grid_ui_from_before_scopes_finds_no_row_for_a_scoped_token(db):
+    """Whatever it is sent: the token, or the token with scoped: put in front, once or twice. So a rolled-back
+    Grid UI turns a scoped token away; it never takes it for one with no limit."""
+    limited = store.create_token("limited", "client", scope=["grid.view", "mfa.use"])
+    plain = store.create_token("plain", "client")
+    add_scoped_row(db, "A" * 43, "grid.view")  # T, whose hashes are written out above
+    for token in (limited["token"], T):
+        for bearer in (token, "scoped:" + token, "scoped:scoped:" + token):
+            assert released_lookup(db, bearer) == [], bearer[:-43]
+    assert released_lookup(db, plain["token"]) == [(plain["id"],)]  # the query is the right one
+    assert token_count(db) == 3
+
+
+def test_a_scoped_tokens_stored_form_is_not_a_sha256(db):
+    limited = store.create_token("limited", "client", scope=["sessions.open"])
+    plain = store.create_token("plain", "client")
+    ((stored,),) = run(db, "SELECT tokenHash FROM accessTokens WHERE id = ?", (limited["id"],))
+    assert len(stored) == 64 and stored.startswith("scoped:")
+    assert not re.fullmatch(r"[0-9a-f]{64}", stored)
+    ((stored,),) = run(db, "SELECT tokenHash FROM accessTokens WHERE id = ?", (plain["id"],))
+    assert re.fullmatch(r"[0-9a-f]{64}", stored)
+
+
+def test_the_scoped_form_is_part_of_the_plain_hash():
+    plain = hashlib.sha256(T.encode()).hexdigest()
+    assert store.token_hash(T) == plain == T_PLAIN
+    assert store.scoped_token_hash(T) == T_SCOPED
+    assert store.scoped_token_hash(T) == "scoped:" + store.token_hash(T)[:57] == "scoped:" + plain[:57]
+    assert len(T_SCOPED) == 64
+    # What software from before scopes computes for the token with scoped: in front is something else again.
+    old = hashlib.sha256(("scoped:" + T).encode()).hexdigest()
+    assert old == "c9795951395e62fd4872f788f64603b879af3dcdb0954109b0d77aad5eeabd7a"
+    assert T_SCOPED not in (old, hashlib.sha256(("scoped:scoped:" + T).encode()).hexdigest())
+
+
+def test_a_grid_ui_from_before_scopes_has_no_route_that_makes_a_scoped_token():
+    """It answers 404 and makes nothing: a scope sent to it can't come back as a token with no limit."""
+    released = werkzeug.routing.Map([werkzeug.routing.Rule(rule, methods=methods, endpoint=rule)
+                                     for rule, methods in RELEASED_TOKEN_RULES]).bind("localhost")
+    assert released.match("/api/tokens", method="POST") == ("/api/tokens", {})
+    assert released.match("/api/tokens/7/revoke", method="POST")[1] == {"token_id": 7}
+    with pytest.raises(werkzeug.exceptions.NotFound):
+        released.match("/api/tokens/scoped", method="POST")
+    assert grid_app.app.url_map.bind("localhost").match("/api/tokens/scoped", method="POST") == (
+        "create_scoped_token", {})
+
+
+def test_a_token_made_without_a_scope_is_stored_and_listed_as_before(db):
+    client = grid_app.app.test_client()
+    r = client.post("/api/tokens", json={"name": "checks", "kind": "client", "expiresInDays": 7}, headers=ADMIN)
+    made = r.get_json()
+    assert r.status_code == 201 and made["scope"] is None and "scopeLost" not in made
+    assert run(db, "SELECT tokenHash, scope FROM accessTokens") == [
+        (hashlib.sha256(made["token"].encode()).hexdigest(), None)]
+    listed = by_name(client.get("/api/tokens", headers=ADMIN).get_json())["checks"]
+    assert listed["scope"] is None and "scopeLost" not in listed
+    agent = store.create_token("farm", "agent")
+    assert agent["scope"] is None and by_name(store.list_tokens())["farm"]["scope"] is None
+    assert run(db, "SELECT tokenHash, scope FROM accessTokens WHERE id = ?", (agent["id"],)) == [
+        (hashlib.sha256(agent["token"].encode()).hexdigest(), None)]
+
+
+def test_a_scoped_token_is_stored_in_the_scoped_form_with_its_ids_sorted(db):
+    client = grid_app.app.test_client()
+    r = scoped(client, {"name": "limited", "scope": ["signins.use", "grid.view", "sessions.open", "grid.view"],
+                        "expiresInDays": 30})
+    made = r.get_json()
+    assert r.status_code == 201 and r.headers["Cache-Control"] == "no-store"
+    assert (made["kind"], made["scope"], made["status"]) == ("client", ["grid.view", "sessions.open", "signins.use"],
+                                                             "active")
+    assert re.fullmatch(r"pwgc_[A-Za-z0-9_-]{43}", made["token"]) and "scopeLost" not in made
+    assert run(db, "SELECT tokenHash, scope, kind, prefix FROM accessTokens") == [
+        (store.scoped_token_hash(made["token"]), "grid.view sessions.open signins.use", "client", made["token"][:12])]
+    assert run(db, "SELECT COUNT(*) FROM accessTokens WHERE tokenHash = ?", (store.token_hash(made["token"]),)) == [(0,)]
+    listed = by_name(client.get("/api/tokens", headers=ADMIN).get_json())["limited"]
+    assert listed["scope"] == ["grid.view", "sessions.open", "signins.use"] and "scopeLost" not in listed
+    every = store.create_token("every", "client", scope=tuple(permissions.TOKEN_SCOPES))
+    assert every["scope"] == sorted(permissions.TOKEN_SCOPES)
+
+
+def test_scope_requests_that_are_refused(db):
+    client = grid_app.app.test_client()
+    for scope, error in (("grid.view", NOT_A_LIST), (["grid.view", 7], NOT_A_LIST), ([], NOTHING_PICKED),
+                         ("", NOT_A_LIST), (0, NOT_A_LIST), (False, NOT_A_LIST), ({"grid.view": True}, NOT_A_LIST),
+                         (["grid.view", "grid.operate"], "There is no scope 'grid.operate'."),
+                         (["sessions.openx"], "There is no scope 'sessions.openx'."),
+                         (["signins.add"], ADD_NEEDS_USE), (["signins.add", "grid.view"], ADD_NEEDS_USE)):
+        r = scoped(client, {"name": "limited", "scope": scope})
+        assert (r.status_code, r.get_json()) == (400, {"error": error}), scope
+    for scope in (["grid.view"], [], "grid.view"):
+        with pytest.raises(store.InvalidToken, match="Only client tokens can have a scope."):
+            store.create_token("farm", "agent", scope=scope)
+    assert token_count(db) == 0 and audit_details(db) == []
+
+
+def test_the_scoped_route_never_makes_a_token_without_a_scope(db):
+    """A scope that is missing, null or misspelt is refused. Ignoring it would make a token with no limit."""
+    client = grid_app.app.test_client()
+    for body, error in (({"name": "x"}, NO_SCOPE_SENT), ({"name": "x", "scope": None}, NO_SCOPE_SENT),
+                        ({"name": "x", "expiresInDays": 7}, NO_SCOPE_SENT),
+                        ({"name": "x", "scopes": ["grid.view"]}, unknown_setting("scopes")),
+                        ({"name": "x", "Scope": ["grid.view"]}, unknown_setting("Scope")),
+                        ({"name": "x", "scope ": ["grid.view"]}, unknown_setting("scope ")),
+                        ({"name": "x", "scope": ["grid.view"], "scopes": None}, unknown_setting("scopes"))):
+        r = scoped(client, body)
+        assert (r.status_code, r.get_json()) == (400, {"error": error}), body
+    assert token_count(db) == 0 and audit_details(db) == []
+
+
+def test_the_scoped_route_makes_client_tokens_only(db):
+    client = grid_app.app.test_client()
+    for key, value in (("kind", "agent"), ("kind", "client"), ("nodeName", "node-1"), ("nodeName", None)):
+        r = scoped(client, {"name": "x", "scope": ["grid.view"], key: value})
+        assert (r.status_code, r.get_json()) == (400, {"error": unknown_setting(key)}), (key, value)
+    assert token_count(db) == 0
+    made = scoped(client, {"name": "x", "scope": ["grid.view"]}).get_json()
+    assert made["kind"] == "client" and made["token"].startswith("pwgc_") and made["nodeName"] is None
+    assert run(db, "SELECT kind, nodeName FROM accessTokens") == [("client", None)]
+
+
+def test_the_plain_route_refuses_a_scope_and_any_key_it_does_not_know(db):
+    """A key it doesn't know is never ignored, a scope least of all."""
+    client = grid_app.app.test_client()
+    for kind in ("client", "agent"):
+        for extra, error in (({"scope": ["grid.view"]}, SCOPED_ELSEWHERE), ({"scope": None}, SCOPED_ELSEWHERE),
+                             ({"scope": []}, SCOPED_ELSEWHERE),
+                             ({"scopes": ["grid.view"]}, unknown_setting("scopes")),
+                             ({"Scope": ["grid.view"]}, unknown_setting("Scope")),
+                             ({"expiresInDay": 7}, unknown_setting("expiresInDay"))):
+            r = client.post("/api/tokens", json=dict({"name": "x", "kind": kind}, **extra), headers=ADMIN)
+            assert (r.status_code, r.get_json()) == (400, {"error": error}), (kind, extra)
+    assert token_count(db) == 0 and audit_details(db) == []
+    r = client.post("/api/tokens", json={"name": "farm", "kind": "agent", "nodeName": "node-1", "expiresInDays": 7},
+                    headers=ADMIN)
+    assert r.status_code == 201 and r.get_json()["scope"] is None
+    assert client.post("/api/tokens", json={"name": "checks", "kind": "client"}, headers=ADMIN).status_code == 201
+
+
+def test_a_scope_may_name_what_its_maker_lacks(db, monkeypatch):
+    """It is made as asked, and grants nothing: what the token gets still goes by its owner's roles."""
+    oidc_on(monkeypatch)
+    store.create_token("legacy", "client")  # not the grid's first client token, then
+    maker = make_user(db, "Mo Maker",[add_role(db, "Makes tokens", "tokens.own")])
+    client = grid_app.app.test_client()
+    sign_in_as(client, maker)
+    r = scoped(client, {"name": "mo-ci", "scope": ["mfa.use", "grid.view"]}, headers={})
+    made = r.get_json()
+    assert r.status_code == 201 and made["scope"] == ["grid.view", "mfa.use"] and made["owner"]["id"] == maker
+    r = grid_app.app.test_client().post("/api/mfa/code", json={"name": "intranet"},
+                                        headers={"Authorization": "Bearer " + made["token"]})
+    assert r.status_code == 403 and r.get_json()["forbidden"] is True and "out_of_scope" not in r.get_json()
+
+
+def test_a_scoped_token_is_refused_when_the_table_has_no_scope_column(db):
+    """A database no hub that knows scopes has started on yet: the limit can't be kept, so no token is made."""
+    run(db, "ALTER TABLE accessTokens DROP COLUMN scope")
+    client = grid_app.app.test_client()
+    r = scoped(client, {"name": "limited", "scope": ["grid.view"]})
+    assert (r.status_code, r.get_json()) == (503, {"error": store._NO_TOKEN_SCOPE})
+    with pytest.raises(store.TokensUnavailable):
+        store.create_token("limited", "client", scope=["grid.view"])
+    assert token_count(db) == 0 and audit_details(db) == []
+    r = client.post("/api/tokens", json={"name": "checks", "kind": "client"}, headers=ADMIN)
+    assert r.status_code == 201 and r.get_json()["scope"] is None
+    assert audit_details(db) == [("token.created", "checks", {"kind": "client", "owner": None, "scope": None})]
+
+
+def test_a_table_without_the_scope_column_lists_every_token_with_no_scope(db):
+    run(db, "ALTER TABLE accessTokens DROP COLUMN scope")
+    add_token(db, "farm")
+    checks = add_token(db, "checks", kind="client")
+    listing = grid_app.app.test_client().get("/api/tokens", headers=ADMIN).get_json()
+    assert listing["ready"] is True and [(t["name"], t["scope"]) for t in listing["tokens"]] == [
+        ("checks", None), ("farm", None)]
+    assert all("scopeLost" not in t for t in listing["tokens"])
+    revoked = store.revoke_token(checks)
+    assert revoked["scope"] is None and "scopeLost" not in revoked
+
+
+def test_an_empty_stored_scope_is_listed_as_an_empty_list_not_as_none(db):
+    """None is no limit and an empty scope allows nothing: the two never read alike."""
+    add_scoped_row(db, "nothing", "")
+    add_scoped_row(db, "plain-nothing", "", plain=True)  # a plain row someone gave an empty scope
+    add_token(db, "checks", kind="client")
+    tokens = by_name(store.list_tokens())
+    assert (tokens["nothing"]["scope"], tokens["plain-nothing"]["scope"], tokens["checks"]["scope"]) == ([], [], None)
+    assert all("scopeLost" not in t for t in tokens.values())
+
+
+def test_a_scoped_row_whose_scope_is_gone_is_listed_as_lost_never_as_no_limit(db):
+    """Its scope set to NULL by hand, or the column dropped: the row allows nothing and the list says so, in
+    the answers to revoking and giving it too."""
+    client = grid_app.app.test_client()
+    dana = make_user(db, "Dana Lee")
+    lost, healthy, later = (store.create_token(name, "client", scope=["grid.view"])["id"]
+                            for name in ("lost", "healthy", "later"))
+    plain = store.create_token("plain", "client")["id"]
+    run(db, "UPDATE accessTokens SET scope = NULL WHERE id = ?", (lost,))
+
+    def listed():
+        return {name: (t["scope"], t.get("scopeLost", "no key"))
+                for name, t in by_name(client.get("/api/tokens", headers=ADMIN).get_json()).items()}
+
+    assert listed() == {"lost": ([], True), "healthy": (["grid.view"], "no key"), "later": (["grid.view"], "no key"),
+                        "plain": (None, "no key")}
+    r = client.post("/api/tokens/{}/owner".format(lost), json={"userId": dana}, headers=ADMIN)
+    assert r.status_code == 200 and (r.get_json()["token"]["scope"], r.get_json()["token"]["scopeLost"]) == ([], True)
+    r = client.post("/api/tokens/{}/revoke".format(lost), json={}, headers=ADMIN)
+    assert r.status_code == 200 and (r.get_json()["token"]["scope"], r.get_json()["token"]["scopeLost"]) == ([], True)
+    for token_id in (healthy, plain):
+        assert "scopeLost" not in store.revoke_token(token_id)
+
+    run(db, "ALTER TABLE accessTokens DROP COLUMN scope")
+    assert listed() == {"lost": ([], True), "healthy": ([], True), "later": ([], True), "plain": (None, "no key")}
+    r = client.post("/api/tokens/{}/owner".format(later), json={"userId": dana}, headers=ADMIN)
+    assert r.status_code == 200 and (r.get_json()["token"]["scope"], r.get_json()["token"]["scopeLost"]) == ([], True)
+    r = client.post("/api/tokens/{}/revoke".format(later), json={}, headers=ADMIN)
+    assert r.status_code == 200 and (r.get_json()["token"]["scope"], r.get_json()["token"]["scopeLost"]) == ([], True)
+
+
+def test_ids_this_version_does_not_know_are_left_out_of_a_listed_scope(db):
+    add_scoped_row(db, "newer", "grid.view made.up sessions.openx")
+    add_scoped_row(db, "newest", "made.up grid.operate")  # a permission is not a scope id either
+    tokens = by_name(store.list_tokens())
+    assert tokens["newer"]["scope"] == ["grid.view"] and tokens["newest"]["scope"] == []
+    assert "scopeLost" not in tokens["newer"] and "scopeLost" not in tokens["newest"]
+
+
+def test_the_audit_log_records_the_scope_a_client_token_was_made_with(db):
+    client = grid_app.app.test_client()
+    made = [scoped(client, {"name": "limited", "scope": ["mfa.use", "grid.view"]}).get_json(),
+            client.post("/api/tokens", json={"name": "checks", "kind": "client"}, headers=ADMIN).get_json(),
+            client.post("/api/tokens", json={"name": "farm", "kind": "agent"}, headers=ADMIN).get_json()]
+    assert audit_details(db) == [
+        ("token.created", "limited", {"kind": "client", "owner": None, "scope": ["grid.view", "mfa.use"]}),
+        ("token.created", "checks", {"kind": "client", "owner": None, "scope": None}),
+        ("token.created", "farm", {"kind": "agent", "owner": None})]
+    rows = run(db, "SELECT * FROM auditLog")
+    for token in made:
+        assert not any(token["token"] in str(value) for row in rows for value in row)
+
+
+def test_the_plaintext_of_a_scoped_token_is_returned_once_and_stored_nowhere(db):
+    client = grid_app.app.test_client()
+    made = scoped(client, {"name": "limited", "scope": ["grid.view"]}).get_json()
+    token = made["token"]
+    assert re.fullmatch(r"pwgc_[A-Za-z0-9_-]{43}", token)
+    for table in ("accessTokens", "auditLog", "itemOwners"):
+        assert not any(token in str(value) for row in run(db, "SELECT * FROM " + table) for value in row), table
+    # Nor is what is kept enough to find the row with by its sha256: it is 57 of the 64 characters.
+    assert store.token_hash(token) not in str(run(db, "SELECT * FROM accessTokens"))
+    listing = client.get("/api/tokens", headers=ADMIN)
+    assert token not in listing.get_data(as_text=True) and "token" not in by_name(listing.get_json())["limited"]
+    r = client.post("/api/tokens/{}/revoke".format(made["id"]), json={}, headers=ADMIN)
+    assert token not in r.get_data(as_text=True) and "token" not in r.get_json()["token"]
+    assert scoped(client, {"name": "limited", "scope": ["grid.view"]}).get_json()["token"] != token
+
+
+def test_revoking_and_giving_a_scoped_token_answer_with_its_scope(db):
+    client = grid_app.app.test_client()
+    dana = make_user(db, "Dana Lee")
+    made = scoped(client, {"name": "limited", "scope": ["signins.use", "mfa.use"]}).get_json()
+    stored = run(db, "SELECT tokenHash, scope FROM accessTokens")
+    r = client.post("/api/tokens/{}/owner".format(made["id"]), json={"userId": dana}, headers=ADMIN)
+    given = r.get_json()["token"]
+    assert r.status_code == 200 and given["scope"] == ["mfa.use", "signins.use"] and given["owner"]["id"] == dana
+    r = client.post("/api/tokens/{}/revoke".format(made["id"]), json={}, headers=ADMIN)
+    revoked = r.get_json()["token"]
+    assert r.status_code == 200 and (revoked["scope"], revoked["status"]) == (["mfa.use", "signins.use"], "revoked")
+    assert "scopeLost" not in given and "scopeLost" not in revoked
+    assert run(db, "SELECT tokenHash, scope FROM accessTokens") == stored
+
+
+def test_sessions_open_is_a_scope_and_not_a_permission():
+    """The hub enforces it. No role holds it, and a scope's ids are never read as permissions."""
+    assert list(permissions.TOKEN_SCOPES.items()) == [
+        ("sessions.open", "Open browser sessions"), ("grid.view", "See the grid"), ("mfa.use", "Use MFA secrets"),
+        ("signins.use", "Use saved sign-ins"), ("signins.add", "Add saved sign-ins")]
+    assert permissions.SESSIONS_SCOPE == "sessions.open"
+    assert "sessions.open" not in permissions.PERMISSIONS and "sessions.open" not in permissions.ALL
+    assert "sessions.open" not in [p["id"] for p in permissions.catalogue()]
+    assert permissions.expand({"sessions.open"}) == permissions.parse("sessions.open") == frozenset()
+    assert set(permissions.TOKEN_SCOPES) - {"sessions.open"} <= permissions.ALL
+    assert permissions.parse_scope("mfa.use  made.up sessions.open grid.operate") == {"mfa.use", "sessions.open"}
+    assert permissions.parse_scope("") == permissions.parse_scope(None) == frozenset()
+
+
+class _ScopeChoices(html.parser.HTMLParser):
+    """The (value, label) of each scope checkbox inside the new-token dialog's #nt-scope-list."""
+
+    def __init__(self):
+        super().__init__()
+        self.choices, self._depth, self._value, self._label = [], 0, None, None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if self._depth:
+            self._depth += tag == "div"
+            if tag == "input" and attrs.get("type") == "checkbox" and attrs.get("name") == "scope":
+                self._value = attrs.get("value")
+            elif tag == "strong" and self._value is not None:
+                self._label = ""
+        elif tag == "div" and attrs.get("id") == "nt-scope-list":
+            self._depth = 1
+
+    def handle_data(self, data):
+        if self._label is not None:
+            self._label += data
+
+    def handle_endtag(self, tag):
+        if self._depth and tag == "div":
+            self._depth -= 1
+        elif tag == "strong" and self._label is not None:
+            self.choices.append((self._value, self._label.strip()))
+            self._value = self._label = None
+
+
+def test_the_dialog_offers_exactly_the_scopes_the_server_knows():
+    """A scope the dialog lacks can't be picked, and one the server lacks would be refused."""
+    parser = _ScopeChoices()
+    with open(os.path.join(os.path.dirname(grid_app.__file__), "templates", "index.html"), encoding="utf-8") as f:
+        parser.feed(f.read())
+    assert parser.choices == list(permissions.TOKEN_SCOPES.items())
+
+
+def test_the_demo_stores_its_scoped_token_the_way_the_store_does(tmp_path, monkeypatch):
+    made, token_urlsafe = [], secrets.token_urlsafe
+
+    def recorded(nbytes=None):
+        made.append(token_urlsafe(nbytes))
+        return made[-1]
+
+    monkeypatch.setattr(secrets, "token_urlsafe", recorded)
+    path = str(tmp_path / "demo.db")
+    with contextlib.closing(sqlite3.connect(path)) as con, con:
+        demo.seed(con)
+    monkeypatch.setattr(store, "DB_ENGINE", "sqlite")
+    monkeypatch.setattr(store, "SQLITE_PATH", path)
+    ((stored, scope),) = run(path, "SELECT tokenHash, scope FROM accessTokens WHERE name = 'Grid monitor'")
+    (token,) = ["pwgc_" + value for value in made if store.scoped_token_hash("pwgc_" + value) == stored]
+    assert scope == "grid.view"
+    assert store.client_token(token)["scope"] == {"grid.view"}
+    assert by_name(store.list_tokens())["Grid monitor"]["scope"] == ["grid.view"]
+    # Every other demo token has no scope and is stored by its sha256.
+    assert run(path, "SELECT COUNT(*) FROM accessTokens WHERE scope IS NOT NULL OR tokenHash LIKE 'scoped:%'") == [(1,)]

@@ -27,9 +27,12 @@ from . import oidc, permissions, store
 # name: who it is, as the page shows it; method: the provider id that vouched for them; user_id: their users.id
 # (None for the admin token and for client tokens without an owner); permissions: what they may do; role_ids:
 # their effective role ids, for items shared with a role; email: for the account menu. A provider that says
-# nothing about permissions vouches for an admin, as every principal was before roles existed.
-Principal = namedtuple("Principal", "name method user_id permissions role_ids email",
-                       defaults=(None, permissions.ALL, (), None))
+# nothing about permissions vouches for an admin, as every principal was before roles existed. scope: a client
+# token's scope (None: no limit; people and the bootstrap token have none). It is kept apart from permissions on
+# purpose: what a token reaches is judged by its owner's permissions, and a smaller set there would reach more
+# shared sign-ins, not fewer.
+Principal = namedtuple("Principal", "name method user_id permissions role_ids email scope",
+                       defaults=(None, permissions.ALL, (), None, None))
 
 # What anyone but an admin is told about single sign-on that can't work as configured: the problem itself may
 # name a file path, so it goes to the log, the admin token and people who may see the settings (users.view).
@@ -410,7 +413,7 @@ def _token_principal(lookup):
         abort(make_response(jsonify(error="The client token is wrong, revoked or expired.", client_token_required=True), 401))
     name = "client token '{}'".format(found["name"])
     if found["ownerId"] is None:
-        return Principal(name, "client-token")
+        return Principal(name, "client-token", scope=found["scope"])
     owner = found["owner"]
     if owner is None:
         _owner_refused("This client token belongs to a person this grid no longer knows, so it gets nothing from the "
@@ -418,18 +421,36 @@ def _token_principal(lookup):
     if owner["disabled"]:
         _owner_refused("This client token belongs to {}, whose account is disabled, so it gets nothing from the Grid "
                        "UI. An admin can enable them, or revoke the token.".format(owner["name"]))
-    return principal_for_user(owner, "client-token", name="{} ({})".format(name, owner["name"])[:255])
+    return principal_for_user(owner, "client-token",
+                              name="{} ({})".format(name, owner["name"])[:255])._replace(scope=found["scope"])
 
 
-def check_principal(lookup, permission=None):
+def in_scope(principal, scope):
+    """Whether a client token's scope leaves `scope` in. People, the bootstrap token and tokens made without
+    a scope have none, and everything is in."""
+    return principal.scope is None or scope in principal.scope
+
+
+def out_of_scope(scope, error=None):
+    """The 403 for a client token whose scope leaves `scope` out: not the same as its owner's roles lacking it."""
+    return make_response(jsonify(
+        error=error or "This client token's scope doesn't include “{}”. A token's scope can't be changed: "
+                       "make another on the Access page.".format(permissions.TOKEN_SCOPES.get(scope, scope)),
+        out_of_scope=True, scope=scope), 403)
+
+
+def check_principal(lookup, scope, permission=None):
     """The check a request comes from, judged by its client token, or a 401/403/429 abort.
 
-    lookup(token) -> the managed client token as {"id", "name", "ownerId", "owner"}, or None
+    lookup(token) -> the managed client token as {"id", "name", "ownerId", "owner", "scope"}, or None
     (accounts.client_token_access). Whether the token acts as a person goes by ownerId, never by whether
     the owner could be found: a token whose owner this grid no longer knows gets nothing, never an
-    admin's access. permission is what the check needs (mfa.use, signins.use): a token whose owner's
-    roles don't include it is refused as forbidden."""
+    admin's access. scope is the scope id the request needs (permissions.TOKEN_SCOPES): a token whose scope
+    leaves it out is refused first, with out_of_scope. permission is what the owner's roles must include as
+    well (mfa.use, signins.use): a token whose owner's roles don't include it is refused as forbidden."""
     principal = _token_principal(lookup)
+    if not in_scope(principal, scope):
+        abort(out_of_scope(scope))
     if permission is not None and permission not in principal.permissions:
         abort(make_response(jsonify(error="This client token's owner's roles don't include “{}”.".format(
             permissions.PERMISSIONS[permission][1]), forbidden=True, permission=permission), 403))
@@ -458,7 +479,8 @@ def reader_principal(lookup, soft=False):
     """Who reads the grid where reading needs sign-in, or a refusal as the gate's: token_required for nobody,
     forbidden without grid.view. A client token sent as "Authorization: Bearer <token>" is looked at only when
     nothing else vouches for the request, with check_principal's lookup, so a wrong one is a 401 (or the
-    guessing limit's 429) and one whose owner can't use it a 403 owner_disabled. soft answers those two
+    guessing limit's 429), one whose owner can't use it a 403 owner_disabled, and one whose scope leaves out
+    grid.view a 403 out_of_scope. soft answers those two
     refusals with 200 {"refused": "signedout" | "forbidden", "error"} instead; the 401, 403 and 429 of a
     client token never are. Without any sign-in configured, nobody could sign in to read, so reading is as
     open as grid actions (the principal is None)."""
@@ -466,7 +488,7 @@ def reader_principal(lookup, soft=False):
         return None
     principal = current_principal()
     if principal is None and _bearer():
-        principal = check_principal(lookup)
+        principal = check_principal(lookup, "grid.view")
     if principal is None:
         _refuse_read(soft, "signedout", _signed_out_body())
     if not can(principal, "grid.view"):

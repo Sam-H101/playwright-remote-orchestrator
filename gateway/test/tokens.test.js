@@ -9,7 +9,9 @@ const WebSocket = require('ws');
 const h = require('./helpers');
 const { createHub } = require('../hub');
 const { MemoryRegistry } = require('../lib/registry');
-const { hashToken } = require('../lib/protocol');
+const { hashToken, scopedHash, isManagedToken } = require('../lib/protocol');
+const { createTokenAuth, tokenProblem } = require('../lib/tokens');
+const { silent } = require('../lib/log');
 
 afterEach(h.cleanup);
 
@@ -45,7 +47,7 @@ test('a managed agent token registers the node, is recorded on it, and turns age
   const token = mint();
   const row = registry.addToken(token, { name: 'build farm' });
   assert.deepEqual(await registry.lookupToken(hashToken(token)),
-    { id: row.id, name: 'build farm', kind: 'agent', prefix: token.slice(0, 12), nodeName: null, expiresAt: null, revokedAt: null });
+    { id: row.id, name: 'build farm', kind: 'agent', prefix: token.slice(0, 12), nodeName: null, expiresAt: null, revokedAt: null, scoped: false, scope: null, storedTwice: false });
   assert.equal(await registry.lookupToken(hashToken(`${token}x`)), null);
 
   const { url, hub } = await h.startHub({}, registry);
@@ -610,4 +612,344 @@ test('a data channel must carry the token its control connection used', async ()
   const ws = await client;
   data.send('over the tunnel');
   assert.equal((await h.nextMessage(ws)).data.toString(), 'over the tunnel');
+});
+
+// A token check on its own, as the hub builds it, with every lookup it costs written down.
+function tokenAuth(registry, options = {}) {
+  const lookups = [];
+  const lookup = registry.lookupToken.bind(registry);
+  registry.lookupToken = async (hash) => {
+    lookups.push(hash);
+    return lookup(hash);
+  };
+  return { lookups, tokens: createTokenAuth({ registry, log: silent, cacheMs: 0, ...options }) };
+}
+
+// What /connect answers a token pinned to a node nobody serves: { status, body } (404 means it was let in).
+function clientAnswer(url, token) {
+  return h.connect(`${url}/connect?node=nobody&gateway_token=${token}`).then(() => ({ status: 101, body: '' }), (err) => ({ status: err.status, body: err.body }));
+}
+
+const NO_SESSIONS = 'not allowed to open browser sessions (its scope leaves that out)';
+const SCOPE_CHANGED = 'not usable: its scope was lost or changed in the database';
+const STORED_TWICE = 'not usable: it is stored twice, with and without a scope';
+
+test('a client token costs one lookup, with a scope or without, and so does a made-up one', async () => {
+  const registry = new MemoryRegistry();
+  const plain = mint('client');
+  const scoped = mint('client');
+  const madeUp = mint('client');
+  registry.addToken(plain, { kind: 'client' });
+  registry.addToken(scoped, { kind: 'client', scope: 'sessions.open' });
+  const { tokens, lookups } = tokenAuth(registry, { cacheMs: 10000 });
+
+  assert.equal((await tokens.check('client', plain)).ok, true);
+  assert.deepEqual(lookups, [hashToken(plain)]);
+  assert.equal((await tokens.check('client', scoped)).ok, true);
+  assert.deepEqual(lookups, [hashToken(plain), hashToken(scoped)], 'asked for by the plain hash, once');
+  const verdict = await tokens.check('client', madeUp);
+  assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, undefined, undefined]);
+  assert.match(verdict.message, /^unknown token pwgc_/);
+  assert.deepEqual(lookups, [hashToken(plain), hashToken(scoped), hashToken(madeUp)]);
+
+  // Each answer is cached as before, the negative one too.
+  for (const token of [plain, scoped, madeUp]) await tokens.check('client', token);
+  assert.equal(lookups.length, 3);
+});
+
+test('a scoped token with sessions.open is let in', async () => {
+  const registry = new MemoryRegistry();
+  const { tokens } = tokenAuth(registry);
+  for (const scope of ['sessions.open', 'grid.view sessions.open', 'grid.view mfa.use sessions.open signins.add signins.use', 'future.thing sessions.open']) {
+    const token = mint('client');
+    const row = registry.addToken(token, { kind: 'client', name: 'ci', scope });
+    assert.equal(row.tokenHash, scopedHash(hashToken(token)));
+    assert.deepEqual(await tokens.check('client', token),
+      { ok: true, via: 'managed', tokenId: row.id, nodeName: null, label: `token ${token.slice(0, 12)}... (#${row.id} "ci")` }, scope);
+    await h.waitFor(() => row.lastUsedAt, { what: 'the use recorded' });
+  }
+  const { url } = await h.startHub({}, registry);
+  const token = mint('client');
+  registry.addToken(token, { kind: 'client', scope: 'grid.view sessions.open' });
+  assert.equal(await clientStatus(url, `?gateway_token=${token}`), 404);
+  assert.equal(await clientStatus(url, '', { 'x-gateway-token': token }), 404);
+});
+
+test('a scoped token without sessions.open is refused as forbidden', async () => {
+  const registry = new MemoryRegistry();
+  const token = mint('client');
+  const row = registry.addToken(token, { kind: 'client', scope: 'grid.view mfa.use signins.add signins.use' });
+  const { tokens } = tokenAuth(registry);
+  const verdict = await tokens.check('client', token);
+  assert.deepEqual(verdict, {
+    ok: false, problem: NO_SESSIONS, forbidden: true,
+    message: `client token ${token.slice(0, 12)}... (#${row.id}) is ${NO_SESSIONS}`,
+  });
+  assert.equal(verdict.message.includes(token), false, 'the full token is never echoed');
+  assert.equal(tokenProblem(await registry.lookupToken(hashToken(token)), 'client'), NO_SESSIONS);
+  // A refused token is not recorded as used.
+  await h.sleep(50);
+  assert.equal(row.lastUsedAt, null);
+});
+
+test('an empty scope and a scope of unknown ids are refused as forbidden', async () => {
+  const registry = new MemoryRegistry();
+  const { tokens } = tokenAuth(registry);
+  const { url } = await h.startHub({ tokenCacheMs: 0 }, registry);
+  for (const scope of ['', ' ', 'future.thing', 'future.thing other.thing']) {
+    const token = mint('client');
+    registry.addToken(token, { kind: 'client', scope });
+    const verdict = await tokens.check('client', token);
+    assert.deepEqual([verdict.ok, verdict.forbidden, verdict.problem], [false, true, NO_SESSIONS], JSON.stringify(scope));
+    assert.deepEqual(await clientAnswer(url, token), { status: 403, body: `gateway token is ${NO_SESSIONS}\n` });
+  }
+});
+
+test('scope ids are matched whole', async () => {
+  const registry = new MemoryRegistry();
+  const { tokens } = tokenAuth(registry);
+  const verdictFor = (scope) => {
+    const token = mint('client');
+    registry.addToken(token, { kind: 'client', scope });
+    return tokens.check('client', token);
+  };
+  for (const scope of ['sessions.openx', 'xsessions.open', 'sessions.open.more', 'sessions', 'sessions.', '.open', 'sessions open',
+    'SESSIONS.OPEN', 'Sessions.Open', 'sessions.open,grid.view', 'grid.view,sessions.open', 'sessions.open;', '"sessions.open"', 'sessions_open']) {
+    const verdict = await verdictFor(scope);
+    assert.deepEqual([verdict.ok, verdict.forbidden], [false, true], scope);
+  }
+  // The stored form is ids with one space between them; the word is found among them wherever it stands.
+  for (const scope of ['sessions.open', 'grid.view sessions.open', 'sessions.open signins.use', 'mfa.use sessions.open signins.use', 'sessions.openx sessions.open']) {
+    assert.equal((await verdictFor(scope)).ok, true, scope);
+  }
+});
+
+test('a scoped row whose scope was set to null is refused', async () => {
+  const registry = new MemoryRegistry();
+  const token = mint('client');
+  const row = registry.addToken(token, { kind: 'client', scope: 'grid.view sessions.open' });
+  const other = mint('client');
+  registry.addToken(other, { kind: 'client', scope: 'sessions.open' });
+  const { tokens } = tokenAuth(registry);
+  const { url } = await h.startHub({ tokenCacheMs: 0 }, registry);
+  assert.equal(await clientStatus(url, `?gateway_token=${token}`), 404);
+
+  row.scope = null; // as an UPDATE by hand, or a lost column, leaves it
+  assert.deepEqual(await registry.lookupToken(hashToken(token)),
+    { id: row.id, name: 'test token', kind: 'client', prefix: token.slice(0, 12), nodeName: null, expiresAt: null, revokedAt: null, scoped: true, scope: null, storedTwice: false });
+  const verdict = await tokens.check('client', token);
+  assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, SCOPE_CHANGED, false]);
+  // 401, as a token that is wrong: it is never taken for one with no limit.
+  assert.deepEqual(await clientAnswer(url, token), { status: 401, body: `gateway token is ${SCOPE_CHANGED}\n` });
+  assert.equal(await clientStatus(url, `?gateway_token=${other}`), 404, 'other scoped tokens are untouched');
+});
+
+test('a plain row that was given a scope is refused', async () => {
+  const registry = new MemoryRegistry();
+  const { tokens } = tokenAuth(registry);
+  const { url } = await h.startHub({ tokenCacheMs: 0 }, registry);
+  for (const scope of ['sessions.open', 'grid.view sessions.open', 'grid.view', '']) {
+    const token = mint('client');
+    const row = registry.addToken(token, { kind: 'client' });
+    assert.equal(await clientStatus(url, `?gateway_token=${token}`), 404);
+    row.scope = scope; // the hash stays the plain one
+    const found = await registry.lookupToken(hashToken(token));
+    assert.deepEqual([found.scoped, found.scope, found.storedTwice], [false, scope, false]);
+    const verdict = await tokens.check('client', token);
+    assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, SCOPE_CHANGED, false], JSON.stringify(scope));
+    assert.deepEqual(await clientAnswer(url, token), { status: 401, body: `gateway token is ${SCOPE_CHANGED}\n` });
+  }
+});
+
+test('a token stored both ways is refused', async () => {
+  for (const order of [[null, 'sessions.open'], ['sessions.open', null]]) {
+    const registry = new MemoryRegistry();
+    const token = mint('client');
+    for (const scope of order) registry.addToken(token, { kind: 'client', scope });
+    const rows = [...registry.tokens.values()];
+    assert.deepEqual(rows.map((row) => row.tokenHash).sort(), [hashToken(token), scopedHash(hashToken(token))].sort());
+    assert.equal((await registry.lookupToken(hashToken(token))).storedTwice, true);
+    const { tokens, lookups } = tokenAuth(registry);
+    const verdict = await tokens.check('client', token);
+    assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, STORED_TWICE, false]);
+    assert.equal(lookups.length, 1);
+    // 401, not 403: neither row is believed.
+    const { url } = await h.startHub({ tokenCacheMs: 0 }, registry);
+    assert.deepEqual(await clientAnswer(url, token), { status: 401, body: `gateway token is ${STORED_TWICE}\n` });
+    // Revoking one of the two does not bring the other back.
+    rows[0].revokedAt = iso(-1000);
+    assert.equal((await tokens.check('client', token)).problem, STORED_TWICE);
+    rows[0].revokedAt = null;
+    rows[1].revokedAt = iso(-1000);
+    assert.equal((await tokens.check('client', token)).problem, STORED_TWICE);
+  }
+});
+
+test('a scoped client token is not an agent token at /agent, and an agent row with a scope or in the scoped form is refused', async () => {
+  const registry = new MemoryRegistry();
+  const client = mint('client');
+  registry.addToken(client, { kind: 'client', scope: 'grid.view sessions.open' });
+  const given = mint(); // a good agent row that someone gave a scope
+  registry.addToken(given).scope = 'sessions.open';
+  const scopedAgent = mint(); // an agent row made as a scoped token is made
+  registry.addToken(scopedAgent, { scope: 'sessions.open' });
+  const formOnly = mint(); // an agent row in the scoped form whose scope is gone
+  registry.addToken(formOnly, { scope: '' }).scope = null;
+  const good = mint();
+  registry.addToken(good);
+  const { url, hub } = await h.startHub({}, registry);
+
+  let r = await refused(url, client);
+  assert.equal(r.code, 4401);
+  assert.match(r.errors[0], /client token pwgc_.{7}\.\.\. \(#\d+\) is not an agent token$/);
+  for (const token of [given, scopedAgent, formOnly]) {
+    r = await refused(url, token);
+    assert.equal(r.code, 4401);
+    assert.match(r.errors[0], /agent token pwga_.{7}\.\.\. \(#\d+\) is not usable: its scope was lost or changed in the database$/);
+    assert.equal(r.errors[0].includes(token), false, 'the full token is never echoed');
+    assert.equal(tokenProblem(await registry.lookupToken(hashToken(token)), 'agent'), SCOPE_CHANGED);
+  }
+  assert.deepEqual([...hub.nodes.keys()], []);
+  const ok = await h.rawAgent(url, bearer(good));
+  assert.deepEqual(await h.register(ok, 'unscoped'), { type: 'registered', name: 'unscoped' });
+  // And an agent token is still not a client token, whatever its row says.
+  for (const token of [given, scopedAgent, good]) {
+    assert.deepEqual(await clientAnswer(url, token), { status: 401, body: 'gateway token is not a client token\n' });
+  }
+});
+
+test('revoked and expired come before the scope verdicts', async () => {
+  const row = (extra) => ({ id: 1, name: 't', kind: 'client', prefix: 'pwgc_AbCdEfG', nodeName: null, expiresAt: null, revokedAt: null, scoped: true, scope: 'grid.view', storedTwice: false, ...extra });
+  const now = Date.parse('2026-01-01T00:00:00Z');
+  assert.equal(tokenProblem(row({}), 'client', now), NO_SESSIONS);
+  assert.equal(tokenProblem(row({ revokedAt: '2025-12-31T00:00:00Z' }), 'client', now), 'revoked');
+  assert.equal(tokenProblem(row({ expiresAt: '2025-12-31T23:59:59Z' }), 'client', now), 'expired');
+  assert.equal(tokenProblem(row({ expiresAt: '2026-01-01T00:00:01Z' }), 'client', now), NO_SESSIONS, 'a future expiry is not one');
+  assert.equal(tokenProblem(row({ scope: null, revokedAt: '2025-12-31T00:00:00Z' }), 'client', now), 'revoked');
+  assert.equal(tokenProblem(row({ scope: null, expiresAt: '2025-12-31T23:59:59Z' }), 'client', now), 'expired');
+  assert.equal(tokenProblem(row({ scope: null }), 'client', now), SCOPE_CHANGED);
+  assert.equal(tokenProblem(row({}), 'agent', now), 'not an agent token');
+  assert.equal(tokenProblem(row({ storedTwice: true, revokedAt: '2025-12-31T00:00:00Z' }), 'client', now), STORED_TWICE, 'stored twice comes before everything');
+  assert.equal(tokenProblem(row({ scope: 'sessions.open' }), 'client', now), null);
+  // A row built without the new fields reads as a plain row with no scope.
+  assert.equal(tokenProblem({ id: 1, kind: 'client', revokedAt: null, expiresAt: null }, 'client', now), null);
+  assert.equal(tokenProblem(null, 'client', now), 'unknown');
+
+  // Through the hub: 401 with the sentences there were before, never the 403 of a good token.
+  const registry = new MemoryRegistry();
+  const revoked = mint('client');
+  const expired = mint('client');
+  registry.addToken(revoked, { kind: 'client', scope: 'grid.view', revokedAt: iso(-60000) });
+  registry.addToken(expired, { kind: 'client', scope: 'grid.view', expiresAt: iso(-1000) });
+  const { tokens } = tokenAuth(registry);
+  const { url } = await h.startHub({ tokenCacheMs: 0 }, registry);
+  for (const [token, problem] of [[revoked, 'revoked'], [expired, 'expired']]) {
+    const verdict = await tokens.check('client', token);
+    assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, problem, false]);
+    assert.deepEqual(await clientAnswer(url, token), { status: 401, body: `gateway token is ${problem}\n` });
+  }
+});
+
+test('a failed lookup is unavailable, never a pass', async () => {
+  const registry = new MemoryRegistry();
+  const open = mint('client');
+  const limited = mint('client');
+  registry.addToken(open, { kind: 'client', scope: 'sessions.open' });
+  registry.addToken(limited, { kind: 'client', scope: 'grid.view' });
+  const { url } = await h.startHub({ tokenCacheMs: 0 }, registry);
+  assert.equal(await clientStatus(url, `?gateway_token=${open}`), 404);
+  registry.lookupToken = async () => { throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:3306'), { code: 'ECONNREFUSED' }); };
+  const tokens = createTokenAuth({ registry, log: silent, cacheMs: 0 });
+  for (const token of [open, limited]) {
+    const verdict = await tokens.check('client', token);
+    assert.deepEqual(verdict, { ok: false, unavailable: true, message: 'could not check the client token: connect ECONNREFUSED 127.0.0.1:3306' });
+    assert.deepEqual(await tokens.checkHash('client', hashToken(token)), verdict);
+    // 503 for both: the hub cannot tell which of them may open sessions, so it lets neither in and blames neither.
+    assert.equal(await clientStatus(url, `?gateway_token=${token}`), 503);
+  }
+  // Where a missing token would be let in (GATEWAY_ALLOW_OPEN_CLIENTS, nothing active), one that is sent still isn't waved through.
+  const allowed = new MemoryRegistry();
+  const revoked = mint('client');
+  allowed.addToken(revoked, { kind: 'client', scope: 'sessions.open', revokedAt: iso(-1000) });
+  const lenient = createTokenAuth({ registry: allowed, log: silent, cacheMs: 0, allowOpen: { client: true } });
+  assert.equal((await lenient.check('client', null)).via, 'open');
+  allowed.lookupToken = async () => { throw new Error('ETIMEDOUT'); };
+  assert.deepEqual(await lenient.check('client', revoked), { ok: false, unavailable: true, message: 'could not check the client token: ETIMEDOUT' });
+});
+
+test('checkHash re-checks a scoped token by its plain hash', async () => {
+  const registry = new MemoryRegistry();
+  const token = mint('client');
+  const row = registry.addToken(token, { kind: 'client', name: 'ci', scope: 'grid.view sessions.open' });
+  const { tokens, lookups } = tokenAuth(registry);
+  const hash = hashToken(token); // what the hub keeps for a waiting client
+  assert.notEqual(row.tokenHash, hash);
+
+  assert.deepEqual(await tokens.checkHash('client', hash),
+    { ok: true, via: 'managed', tokenId: row.id, nodeName: null, label: `token ${token.slice(0, 12)}... (#${row.id} "ci")` });
+  assert.deepEqual(lookups, [hash]);
+  row.scope = 'grid.view';
+  let verdict = await tokens.checkHash('client', hash);
+  assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, NO_SESSIONS, true]);
+  row.scope = null;
+  verdict = await tokens.checkHash('client', hash);
+  assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, SCOPE_CHANGED, false]);
+  row.scope = 'sessions.open';
+  row.revokedAt = iso(0);
+  verdict = await tokens.checkHash('client', hash);
+  assert.deepEqual([verdict.ok, verdict.problem, verdict.forbidden], [false, 'revoked', false]);
+  assert.deepEqual(lookups, [hash, hash, hash, hash], 'one lookup each time, always by the plain hash');
+});
+
+// A made-up token and its hashes, worked out with sha256 beforehand: the tests compare with these and derive them too.
+const VECTOR = `pwgc_${'A'.repeat(43)}`;
+const VECTOR_HASH = '1f0bc52f7fa82946861c65a388c72cfdd15561d997682cee0eba9fa2becc4bd0';
+const VECTOR_SCOPED = 'scoped:1f0bc52f7fa82946861c65a388c72cfdd15561d997682cee0eba9fa2b';
+const sha256 = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+
+// How a hub from before scopes (commit d05b719) finds a client's row, kept here as it was: check() refuses
+// anything that is not of the managed shape without a query, and lookupToken compares tokenHash with the
+// sha256 of the string and nothing else. It must not call today's lookup.
+function releasedLookup(registry, presented) {
+  if (!isManagedToken(presented)) return null;
+  const hash = hashToken(presented);
+  return [...registry.tokens.values()].find((row) => row.tokenHash === hash) || null;
+}
+
+test('a hub from before scopes finds no row for a scoped token', async () => {
+  for (const scoped of [VECTOR, mint('client')]) {
+    const registry = new MemoryRegistry();
+    const row = registry.addToken(scoped, { kind: 'client', scope: 'sessions.open' });
+    const plain = mint('client');
+    const plainRow = registry.addToken(plain, { kind: 'client' });
+    const presentedAs = [scoped, `scoped:${scoped}`, `scoped:scoped:${scoped}`];
+
+    for (const presented of presentedAs) assert.equal(releasedLookup(registry, presented), null);
+    // Why: the two with scoped: in front are not of the managed shape, and the token has no row under its
+    // sha256. Even a hub that hashed whatever it was sent would find none of the three.
+    assert.deepEqual(presentedAs.map(isManagedToken), [true, false, false]);
+    for (const presented of presentedAs) assert.notEqual(row.tokenHash, sha256(presented));
+    // The same lookup finds a token without a scope, so it is the right lookup; and today's hub finds both.
+    assert.equal(releasedLookup(registry, plain), plainRow);
+    assert.equal((await registry.lookupToken(hashToken(scoped))).id, row.id);
+    assert.equal((await registry.lookupToken(hashToken(plain))).id, plainRow.id);
+  }
+  assert.equal(sha256(`scoped:${VECTOR}`), 'c9795951395e62fd4872f788f64603b879af3dcdb0954109b0d77aad5eeabd7a');
+  assert.equal(sha256(`scoped:scoped:${VECTOR}`), '4f2831d72fbb1af615980c4c88bd8c9a5759c08cf2a3964c720a0cd57c7ed067');
+});
+
+test('the scoped form is not 64 hex characters', () => {
+  const registry = new MemoryRegistry();
+  const scoped = registry.addToken(VECTOR, { kind: 'client', scope: 'sessions.open' });
+  assert.equal(scoped.tokenHash.length, 64);
+  assert.ok(scoped.tokenHash.startsWith('scoped:'));
+  assert.doesNotMatch(scoped.tokenHash, /^[0-9a-f]{64}$/);
+  assert.equal(scoped.tokenHash, VECTOR_SCOPED);
+  assert.equal(scoped.tokenHash, `scoped:${sha256(VECTOR).slice(0, 57)}`);
+  assert.equal(hashToken(VECTOR), VECTOR_HASH);
+  // An empty scope is a scope: the form says so even when the scope allows nothing.
+  assert.ok(registry.addToken(mint('client'), { kind: 'client', scope: '' }).tokenHash.startsWith('scoped:'));
+  const plain = registry.addToken(mint('client'), { kind: 'client' });
+  assert.match(plain.tokenHash, /^[0-9a-f]{64}$/);
+  assert.equal(plain.scope, null);
 });

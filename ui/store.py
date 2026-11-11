@@ -1042,6 +1042,13 @@ _NO_TOKEN_TABLE = ("This database has no accessTokens table yet. The gateway hub
 _NO_TOKEN_OWNERS = ("This database has users but no itemOwners table, so the Grid UI can't tell whose client token this "
                     "is, and won't take it for an admin's. The grid UI creates the table on MySQL when its database user "
                     "may create tables, and so does the gateway hub when it starts.")
+_NO_TOKEN_SCOPE = ("This database's accessTokens table has no scope column yet, so a token can't be given a scope. "
+                   "The gateway hub adds the column when it starts: update the hub, start it, and make the token again.")
+_TOKEN_FORM = ("Client token #{} is turned away: how it is stored and its scope don't agree, so its scope was "
+               "changed in the database or the accessTokens table lost its scope column. Revoke it and make another.")
+_TWO_TOKEN_ROWS = ("Client tokens #{} and #{} are one token stored twice, with and without a scope: it is turned "
+                   "away. Delete both and make another.")
+SCOPED_HASH_PREFIX = "scoped:"
 # The hub turns away checks without a client token as soon as any client token row exists, revoked or expired
 # ones too, so the first row and the last are switches for the whole grid.
 FIRST_CLIENT_TOKEN = ("This would be the grid's first client token: from then on the hub turns away checks that don't "
@@ -1052,6 +1059,13 @@ LAST_CLIENT_TOKEN = ("It's the last client token on record: deleting it lets che
 
 def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def scoped_token_hash(token):
+    """What tokenHash holds for a token with a scope: 'scoped:' and the first 57 hex characters of token_hash,
+    64 characters in all. It is not the sha256 of anything, so software from before scopes, which compares
+    tokenHash with the sha256 of what it was sent, finds no row whatever it is sent."""
+    return SCOPED_HASH_PREFIX + token_hash(token)[:64 - len(SCOPED_HASH_PREFIX)]
 
 
 def _db_time(value):
@@ -1066,15 +1080,29 @@ def _token_status(now, expires, revoked):
     return "active"
 
 
+def _token_columns(cur):
+    """_TOKEN_COLUMNS, whether the row is stored in the scoped form, and the scope, which is NULL for every
+    row of a table from before scopes."""
+    return (_TOKEN_COLUMNS + ", SUBSTR(tokenHash, 1, 7) = 'scoped:', "
+            + ("scope" if "scope" in _columns(cur, "accessTokens") else "NULL"))
+
+
 def _token(row, now):
     token_id, name, kind, prefix, node_name = row[:5]
-    created, expires, last_used, revoked = (_parse_time(v) for v in row[5:])
-    return {
+    created, expires, last_used, revoked = (_parse_time(v) for v in row[5:9])
+    scoped, scope = bool(row[9]), row[10]
+    token = {
         "id": token_id, "name": name, "kind": kind, "prefix": prefix, "nodeName": node_name,
         "createdAt": _iso(created), "expiresAt": _iso(expires), "lastUsedAt": _iso(last_used),
         "revokedAt": _iso(revoked), "status": _token_status(now, expires, revoked),
         "nodes": [], "nodesOnline": [],
+        # A row stored in the scoped form is never listed as a token with no limit: with its scope gone
+        # (set to NULL by hand, or the column was lost) it allows nothing, and the list says so.
+        "scope": sorted(permissions.parse_scope(scope)) if scoped or scope is not None else None,
     }
+    if scoped and scope is None:
+        token["scopeLost"] = True
+    return token
 
 
 def _token_rights(kind, owner_id, access):
@@ -1122,7 +1150,7 @@ def list_tokens(access=None):
             tables = _tables(cur)
             if "accesstokens" not in tables:
                 return _no_tokens(_iso(now), access)
-            cur.execute("SELECT " + _TOKEN_COLUMNS + " FROM accessTokens ORDER BY createdAt DESC, id DESC")
+            cur.execute("SELECT " + _token_columns(cur) + " FROM accessTokens ORDER BY createdAt DESC, id DESC")
             tokens = [_token(row, now) for row in cur.fetchall()]
             users = []
             # tokenId came with managed tokens; the hub adds it to nodes tables made before that.
@@ -1180,15 +1208,37 @@ def _validate_token_request(name, kind, node_name, expires_in_days):
     return name.strip(), kind, node_name, expires_in_days
 
 
-def create_token(name, kind, node_name=None, expires_in_days=None, owner_id=None, access=None, actor=None):
+def _validate_scope(kind, scope):
+    """None for no scope, or a client token's scope ids, sorted. An empty scope is refused: None alone means no limit."""
+    if scope is None:
+        return None
+    if kind != "client":
+        raise InvalidToken("Only client tokens can have a scope.")
+    if not isinstance(scope, (list, tuple)) or not all(isinstance(s, str) for s in scope):
+        raise InvalidToken("Send scope as a list of scope ids, or leave it out for no limit.")
+    if not scope:
+        raise InvalidToken("Pick at least one thing the token may do, or leave scope out for no limit.")
+    for s in scope:
+        if s not in permissions.TOKEN_SCOPES:
+            raise InvalidToken("There is no scope {!r}.".format(s[:64]))
+    if "signins.add" in scope and "signins.use" not in scope:
+        raise InvalidToken("A scope with “Add saved sign-ins” needs “Use saved sign-ins” too: "
+                           "a check that adds a sign-in then uses it.")
+    return tuple(sorted(set(scope)))
+
+
+def create_token(name, kind, node_name=None, expires_in_days=None, owner_id=None, access=None, actor=None,
+                 scope=None):
     """Make a managed token, owned by owner_id (a users.id; None: the admins'). The result's "token" is the
     plaintext: the only time it's available. With access (who asks), the result has its "ownerId", and a client
     token that would be the grid's first needs _may_switch_client_tokens (NotPermitted). actor is who made it,
-    for the audit log.
+    for the audit log. scope (client tokens only) is the list of scope ids that limits what the token may do;
+    None is no limit.
 
     Raises InvalidToken for a bad request and TokensUnavailable without an accessTokens table (or, for a token
-    someone owns, without an itemOwners table)."""
+    someone owns, without an itemOwners table; or, for a token with a scope, without a scope column)."""
     name, kind, node_name, expires_in_days = _validate_token_request(name, kind, node_name, expires_in_days)
+    scope = _validate_scope(kind, scope)
     ensure_schema()
     token = TOKEN_PREFIXES[kind] + secrets.token_urlsafe(32)
     try:
@@ -1199,21 +1249,34 @@ def create_token(name, kind, node_name=None, expires_in_days=None, owner_id=None
             tables = _tables(cur)
             if owner_id is not None and "accesstokens" in tables and "itemowners" not in tables:
                 raise TokensUnavailable(_NO_OWNER_TABLE)
+            if scope is not None and "accesstokens" in tables and "scope" not in _columns(cur, "accessTokens"):
+                raise TokensUnavailable(_NO_TOKEN_SCOPE)
             if kind == "client" and not _may_switch_client_tokens(access):
                 cur.execute("SELECT COUNT(*) FROM accessTokens WHERE kind = 'client'")
                 if not cur.fetchone()[0]:
                     raise NotPermitted(FIRST_CLIENT_TOKEN, permission="tokens.all")
-            cur.execute(_sql("""
-                INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """), (name, kind, token_hash(token), token[:12], node_name, _db_time(now), _db_time(expires)))
+            if scope is None:
+                cur.execute(_sql("""
+                    INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """), (name, kind, token_hash(token), token[:12], node_name, _db_time(now), _db_time(expires)))
+            else:
+                cur.execute(_sql("""
+                    INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt, scope)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """), (name, kind, scoped_token_hash(token), token[:12], node_name, _db_time(now),
+                       _db_time(expires), permissions.unparse(scope)))
             token_id = cur.lastrowid
             if owner_id is not None:
                 _add_owner(cur, "token", token_id, owner_id)
-            _audit(cur, actor, "token.created", "token", token_id, name, {"kind": kind, "owner": owner_id})
+            details = {"kind": kind, "owner": owner_id}
+            if kind == "client":
+                details["scope"] = None if scope is None else list(scope)
+            _audit(cur, actor, "token.created", "token", token_id, name, details)
     except _MissingTables as e:
         raise TokensUnavailable(_NO_TOKEN_TABLE) from e
-    result = _token((token_id, name, kind, token[:12], node_name, now, expires, None, None), now)
+    result = _token((token_id, name, kind, token[:12], node_name, now, expires, None, None,
+                     scope is not None, None if scope is None else permissions.unparse(scope)), now)
     if access is not None:
         result["ownerId"] = owner_id
     result["token"] = token
@@ -1247,7 +1310,8 @@ def revoke_token(token_id, access=None, actor=None):
                         (token_id,))
             if cur.rowcount:
                 _audit(cur, actor, "token.revoked", "token", token_id, found[1])
-            cur.execute(_sql("SELECT {}, {} FROM accessTokens WHERE id = ?".format(_now_sql(), _TOKEN_COLUMNS)), (token_id,))
+            cur.execute(_sql("SELECT {}, {} FROM accessTokens WHERE id = ?".format(_now_sql(), _token_columns(cur))),
+                        (token_id,))
             row = cur.fetchone()
     except _MissingTables:
         return None
@@ -1295,9 +1359,11 @@ def delete_token(token_id, access=None, actor=None):
 
 
 def client_token(token):
-    """The active managed client token `token` is, as {"id", "name", "ownerId"}, or None. ownerId is the users.id
-    of the person who made it, or None when an admin did (with the admin token, or before there were users):
-    checks using it act as an admin. Stamps the token's lastUsedAt, as the hub does when a check connects with it.
+    """The active managed client token `token` is, as {"id", "name", "ownerId", "scope"}, or None. ownerId is the
+    users.id of the person who made it, or None when an admin did (with the admin token, or before there were
+    users): checks using it act as an admin. scope is None for a token made without one; otherwise the frozenset
+    of its scope ids this version knows, which may be empty (nothing is allowed). Stamps the token's lastUsedAt,
+    as the hub does when a check connects with it.
 
     Raises TokensUnavailable when the database has users but no itemOwners table (or the UI's database user can't
     see it): people may have made tokens, and without their owner rows none can be told from an admin's, so none
@@ -1306,16 +1372,29 @@ def client_token(token):
         return None
     try:
         with _session() as cur:
-            cur.execute(_sql("SELECT {}, id, name, expiresAt, revokedAt FROM accessTokens WHERE tokenHash = ? AND kind = 'client'"
-                             .format(_now_sql())), (token_hash(token),))
-            row = cur.fetchone()
-            if row is None or _token_status(_parse_time(row[0]), _parse_time(row[3]), _parse_time(row[4])) != "active":
+            scope_sql = "scope" if "scope" in _columns(cur, "accessTokens") else "NULL"
+            cur.execute(_sql("SELECT {}, id, name, expiresAt, revokedAt, tokenHash, {} FROM accessTokens "
+                             "WHERE tokenHash IN (?, ?) AND kind = 'client'".format(_now_sql(), scope_sql)),
+                        (token_hash(token), scoped_token_hash(token)))
+            rows = cur.fetchall()
+            if len(rows) != 1:
+                if rows:  # one token stored both ways: only someone writing to the table does that
+                    warn_once(_TWO_TOKEN_ROWS.format(rows[0][1], rows[1][1]))
+                return None
+            row = rows[0]
+            if _token_status(_parse_time(row[0]), _parse_time(row[3]), _parse_time(row[4])) != "active":
+                return None
+            # The row says which form it is: stored as scoped, it has a scope; stored by the plain hash, it has
+            # none. Anything else was changed in the database, or the scope column is gone: it lets nothing in.
+            if str(row[5]).startswith(SCOPED_HASH_PREFIX) != (row[6] is not None):
+                warn_once(_TOKEN_FORM.format(row[1]))
                 return None
             tables = _tables(cur)
             if "users" in tables and "itemowners" not in tables:
                 raise TokensUnavailable(_NO_TOKEN_OWNERS)
             cur.execute(_sql("UPDATE accessTokens SET lastUsedAt = {} WHERE id = ?".format(_now_sql())), (row[1],))
-            return {"id": row[1], "name": row[2], "ownerId": _owner(cur, "token", row[1], tables)}
+            return {"id": row[1], "name": row[2], "ownerId": _owner(cur, "token", row[1], tables),
+                    "scope": None if row[6] is None else permissions.parse_scope(row[6])}
     except _MissingTables:
         return None
 
@@ -1766,12 +1845,13 @@ def list_signins(access=None):
     return {"ready": True, "generated": _iso(now), "signins": signins}
 
 
-def _may_add_signins(access):
-    # A name's first checkout adds it, for checks whose token's owner may add sign-ins (and the store's own callers).
-    return access is None or "signins.add" in access.permissions
+def _may_add_signins(access, may_add=True):
+    # A name's first checkout adds it, for checks whose token's owner may add sign-ins (and the store's own callers),
+    # unless the token's scope leaves adding out (may_add).
+    return may_add and (access is None or "signins.add" in access.permissions)
 
 
-def _add_signin(name, access=None, actor=None):
+def _add_signin(name, access=None, actor=None, may_add=True):
     """Drop every state past its expiresAt, and add the row of a name no check used yet when the check may
     (_may_add_signins), owned by its token's owner (access.user_id; None: the admins'). SigninsFull past
     SIGNIN_MAX_COUNT names, or past SIGNIN_MAX_PER_OWNER for an owner who doesn't see every sign-in.
@@ -1787,7 +1867,7 @@ def _add_signin(name, access=None, actor=None):
         # No locking read: on MySQL, FOR UPDATE on a name nobody has locks a gap, and two checkouts holding it
         # deadlock on their INSERTs. uq_signin_name decides a race.
         cur.execute(_sql("SELECT id FROM savedSignins WHERE name = ?"), (name,))
-        if cur.fetchone() is not None or not _may_add_signins(access):
+        if cur.fetchone() is not None or not _may_add_signins(access, may_add):
             return
         owner_id = access.user_id if access is not None else None
         if owner_id is not None and not _owner_tables(cur)[0]:
@@ -1813,7 +1893,8 @@ def _add_signin(name, access=None, actor=None):
         _audit(cur, actor, "signin.created", "signin", signin_id, name, {"owner": owner_id})
 
 
-def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_id=None, access=None, actor=None):
+def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_id=None, access=None, actor=None,
+                    may_add=True):
     """What a check should do to be signed in as `name`:
 
     {"status": "saved", "id", "name", "version", "state", "savedAt", "expiresAt"}: open a context with that
@@ -1830,7 +1911,8 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
     With access (who the check acts as), a sign-in it may not use raises NotShared, and two more answers can
     come: {"status": "missing"} for a name nobody added when it may not add names, and {"status":
     "owner-signs-in", "name"} when nothing usable is saved and it isn't a steward, so it may not sign in for
-    it. actor is the check, for the audit log.
+    it. actor is the check, for the audit log. may_add is False when the asking client token's scope leaves out
+    signins.add: a name nobody added then stays missing, whatever access holds.
     Raises InvalidSignin, SigninsFull, mfa.SecretsKeyMissing (before anything is written) and SigninsUnavailable."""
     name = _signin_name(name)
     rejected_version = _version(rejected_version, "rejectedVersion")
@@ -1842,7 +1924,7 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
     ensure_schema()
     try:
         while True:
-            _add_signin(name, access, actor)
+            _add_signin(name, access, actor, may_add)
             with _session() as cur:
                 lock = _lock(cur)
                 cur.execute("SELECT " + _now_sql())
@@ -1859,7 +1941,7 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
                         if not usable:
                             raise _not_shared("saved sign-in", name)
                     return _checkout(cur, now, row, used_by, rejected_version, signin_id, lease_s, steward)
-                if not _may_add_signins(access):
+                if not _may_add_signins(access, may_add):
                     return {"status": "missing"}
             # An admin deleted it in between: add it again.
     except _MissingTables as e:

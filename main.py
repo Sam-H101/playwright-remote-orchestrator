@@ -33,6 +33,8 @@ CONNECT_TIMEOUT = re.compile(r"browserType\.connect: Timeout (\d+)ms exceeded", 
 HINTS = [
     (400, re.compile(r"^node "), "check GATEWAY_NODE"),
     (401, None, "check GATEWAY_CLIENT_TOKEN: it is missing, wrong, revoked or expired"),
+    (403, None, "GATEWAY_CLIENT_TOKEN's scope leaves out opening browser sessions: use a token whose scope "
+                "includes it"),
     (404, re.compile(r"^no node or static host "), "check GATEWAY_NODE: the hub knows no node or static host of "
                                                     "that name"),
     (404, None, "the hub has no /connect: it predates routing by browser, so upgrade it (or check GATEWAY_URL)"),

@@ -139,7 +139,8 @@ export function createUsers(el, ctx) {
     return html`<div class="empty">${icon("i-users", "empty-mark")}
       <h2>Set up single sign-on to see people here</h2>
       <p>People appear here after they first sign in with your identity provider (Entra ID, Google, Okta, Keycloak...). Register the
-        Grid UI there as a web application with a client secret, then give it these settings.</p>
+        Grid UI there as a web application, with a client secret, or without one where the platform gives the Grid UI a token (see the README), then give it these
+        settings.</p>
       <ol class="steps">
         ${step("Register this redirect URI with your identity provider", "the redirect URI", "redirect")}
         ${step("Add these to .env next to docker-compose.yaml (or to the Grid UI's environment), with your provider's values", "the settings", "env")}

@@ -2,11 +2,13 @@
 
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { test, afterEach } = require('node:test');
 const h = require('./helpers');
+const { createHub } = require('../hub');
 const { MemoryRegistry } = require('../lib/registry');
 
 afterEach(h.cleanup);
@@ -494,4 +496,159 @@ test('the start-up sweep removes ephemeral nodes that went away while the hub wa
   await h.startHub({ ephemeralGraceMs: 120000 }, registry);
   assert.deepEqual([...registry.nodes.keys()].sort(), ['recent', 'static']);
   assert.equal(registry.nodes.get('recent').online, 0);
+});
+
+// Client tokens with a scope. The format is the Grid UI's: pwgc_ + secrets.token_urlsafe(32).
+const mintClient = () => `pwgc_${crypto.randomBytes(32).toString('base64url')}`;
+const NO_SESSIONS = 'gateway token is not allowed to open browser sessions (its scope leaves that out)\n';
+const inUse = (registry) => [...registry.slots.values()].flatMap((m) => [...m.values()]).filter((s) => s.inUse);
+
+test('a client token whose scope leaves out sessions gets 403 on /connect, in the header and the query, and takes no slot', async () => {
+  const registry = new MemoryRegistry();
+  const token = mintClient();
+  const row = registry.addToken(token, { kind: 'client', name: 'grid monitor', scope: 'grid.view mfa.use signins.add signins.use' });
+  const lines = [];
+  const push = (level) => (...args) => lines.push(`${level} ${args.join(' ')}`);
+  const hub = createHub(h.hubConfig(), { log: { info: push('info'), warn: push('warn'), error: push('error') }, registry });
+  const url = `ws://127.0.0.1:${await hub.start()}`;
+  h.cleanups.push(() => hub.stop());
+  const agent = await h.startAgent(url, { name: 'scoped-1', slots: 1 });
+  await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
+
+  const refusals = [
+    h.connect(`${url}/connect?gateway_token=${token}`),
+    h.connect(`${url}/connect?node=scoped-1&gateway_token=${token}`),
+    h.connect(`${url}/connect`, { 'x-gateway-token': token }),
+    h.connect(`${url}/connect?node=scoped-1`, { 'x-gateway-token': token }),
+    // Refused before the request is looked at: a node nobody serves is not a 404 for it.
+    h.connect(`${url}/connect?node=nobody&gateway_token=${token}`),
+  ];
+  for (const refusal of refusals) {
+    await assert.rejects(refusal, (err) => {
+      assert.deepEqual([err.status, err.body], [403, NO_SESSIONS]);
+      return true;
+    });
+  }
+  assert.equal(hub.queue.length, 0, 'never queued');
+  assert.deepEqual([hub.claims.size, hub.pending.size, hub.sessions.size], [0, 0, 0]);
+  assert.deepEqual(inUse(registry), [], 'no slot claimed');
+  assert.equal(row.lastUsedAt, null, 'a refused token is not recorded as used');
+
+  const refusedLines = lines.filter((l) => l.includes('rejected'));
+  assert.equal(refusedLines.length, 5);
+  for (const line of refusedLines) {
+    assert.equal(line, `warn client 127.0.0.1 rejected: client token ${token.slice(0, 12)}... (#${row.id}) is not allowed to open browser sessions (its scope leaves that out)`);
+  }
+  assert.ok(lines.every((l) => !l.includes(token)), 'the token is never logged');
+
+  // The slot it did not take is there for a token that may open sessions.
+  const other = mintClient();
+  registry.addToken(other, { kind: 'client' });
+  const ws = await h.connect(`${url}/connect`, { 'x-gateway-token': other });
+  ws.send('hello');
+  assert.equal((await h.nextMessage(ws)).data.toString(), 'hello');
+});
+
+test('a scoped token with sessions.open opens a session', async () => {
+  const registry = new MemoryRegistry();
+  const token = mintClient();
+  const row = registry.addToken(token, { kind: 'client', scope: 'grid.view sessions.open' });
+  const only = mintClient();
+  registry.addToken(only, { kind: 'client', scope: 'sessions.open' });
+  const { url, hub } = await h.startHub({}, registry);
+  const agent = await h.startAgent(url, { name: 'scoped-2', slots: 3 });
+  await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
+
+  const viaQuery = await h.connect(`${url}/connect?a=1&gateway_token=${token}`);
+  viaQuery.send('info');
+  let info = JSON.parse((await h.nextMessage(viaQuery)).data);
+  assert.equal(info.url, '/?a=1', 'the token is stripped from what run-server sees');
+  const viaHeader = await h.connect(`${url}/connect?node=scoped-2`, { 'x-gateway-token': token });
+  viaHeader.send('info');
+  info = JSON.parse((await h.nextMessage(viaHeader)).data);
+  assert.equal(info.headers['x-gateway-token'], undefined);
+  const third = await h.connect(`${url}/connect`, { 'x-gateway-token': only });
+  third.send('hello');
+  assert.equal((await h.nextMessage(third)).data.toString(), 'hello');
+  assert.equal(hub.sessions.size, 3);
+  assert.equal(inUse(registry).length, 3);
+  assert.match(row.lastUsedAt, /Z$/);
+});
+
+test('a waiting client is dropped with 403 when its token\'s scope loses sessions.open', async () => {
+  const registry = new MemoryRegistry();
+  const token = mintClient();
+  const row = registry.addToken(token, { kind: 'client', scope: 'grid.view sessions.open' });
+  const other = mintClient();
+  registry.addToken(other, { kind: 'client', scope: 'sessions.open' });
+  const { url, hub } = await h.startHub({ tokenCacheMs: 0, tokenRecheckMs: 60000, queuePollMs: 100 }, registry);
+  const agent = await h.startAgent(url, { name: 'scoped-3', slots: 1 });
+  await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
+
+  const first = await h.connect(`${url}/connect?gateway_token=${token}`);
+  const queued = h.connect(`${url}/connect?gateway_token=${token}`);
+  await h.waitFor(() => hub.queue.length === 1, { what: 'queued' });
+  const unaffected = h.connect(`${url}/connect`, { 'x-gateway-token': other });
+  await h.waitFor(() => hub.queue.length === 2, { what: 'both queued' });
+
+  row.scope = 'grid.view'; // what only an UPDATE by hand can do: a scope is never changed by the Grid UI
+  first.send('still open');
+  assert.equal((await h.nextMessage(first)).data.toString(), 'still open', 'a session that is already open is left alone');
+  first.close(); // frees the slot: the client whose token lost sessions.open is refused, the next in line gets it
+  await assert.rejects(queued, (err) => {
+    assert.deepEqual([err.status, err.body], [403, NO_SESSIONS]);
+    return true;
+  });
+  const served = await unaffected;
+  served.send('next in line');
+  assert.equal((await h.nextMessage(served)).data.toString(), 'next in line');
+
+  // The periodic token re-check drops a waiting client too, without waiting for a slot to free.
+  row.scope = 'sessions.open';
+  const waiting = h.connect(`${url}/connect?gateway_token=${token}`);
+  await h.waitFor(() => hub.queue.length === 1, { what: 'queued again' });
+  row.scope = '';
+  const dropped = assert.rejects(waiting, (err) => {
+    assert.deepEqual([err.status, err.body], [403, NO_SESSIONS]);
+    return true;
+  });
+  await hub.recheckTokens();
+  await dropped;
+  assert.equal(hub.queue.length, 0);
+  assert.equal(inUse(registry).length, 1, 'only the open session holds a slot');
+});
+
+test('a waiting client whose row\'s scope was cleared is dropped with 401', async () => {
+  const registry = new MemoryRegistry();
+  const token = mintClient();
+  const row = registry.addToken(token, { kind: 'client', scope: 'sessions.open' });
+  const { url, hub } = await h.startHub({ tokenCacheMs: 0, tokenRecheckMs: 60000, queuePollMs: 100 }, registry);
+  const agent = await h.startAgent(url, { name: 'scoped-4', slots: 1 });
+  await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
+  const lost = (err) => {
+    assert.deepEqual([err.status, err.body], [401, 'gateway token is not usable: its scope was lost or changed in the database\n']);
+    return true;
+  };
+
+  const first = await h.connect(`${url}/connect?gateway_token=${token}`);
+  const queued = h.connect(`${url}/connect`, { 'x-gateway-token': token });
+  await h.waitFor(() => hub.queue.length === 1, { what: 'queued' });
+  row.scope = null; // the row stays in the scoped form
+  first.close();
+  await assert.rejects(queued, lost);
+  await h.waitFor(() => inUse(registry).length === 0, { what: 'the slot free again' });
+  // It is not let in as a token with no limit, now or by the re-check.
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=${token}`), lost);
+
+  row.scope = 'sessions.open';
+  const second = await h.connect(`${url}/connect?gateway_token=${token}`);
+  const waiting = h.connect(`${url}/connect?gateway_token=${token}`);
+  await h.waitFor(() => hub.queue.length === 1, { what: 'queued again' });
+  row.scope = null;
+  const dropped = assert.rejects(waiting, lost);
+  await hub.recheckTokens();
+  await dropped;
+  assert.equal(hub.queue.length, 0);
+  second.send('still open');
+  assert.equal((await h.nextMessage(second)).data.toString(), 'still open');
 });

@@ -10,7 +10,8 @@ DEFAULT_URL = "http://grid_ui:4444"
 
 class Refused(Exception):
     """The Grid UI answered with an HTTP error: its status, its JSON answer ({} when it sent none) and the
-    HTTP reason."""
+    HTTP reason. The answer says why: a 403 has not_shared, forbidden, owner_disabled, or out_of_scope (with the
+    scope id as "scope") for a token whose scope leaves the request out."""
 
     def __init__(self, status, answer, reason):
         super().__init__(status, reason)

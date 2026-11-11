@@ -6,7 +6,7 @@ import { app } from "../app.js";
 import * as api from "../api.js";
 import * as auth from "../auth.js";
 import { html, icon, patchList, setHTML, setText } from "../html.js";
-import { agentCommand, ago, connectUrl, fullDate, inTime, parseTime, plural, shortDate } from "../format.js";
+import { agentCommand, ago, connectUrl, fullDate, inTime, parseTime, plural, scopeLimit, shortDate } from "../format.js";
 import { confirm, dismissible } from "../ui/dialog.js";
 import { createPicker, directory } from "../ui/picker.js";
 import { copy, toast } from "../ui/toast.js";
@@ -25,6 +25,9 @@ const ACTS_AS_ADMIN = "Made before single sign-on, or with the admin token. Give
 const LAST_CLIENT_ROW = "It's the last client token on record: deleting it lets checks without a token back in after the hub's next restart. " +
   "Someone whose roles include “Every access token” can delete it.";
 const FIRST_CLIENT = "The grid's first client token makes the hub turn away checks without one, so someone whose roles include “Every access token” makes it.";
+const SCOPE_GONE = "May do nothing: its scope was lost. Revoke it and make another.";
+const NO_SCOPED_ROUTE = "The Grid UI that answered is from before token scopes, so it made no token. " +
+  "Try again when the update has finished.";
 
 export function createAccess(section) {
   setHTML(section, html`
@@ -198,7 +201,8 @@ export function createAccess(section) {
       : html`<button type="button" class="btn ghost small destructive" data-delete-token="${t.id}" data-fk="delete-${t.id}"${switches
         ? html` disabled title="${LAST_CLIENT_ROW}"` : ""}>Delete</button>`;
     return html`<tr data-key="${t.id}" data-token="${t.id}" data-status="${t.status}" data-jk tabindex="-1">
-      <td class="cell-token"><span class="tok-name">${t.name}</span><code class="tok-prefix mono" title="The token starts with these characters">${t.prefix}…</code></td>
+      <td class="cell-token"><span class="tok-name">${t.name}</span><code class="tok-prefix mono" title="The token starts with these characters">${t.prefix}…</code>${t.scope != null
+        ? html`<span class="tok-scope">${t.scopeLost ? SCOPE_GONE : cap(scopeLimit(t.scope))}</span>` : ""}</td>
       <td class="cell-kind" data-label="Kind"><span class="kind k-${t.kind}">${KIND_LABEL[t.kind] || t.kind}</span></td>
       ${owners ? ownerCell(t) : ""}
       <td class="cell-bound${t.kind !== "agent" ? " na" : ""}" data-label="Bound to">${t.kind !== "agent" ? html`<span class="dim">–</span>`
@@ -251,12 +255,15 @@ export function createAccess(section) {
   // Client tokens nobody owns act as an admin: their checks get every MFA secret, and the saved sign-ins that are
   // Admins' or shared with Admin, while such a share still reaches admins (its owner keeps the permissions they had
   // when it was shared). Whoever may see every token is asked to give each to the person whose checks use it.
+  // One whose token scope leaves out both MFA secrets and saved sign-ins gets neither, so it isn't counted.
+  const usesSecrets = (t) => t.scope == null || t.scope.includes("mfa.use") || t.scope.includes("signins.use");
   function actsMarkup(d) {
-    const n = d.tokens.filter((t) => t.actsAs === "admin" && t.status === "active").length, env = !!(d.bootstrap && d.bootstrap.client);
+    const acts = d.tokens.filter((t) => t.actsAs === "admin" && t.status === "active" && usesSecrets(t));
+    const n = acts.length, narrowed = acts.some((t) => t.scope != null), env = !!(d.bootstrap && d.bootstrap.client);
     if (!n && !env) return null;
     return html`<div>${n ? html`<strong>${n === 1 ? "1 client token acts" : n + " client tokens act"} as an admin:</strong> ${n === 1 ? "it was" : "they were"} made
       before single sign-on or with the admin token, so checks using ${n === 1 ? "it get" : "them get"} every MFA secret, and the saved sign-ins
-      that are Admins' or shared with Admin. Give
+      that are Admins' or shared with Admin${narrowed ? (n === 1 ? ", as far as its token scope lets them" : ", as far as their token scopes let them") : ""}. Give
       ${n === 1 ? "it" : "each"} to the person whose checks use it.` : ""}${env ? html`${n ? " " : ""}GATEWAY_CLIENT_TOKEN ${n ? "also " : ""}acts as an admin.
       Once people use client tokens of their own, and the checks that ask the Grid UI for codes and sign-ins send one as GRID_MFA_TOKEN,
       take it out of the Grid UI's environment.` : ""}</div>`;
@@ -285,6 +292,8 @@ export function createAccess(section) {
   }
 
   // ---- reveal -----------------------------------------------------------------
+  // A client token whose scope leaves out opening browser sessions is of no use at the hub.
+  const hubless = (r) => r.kind === "client" && r.scope != null && !r.scope.includes("sessions.open");
   function usages(r) {
     const hub = app.hub();
     if (r.platform) {
@@ -299,6 +308,11 @@ export function createAccess(section) {
         ["Linux or macOS host: the agent, from the repository", agentCommand("linux", hub, r.token, r.nodeName)],
         ["Docker runner: its environment, e.g. runner.env", "GATEWAY_AGENT_TOKEN=" + r.token + (r.nodeName ? "\nNODE_NAME=" + r.nodeName : "")],
       ];
+    }
+    // The hub turns away a token whose scope leaves out sessions: no hub address is handed out for it.
+    if (hubless(r)) {
+      return [["Scripts that ask the Grid UI: as a bearer token. The hub turns this token away, because its scope leaves out opening browser sessions",
+        "Authorization: Bearer " + r.token]];
     }
     return [
       ["Check containers: their environment (example_playwright in docker-compose.yaml)", "GATEWAY_CLIENT_TOKEN=" + r.token],
@@ -335,7 +349,7 @@ export function createAccess(section) {
     const r = access.reveal, box = $("#reveal");
     app.unsaved = !!r;
     if (!r) { setHTML(box, html``); return; }
-    const facts = [KIND_LABEL[r.kind] + " token", r.name, r.nodeName ? "bound to " + r.nodeName : "",
+    const facts = [KIND_LABEL[r.kind] + " token", r.name, r.scope != null ? scopeLimit(r.scope) : "", r.nodeName ? "bound to " + r.nodeName : "",
       r.expiresAt ? "expires " + shortDate(parseTime(r.expiresAt), app.now()) : "never expires"].filter(Boolean);
     box.__html = null;
     setHTML(box, html`<section class="reveal panel" aria-labelledby="reveal-title">
@@ -346,7 +360,7 @@ export function createAccess(section) {
         <button type="button" class="btn ${r.platform ? "" : "primary"} small" data-copy="${r.token}" data-copy-label="the token" data-fk="reveal-copy" aria-describedby="reveal-warn">${icon("i-copy")}Copy</button></div>
       <p class="reveal-warn" id="reveal-warn">${icon("i-alert")}<span>It won't be shown again. The grid keeps only a hash of it: if it's lost, revoke it and create another.</span></p>
       <div class="usage"><h3>${r.platform ? "The command" : "Use it"}</h3>
-        ${hubField()}
+        ${hubless(r) ? "" : hubField()}
         <div class="usage-grid">${usages(r).map((u, i) => html`<div class="step"><div class="step-label">${u[0]}</div>
           <div class="snippet"><code class="mono" data-usage="${i}">${u[1]}</code><button type="button" class="${r.platform ? "btn primary small" : "icon-btn tiny"}" data-copy="${u[1]}" data-copy-label="the command"
             data-fk="reveal-use-${i}" aria-label="Copy the command for ${u[0].split(":")[0]}">${icon("i-copy")}${r.platform ? "Copy command" : ""}</button></div></div>`)}</div>
@@ -549,6 +563,7 @@ export function createAccess(section) {
       <h2 id="token-owner-title">Give “${t.name}” to someone</h2>
       <p class="sheet-sub">Checks using it then act as them: they get the MFA secrets and saved sign-ins that person can use, rather than
         every one. Once given, it stays theirs.</p>
+      ${t.scope != null ? html`<p class="sheet-sub">It keeps its limit: it ${scopeLimit(t.scope)}.</p>` : ""}
       <div class="field">
         <label for="give-token-input">Person</label>
         <div id="give-token-pick"></div>
@@ -627,8 +642,18 @@ export function createAccess(section) {
     document.getElementById("nt-submit").disabled = none;
     document.getElementById("nt-node-field").hidden = kind !== "agent";
     document.getElementById("nt-days-wrap").hidden = document.getElementById("nt-expiry").value !== "custom";
-    // A person's client token acts as them; one made with the admin token, as an admin.
-    document.getElementById("nt-client-note").hidden = !(kind === "client" && auth.state().user);
+    // A scope is a client token's. Adding a sign-in means using it, so that box follows the other.
+    const limited = kind === "client" && dlg.querySelector('input[name="limit"]:checked').value === "scope";
+    // A person's client token acts as them; one made with the admin token, as an admin. One limited to neither
+    // MFA secrets nor saved sign-ins gets none of them.
+    const secrets = !limited || !!dlg.querySelector('input[name="scope"][value="mfa.use"]:checked, input[name="scope"][value^="signins."]:checked');
+    document.getElementById("nt-client-note").hidden = !(kind === "client" && auth.state().user && secrets);
+    document.getElementById("nt-scope-field").hidden = kind !== "client";
+    document.getElementById("nt-scope-list").hidden = !limited;
+    const use = dlg.querySelector('input[name="scope"][value="signins.use"]');
+    const adds = dlg.querySelector('input[name="scope"][value="signins.add"]').checked;
+    if (adds) use.checked = true;
+    use.disabled = adds;
     // The hub starts asking for a token once one of this kind exists, even without its env token.
     const n = d && d.ready ? kindCount(d, kind) : null;
     const first = n && !none && !(d.bootstrap && d.bootstrap[kind]) && n.rows - n.revoked === 0;
@@ -639,7 +664,7 @@ export function createAccess(section) {
   }
   function openCreate() {
     document.getElementById("new-token-form").reset();
-    ["nt-name", "nt-node", "nt-days"].forEach((id) => document.getElementById(id).removeAttribute("aria-invalid"));
+    ["nt-name", "nt-node", "nt-days", "nt-scope-sessions"].forEach((id) => document.getElementById(id).removeAttribute("aria-invalid"));
     formError("");
     syncCreate();
     dlg.showModal();
@@ -650,10 +675,13 @@ export function createAccess(section) {
     const node = document.getElementById("nt-node").value.trim().toLowerCase();
     const expiry = document.getElementById("nt-expiry").value;
     const days = expiry === "custom" ? Number(document.getElementById("nt-days").value) : expiry ? Number(expiry) : null;
+    const limited = kind === "client" && dlg.querySelector('input[name="limit"]:checked').value === "scope";
+    const scope = limited ? [...dlg.querySelectorAll('input[name="scope"]:checked')].map((box) => box.value) : null;
     const problem = !name ? ["nt-name", "Give the token a name, such as the hosts it's for."] :
       kind === "agent" && node && !NODE_NAME.test(node) ? ["nt-node", "A node name is 1 to 128 characters: letters, digits, '.', '_' and '-'."] :
-        days !== null && !(Number.isInteger(days) && days >= 1 && days <= 3650) ? ["nt-days", "Pick a whole number of days from 1 to 3650."] : null;
-    ["nt-name", "nt-node", "nt-days"].forEach((id) => document.getElementById(id).removeAttribute("aria-invalid"));
+        days !== null && !(Number.isInteger(days) && days >= 1 && days <= 3650) ? ["nt-days", "Pick a whole number of days from 1 to 3650."] :
+          limited && !scope.length ? ["nt-scope-sessions", "Tick at least one thing the token may do, or choose Everything."] : null;
+    ["nt-name", "nt-node", "nt-days", "nt-scope-sessions"].forEach((id) => document.getElementById(id).removeAttribute("aria-invalid"));
     if (problem) {
       document.getElementById(problem[0]).setAttribute("aria-invalid", "true");
       formError(problem[1]);
@@ -661,7 +689,9 @@ export function createAccess(section) {
       return null;
     }
     formError("");
-    return { name, kind, nodeName: kind === "agent" && node ? node : null, expiresInDays: days };
+    // A limited token is asked of its own route, with only what that route reads; the other body is today's.
+    return limited ? { name, expiresInDays: days, scope }
+      : { name, kind, nodeName: kind === "agent" && node ? node : null, expiresInDays: days };
   }
   document.getElementById("new-token-form").addEventListener("change", syncCreate);
   document.getElementById("new-token-form").addEventListener("submit", async (e) => {
@@ -670,7 +700,7 @@ export function createAccess(section) {
     if (!body || btn.disabled) return;
     btn.disabled = true;
     try {
-      const res = await api.post("api/tokens", body);
+      const res = await api.post(body.scope ? "api/tokens/scoped" : "api/tokens", body);
       if (res === null) return; // sign-in dismissed: the form stays as it was
       dlg.close();
       access.reveal = res;
@@ -685,7 +715,8 @@ export function createAccess(section) {
         toast(err.message, true);
         return;
       }
-      formError(err.message);
+      // A Grid UI from before scopes has no such route: it made nothing, and there is nothing to revoke.
+      formError(body.scope && (err.status === 404 || err.status === 405) ? NO_SCOPED_ROUTE : err.message);
     } finally {
       btn.disabled = false;
     }

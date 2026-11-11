@@ -93,7 +93,7 @@ def test_access_shows_a_sign_in_panel_and_a_refusal_does_not_loop(admin_grid, pa
     page.press("#signin-token", "Enter")
     page.wait_for_selector("#token-rows tr")
     assert seen[0] == ("GET", "s3cret") and set(seen) == {("GET", "s3cret")}
-    assert page.locator("#token-rows tr").count() == 6
+    assert page.locator("#token-rows tr").count() == 7
     assert "Admin" in page.text_content("#account-btn")
 
     page.click("#account-btn")
@@ -206,6 +206,7 @@ def test_deleting_the_last_token_on_record_warns_that_the_hub_opens_up(admin_gri
     p.wait_for_selector("#token-rows tr")
 
     run(path, "UPDATE accessTokens SET revokedAt = '2026-01-01 00:00:00' WHERE name = 'Example checks'")
+    run(path, "DELETE FROM accessTokens WHERE name = 'Grid monitor'")
     p.click("[data-nav-view=overview] >> visible=true")
     p.click("[data-nav-view=access] >> visible=true")  # opening the view reloads the list
     p.wait_for_selector("#token-rows tr[data-status=revoked]:has-text('Example checks')")
@@ -235,9 +236,9 @@ def test_token_filters(admin_grid, admin_page):
     p.wait_for_selector("#token-rows tr")
 
     p.click("#token-kind [data-kind=client]")
-    assert sorted(names(p)) == ["Example checks", "Staging checks 2025"]
+    assert sorted(names(p)) == ["Example checks", "Grid monitor", "Staging checks 2025"]
     p.click("#token-status [data-status=active]")
-    assert names(p) == ["Example checks"]
+    assert sorted(names(p)) == ["Example checks", "Grid monitor"]
     assert p.text_content("#token-kind [data-kind=agent]") == "Agent3"  # counts follow the other filter
     p.click("#token-kind [data-kind=all]")
     p.click("#token-status [data-status=revoked]")
@@ -248,7 +249,7 @@ def test_token_filters(admin_grid, admin_page):
     p.fill("#token-filter", "nothing like this")
     p.wait_for_selector("#tokens-empty:not([hidden])")
     p.click("[data-clear-token-filter]")
-    assert len(names(p)) == 6
+    assert len(names(p)) == 7
     assert names(p)[-2:] == ["Staging checks 2025", "Old build farm"]  # expired, then revoked, last
 
 
@@ -263,7 +264,7 @@ def test_an_action_that_empties_the_filter_goes_back_to_all(admin_grid, admin_pa
     p.click("#confirm-ok")
     p.wait_for_function("() => document.getElementById('token-note').textContent.indexOf('showing all') !== -1")
     assert p.get_attribute("#token-status [data-status=all]", "aria-pressed") == "true"
-    assert len(names(p)) == 5
+    assert len(names(p)) == 6
 
 
 def test_an_older_demo_database_shows_an_empty_state(admin_grid, admin_page):
@@ -319,7 +320,7 @@ def test_add_a_host_makes_a_bound_token_and_waits_for_the_node(admin_grid, admin
     p.click("[data-reveal-done]")
     p.click("#confirm-ok")  # hide it without copying: it was only a test
     p.wait_for_selector(".reveal", state="detached")
-    p.wait_for_function("() => document.querySelectorAll('#token-rows tr').length === 7")
+    p.wait_for_function("() => document.querySelectorAll('#token-rows tr').length === 8")
     p.fill("#ah-node", "WIN-BUILD-02")
     assert "Registers as win-build-02" in p.text_content("#ah-hint")
     p.click("#ah-create")
@@ -351,3 +352,260 @@ def test_access_fits_a_phone(admin_grid, browser):  # noqa: F811
         assert top >= p.evaluate("document.querySelector('.topbar').getBoundingClientRect().bottom")  # not under the bar
     finally:
         ctx.close()
+
+
+# ---- token scopes -------------------------------------------------------------------------------
+
+NO_SCOPED_ROUTE = "The Grid UI that answered is from before token scopes, so it made no token. Try again when the update has finished."
+SCOPE_GONE = "May do nothing: its scope was lost. Revoke it and make another."
+USAGES = "els => els.map(e => e.textContent)"
+
+
+def token_posts(p):
+    """Every request that could make a token, as the page sends it: (path below /api/, body)."""
+    seen = []
+    p.on("request", lambda r: seen.append((r.url.split("/api/", 1)[1], r.post_data_json))
+         if r.method == "POST" and "/api/tokens" in r.url else None)
+    return seen
+
+
+def open_dialog(p, url):
+    p.goto(url + "#/access")
+    p.wait_for_selector("#token-rows tr")
+    p.click("#new-token-btn")
+    p.wait_for_selector("#new-token-dialog[open]")
+
+
+def limited_form(p, name, *scope):
+    """Fill the open dialog for a client token called name, limited to these scope ids."""
+    p.check("input[name=kind][value=client]")
+    p.fill("#nt-name", name)
+    p.check("input[name=limit][value=scope]")
+    for scope_id in scope:
+        p.check("#nt-scope-list input[value='{}']".format(scope_id))
+
+
+def ticked(p):
+    return p.eval_on_selector_all("#nt-scope-list input[name=scope]:checked", "els => els.map(e => e.value)")
+
+
+def test_making_a_limited_client_token_from_the_dialog(admin_grid, admin_page):
+    url, path = admin_grid
+    p = admin_page
+    posts = token_posts(p)
+    open_dialog(p, url)
+    limited_form(p, "Uptime probe", "grid.view")
+    p.click("#nt-submit")
+    p.wait_for_selector(".reveal")
+    assert posts == [("tokens/scoped", {"name": "Uptime probe", "expiresInDays": 365, "scope": ["grid.view"]})]
+
+    token = p.text_content("#reveal-token")
+    assert re.fullmatch(r"pwgc_[A-Za-z0-9_-]{43}", token)
+    assert run(path, "SELECT tokenHash, kind, scope FROM accessTokens WHERE name = 'Uptime probe'") == [
+        (store.scoped_token_hash(token), "client", "grid.view")]
+    p.wait_for_selector("#token-rows tr:has-text('Uptime probe')")
+    assert row(p, "Uptime probe").locator(".tok-scope").text_content() == "May only see the grid"
+    # The hub turns this token away, so the page gives the bearer line and no hub address.
+    assert p.text_content(".reveal-title p").startswith("Client token · Uptime probe · may only see the grid · expires ")
+    assert p.eval_on_selector_all(".reveal [data-usage]", USAGES) == ["Authorization: Bearer " + token]
+    usage = p.text_content(".usage")
+    assert "its scope leaves out opening browser sessions" in usage
+    assert "/connect" not in usage and "gateway_token" not in usage and "GATEWAY_CLIENT_TOKEN" not in usage
+    assert p.get_attribute(".reveal [data-fk=reveal-use-0]", "data-copy") == "Authorization: Bearer " + token
+    assert "ws://" not in usage and "grid-hub.example" not in p.inner_text(".reveal")
+    assert p.locator(".reveal [data-hub-input]").count() == 0  # nor the field for one: no command here follows it
+
+
+def test_a_limited_token_that_may_open_sessions_gets_the_hub_address(admin_grid, admin_page):
+    url, _ = admin_grid
+    p = admin_page
+    posts = token_posts(p)
+    open_dialog(p, url)
+    limited_form(p, "Nightly checks", "mfa.use", "sessions.open")
+    p.click("#nt-submit")
+    p.wait_for_selector(".reveal")
+    assert posts == [("tokens/scoped", {"name": "Nightly checks", "expiresInDays": 365, "scope": ["sessions.open", "mfa.use"]})]
+    token = p.text_content("#reveal-token")
+    usage = p.text_content(".usage")
+    assert "GATEWAY_CLIENT_TOKEN=" + token in usage
+    assert "ws://grid-hub.example:4500/connect?gateway_token=" + token in usage
+    assert p.input_value(".reveal [data-hub-input]") == "ws://grid-hub.example:4500"
+    p.wait_for_selector("#token-rows tr:has-text('Nightly checks')")
+    assert row(p, "Nightly checks").locator(".tok-scope").text_content() == "May only open browser sessions and get MFA codes"
+
+
+def test_the_scope_choice_is_for_client_tokens_and_starts_at_everything(admin_grid, admin_page):
+    url, _ = admin_grid
+    p = admin_page
+    posts = token_posts(p)
+    open_dialog(p, url)
+    assert p.is_checked("input[name=kind][value=agent]") and p.is_hidden("#nt-scope-field")  # an agent token has no scope
+    p.check("input[name=kind][value=client]")
+    assert p.is_visible("#nt-scope-field") and p.is_checked("input[name=limit][value='']") and p.is_hidden("#nt-scope-list")
+    assert p.text_content("#nt-scope-field legend") == "What it may do"
+    assert p.get_attribute("#nt-scope-field", "aria-describedby") == "nt-scope-hint"
+    assert p.text_content("#nt-scope-hint") == "It can't be changed later: to change what a token may do, make another and revoke this one."
+    p.check("input[name=limit][value=scope]")
+    assert p.is_visible("#nt-scope-list") and ticked(p) == []
+    assert p.eval_on_selector_all("#nt-scope-list label", "els => els.map(e => e.textContent)") == [
+        "Open browser sessions", "See the grid", "Use MFA secrets", "Use saved sign-ins", "Add saved sign-ins"]
+    p.check("#nt-scope-list input[value='mfa.use']")
+    p.check("#nt-scope-list input[value='signins.add']")
+    p.check("input[name=kind][value=agent]")
+    assert p.is_hidden("#nt-scope-field") and p.is_hidden("#nt-scope-list")
+    p.click("#new-token-dialog [data-dismiss]")
+
+    # Opened again, it is as it was the first time: Everything, nothing ticked, nothing locked.
+    p.click("#new-token-btn")
+    p.wait_for_selector("#new-token-dialog[open]")
+    assert p.is_checked("input[name=kind][value=agent]") and p.is_hidden("#nt-scope-field")
+    p.check("input[name=kind][value=client]")
+    assert p.is_checked("input[name=limit][value='']") and p.is_hidden("#nt-scope-list") and ticked(p) == []
+    assert not p.evaluate("document.querySelector('#nt-scope-list input[value=\"signins.use\"]').disabled")
+    p.fill("#nt-name", "Everything checks")
+    p.click("#nt-submit")
+    p.wait_for_selector(".reveal")
+    assert posts == [("tokens", {"name": "Everything checks", "kind": "client", "nodeName": None, "expiresInDays": 365})]
+    p.wait_for_selector("#token-rows tr:has-text('Everything checks')")
+    assert row(p, "Everything checks").locator(".tok-scope").count() == 0
+    assert p.text_content(".reveal-title p").startswith("Client token · Everything checks · expires ")
+    p.click(".reveal [data-copy-label='the token']")
+    p.click("[data-reveal-done]")
+    p.wait_for_selector(".reveal", state="detached")
+
+    # An agent token is asked for as before, whatever was picked while Client was chosen.
+    del posts[:]
+    p.click("#new-token-btn")
+    limited_form(p, "Spare hosts", "grid.view")
+    p.check("input[name=kind][value=agent]")
+    p.click("#nt-submit")
+    p.wait_for_selector(".reveal")
+    assert posts == [("tokens", {"name": "Spare hosts", "kind": "agent", "nodeName": None, "expiresInDays": 365})]
+    assert re.fullmatch(r"pwga_[A-Za-z0-9_-]{43}", p.text_content("#reveal-token"))
+
+
+def test_ticking_add_saved_sign_ins_ticks_and_locks_use_saved_sign_ins(admin_grid, admin_page):
+    url, path = admin_grid
+    p = admin_page
+    posts = token_posts(p)
+    open_dialog(p, url)
+    limited_form(p, "Sign-in maker")
+    use, add = "#nt-scope-list input[value='signins.use']", "#nt-scope-list input[value='signins.add']"
+    p.focus(add)
+    p.keyboard.press("Space")  # by keyboard, as by mouse
+    assert p.is_checked(add) and p.is_checked(use) and p.is_disabled(use)
+    p.keyboard.press("Space")
+    assert not p.is_checked(add) and p.is_checked(use) and p.is_enabled(use)  # unlocked, and left ticked
+    p.uncheck(use)
+    assert ticked(p) == []
+    p.check(add)
+    assert p.is_checked(use) and p.is_disabled(use)
+    p.click("#nt-submit")
+    p.wait_for_selector(".reveal")
+    assert posts == [("tokens/scoped", {"name": "Sign-in maker", "expiresInDays": 365, "scope": ["signins.use", "signins.add"]})]
+    assert run(path, "SELECT scope FROM accessTokens WHERE name = 'Sign-in maker'") == [("signins.add signins.use",)]
+    p.wait_for_selector("#token-rows tr:has-text('Sign-in maker')")
+    assert row(p, "Sign-in maker").locator(".tok-scope").text_content() == "May only reuse saved sign-ins and add saved sign-ins"
+
+
+def test_only_what_you_pick_with_nothing_ticked_sends_nothing(admin_grid, admin_page):
+    url, path = admin_grid
+    p = admin_page
+    posts = token_posts(p)
+    open_dialog(p, url)
+    limited_form(p, "Nothing at all")
+    p.click("#nt-submit")
+    assert p.text_content("#nt-error") == "Tick at least one thing the token may do, or choose Everything."
+    assert p.is_visible("#nt-error") and p.is_visible("#new-token-dialog")
+    assert p.evaluate("document.activeElement.id") == "nt-scope-sessions"
+    assert p.get_attribute("#nt-scope-sessions", "aria-invalid") == "true"
+    p.wait_for_timeout(300)
+    assert posts == [] and p.locator(".reveal").count() == 0
+    assert run(path, "SELECT COUNT(*) FROM accessTokens") == [(7,)]
+
+    # Ticking one thing is enough: the token is made, and the box is no longer marked.
+    p.keyboard.press("Space")
+    p.click("#nt-submit")
+    p.wait_for_selector(".reveal")
+    assert p.get_attribute("#nt-scope-sessions", "aria-invalid") is None
+    assert posts == [("tokens/scoped", {"name": "Nothing at all", "expiresInDays": 365, "scope": ["sessions.open"]})]
+
+
+def test_a_token_without_a_scope_shows_no_limit_line(admin_grid, admin_page):
+    url, _ = admin_grid
+    p = admin_page
+    p.goto(url + "#/access")
+    p.wait_for_selector("#token-rows tr")
+    assert len(names(p)) == 7
+    for name in ("Example checks", "Staging checks 2025", "Docker runners", "WIN-BUILD-01 agent"):
+        assert row(p, name).locator(".tok-scope").count() == 0, name
+        assert row(p, name).locator(".cell-token > *").count() == 2, name  # its name and its first characters, as before
+    assert p.locator("#token-rows .tok-scope").count() == 1  # the demo's one limited token
+
+
+def test_the_demo_grid_monitor_shows_its_limit(admin_grid, admin_page):
+    url, _ = admin_grid
+    p = admin_page
+    p.goto(url + "#/access")
+    p.wait_for_selector("#token-rows tr")
+    cell = row(p, "Grid monitor").locator(".cell-token")
+    assert cell.locator(".tok-scope").text_content() == "May only see the grid"
+    assert cell.locator(".tok-scope").evaluate("el => getComputedStyle(el).display") == "block"  # on a line of its own
+    assert cell.evaluate("el => [...el.children].map((c) => c.className.split(' ')[0])") == ["tok-name", "tok-prefix", "tok-scope"]
+    assert row(p, "Grid monitor").locator(".cell-kind").text_content() == "Client"
+
+
+def test_a_grid_ui_from_before_scopes_makes_no_token_and_the_dialog_says_so(admin_grid, admin_page):
+    url, path = admin_grid
+    p = admin_page
+    posts = token_posts(p)
+    # What a Grid UI from before scopes answers (404), what some proxies answer for it (405), and a 404 with JSON:
+    # there is no such route, so nothing was made.
+    answers = [dict(status=404, content_type="text/html; charset=utf-8", body="<!doctype html><title>404 Not Found</title>"),
+               dict(status=405, content_type="text/html", body="<html><body>405 Not Allowed</body></html>"),
+               dict(status=404, json={"error": "Not found, says a proxy."})]
+    p.route("**/api/tokens/scoped", lambda r: r.fulfill(**answers.pop(0)))
+    open_dialog(p, url)
+    limited_form(p, "Uptime probe", "grid.view")
+    body = ("tokens/scoped", {"name": "Uptime probe", "expiresInDays": 365, "scope": ["grid.view"]})
+    for n in (1, 2, 3):
+        p.click("#nt-submit")  # the error line is emptied and the button disabled until the answer is in
+        p.wait_for_function("text => document.getElementById('nt-error').textContent === text && "
+                            "!document.getElementById('nt-submit').disabled", arg=NO_SCOPED_ROUTE)
+        assert posts == [body] * n  # nothing is asked of api/tokens, which would make a token with no limit
+        assert p.is_visible("#new-token-dialog") and p.is_visible("#nt-error") and p.locator(".reveal").count() == 0
+        assert p.input_value("#nt-name") == "Uptime probe" and ticked(p) == ["grid.view"]  # as it was filled in
+        assert p.is_checked("input[name=limit][value=scope]")
+    assert answers == []
+    p.click("#new-token-dialog [data-dismiss]")
+    refresh_now(p)
+    p.wait_for_timeout(300)
+    assert len(names(p)) == 7 and "Uptime probe" not in names(p) and p.locator(".reveal").count() == 0
+    assert run(path, "SELECT COUNT(*) FROM accessTokens") == [(7,)]
+    assert posts == [body] * 3
+
+    # Any other refusal of that route is said as the server says it.
+    p.unroute("**/api/tokens/scoped")
+    p.route("**/api/tokens/scoped", lambda r: r.fulfill(status=503, json={"error": "The scope test says no."}))
+    p.click("#new-token-btn")
+    limited_form(p, "Uptime probe", "grid.view")
+    p.click("#nt-submit")
+    p.wait_for_function("() => document.getElementById('nt-error').textContent === 'The scope test says no.'")
+    assert run(path, "SELECT COUNT(*) FROM accessTokens") == [(7,)]
+
+
+def test_a_token_whose_scope_was_lost_says_so_in_the_list(admin_grid, admin_page):
+    url, path = admin_grid
+    run(path, "UPDATE accessTokens SET scope = NULL WHERE name = 'Grid monitor'")
+    p = admin_page
+    p.goto(url + "#/access")
+    p.wait_for_selector("#token-rows tr")
+    assert row(p, "Grid monitor").locator(".tok-scope").text_content() == SCOPE_GONE
+    assert p.locator("#token-rows .tok-scope").count() == 1  # never listed as a token with no limit, and no other as lost
+
+    # A stored scope that is empty, or names nothing this version knows, allows nothing: that is not "lost".
+    for stored in ("tomorrow.only", ""):
+        run(path, "UPDATE accessTokens SET scope = ? WHERE name = 'Grid monitor'", (stored,))
+        p.reload()
+        p.wait_for_selector("#token-rows tr")
+        assert row(p, "Grid monitor").locator(".tok-scope").text_content() == "May do nothing", stored

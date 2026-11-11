@@ -123,6 +123,15 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
+// What tokenHash holds for a token with a scope: 'scoped:' and the first 57 characters of its hashToken, 64
+// characters in all. It is not the sha256 of anything, so a hub or Grid UI from before scopes, which compares
+// tokenHash with the sha256 of what it was sent, finds no row and turns the token away rather than taking it
+// for one with no limit. It is made from the plain hash, so the hub never needs the token to look for it.
+const SCOPED_HASH_PREFIX = 'scoped:';
+function scopedHash(hash) {
+  return SCOPED_HASH_PREFIX + hash.slice(0, 64 - SCOPED_HASH_PREFIX.length);
+}
+
 // Whether `token` has the shape of a managed token; nothing else can be in accessTokens.
 function isManagedToken(token) {
   return typeof token === 'string' && MANAGED_TOKEN_RE.test(token);
@@ -144,5 +153,5 @@ module.exports = {
   AGENT_VERSION, MAX_SLOTS, MAX_PAYLOAD, CLOSE,
   isValidName, canonicalName, sanitizeName, forwardHeaders, stripQueryParam, queryParam,
   sendableCloseCode, closeReason, safeClose, safeSend, parseMessage, tokenMatches, bearer, hashToken, isManagedToken, tokenLabel,
-  normalizeSlots,
+  SCOPED_HASH_PREFIX, scopedHash, normalizeSlots,
 };

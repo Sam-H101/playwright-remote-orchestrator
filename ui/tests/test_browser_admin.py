@@ -21,6 +21,7 @@ from ui.tests.test_browser_mfa import set_hidden  # noqa: E402
 from ui.tests.test_browser import browser, grid, page, run  # noqa: E402,F401  (fixtures)
 from ui.tests.test_browser_tokens import _admin_context, admin_grid  # noqa: E402,F401  (fixtures)
 from ui.tests.test_browser_oidc import signed_in_context, sso_grid, watched  # noqa: E402,F401  (fixtures)
+from ui.tests.test_client_auth import AUDIENCE, W1, non_loopback_address  # noqa: E402
 
 SEED = "JBSWY3DPEHPK3PXP"
 HOSTILE = '<img src=x onerror="window.__xss=1">'
@@ -347,7 +348,8 @@ def test_tokens_that_act_as_an_admin_are_given_to_people(people_grid, browser, m
         p.wait_for_selector("#token-rows tr")
         assert p.is_visible("#token-owner-col")
         # What a token nobody owns gets, as the checks' routes decide it: every MFA secret, but of the saved sign-ins
-        # only the admins' and those shared with the Admin role.
+        # only the admins' and those shared with the Admin role. The demo's Grid monitor is nobody's either, but its
+        # token scope leaves out both, so it isn't counted.
         assert squash(p.text_content("#acts-banner")) == (
             "1 client token acts as an admin: it was made before single sign-on or with the admin token, so checks using it "
             "get every MFA secret, and the saved sign-ins that are Admins' or shared with Admin. Give it to the person whose "
@@ -388,9 +390,55 @@ def test_tokens_that_act_as_an_admin_are_given_to_people(people_grid, browser, m
         (token_id,) = run(path, "SELECT id FROM accessTokens WHERE name = 'Example checks'")[0]
         assert run(path, "SELECT userId FROM itemOwners WHERE itemKind = 'token' AND itemId = ?", (token_id,)) == [(who.dana,)]
         p.wait_for_function("id => document.activeElement && document.activeElement.dataset.token === String(id)", arg=token_id)
-        assert squash(p.text_content("#acts-banner")) == ("GATEWAY_CLIENT_TOKEN acts as an admin. Once people use client tokens of "
-                                                          "their own, and the checks that ask the Grid UI for codes and sign-ins "
-                                                          "send one as GRID_MFA_TOKEN, take it out of the Grid UI's environment.")
+        env = ("GATEWAY_CLIENT_TOKEN acts as an admin. Once people use client tokens of their own, and the checks that ask the "
+               "Grid UI for codes and sign-ins send one as GRID_MFA_TOKEN, take it out of the Grid UI's environment.")
+        p.wait_for_function("t => document.querySelector('#acts-banner').textContent.replace(/\\s+/g, ' ').trim() === t", arg=env)
+        # A token scope that keeps MFA secrets counts again, as far as it goes.
+        run(path, "UPDATE accessTokens SET scope = 'grid.view mfa.use' WHERE name = 'Grid monitor'")
+        reopen(p, "access")
+        p.wait_for_selector("#acts-banner:has-text('1 client token acts')")
+        assert squash(p.text_content("#acts-banner")) == (
+            "1 client token acts as an admin: it was made before single sign-on or with the admin token, so checks using it "
+            "get every MFA secret, and the saved sign-ins that are Admins' or shared with Admin, as far as its token scope "
+            "lets them. Give it to the person whose checks use it. " + env.replace("acts", "also acts", 1))
+        assert p.errors == []
+    finally:
+        ctx.close()
+
+
+def test_the_give_dialog_says_a_scoped_token_keeps_its_limit(people_grid, browser):  # noqa: F811
+    """Given to a person, a token acts as them, narrowed by the scope it was made with."""
+    url, path, who = people_grid
+    limit = "It keeps its limit: it may only see the grid."
+    ctx = signed_in_context(browser, url, path, who.robin)
+    try:
+        p = watched(ctx.new_page())
+        p.goto(url + "#/access")
+        p.wait_for_selector("#token-rows tr")
+        # A token without a scope: the dialog is as it was.
+        token_row(p, "Example checks").locator("[data-assign-token]").click()
+        p.wait_for_selector("#token-owner-dialog[open]")
+        assert p.locator("#token-owner-dialog .sheet-sub").count() == 1
+        assert "keeps its limit" not in p.text_content("#token-owner-dialog")
+        p.click("#token-owner-dialog [data-dismiss]")
+        p.wait_for_selector("#token-owner-dialog", state="hidden")
+
+        token_row(p, "Grid monitor").locator("[data-assign-token]").click()
+        p.wait_for_selector("#token-owner-dialog[open]")
+        assert p.text_content("#token-owner-title") == "Give “Grid monitor” to someone"
+        assert [squash(t) for t in p.locator("#token-owner-dialog .sheet-sub").all_text_contents()][1:] == [limit]
+        assert p.evaluate("document.activeElement.id") == "give-token-input"
+        p.fill("#give-token-input", "dana")
+        p.wait_for_selector("#give-token-list [role=option]:has-text('Dana Lee')")
+        p.keyboard.press("ArrowDown")
+        p.keyboard.press("Enter")
+        p.wait_for_selector("#token-owner-dialog", state="hidden")
+        p.wait_for_selector("#token-rows tr:has-text('Grid monitor') .cell-owner:has-text('Dana Lee')")
+        # It is Dana's now, and limited as before.
+        assert token_row(p, "Grid monitor").locator(".tok-scope").text_content() == "May only see the grid"
+        ((token_id, scope, stored),) = run(path, "SELECT id, scope, tokenHash FROM accessTokens WHERE name = 'Grid monitor'")
+        assert scope == "grid.view" and stored.startswith("scoped:")
+        assert run(path, "SELECT userId FROM itemOwners WHERE itemKind = 'token' AND itemId = ?", (token_id,)) == [(who.dana,)]
         assert p.errors == []
     finally:
         ctx.close()
@@ -421,6 +469,12 @@ def test_a_testers_access_page_warns_from_the_grids_counts_not_from_its_own_list
         assert p.is_hidden("#nt-first") and p.is_hidden("#nt-node-field")
         assert p.text_content("#nt-client-note") == ("Checks using this token get the MFA secrets and saved sign-ins you can use, "
                                                      "and lose them if you lose access.")
+        # Limited to neither MFA secrets nor saved sign-ins, it gets none of them.
+        p.check("input[name=limit][value=scope]")
+        p.check("#nt-scope-list input[value='grid.view']")
+        assert p.is_hidden("#nt-client-note")
+        p.check("#nt-scope-list input[value='signins.use']")
+        assert p.is_visible("#nt-client-note")
         p.click("#new-token-dialog [data-dismiss]")
 
         # His is the grid's only client token now.
@@ -1275,6 +1329,56 @@ def test_the_audit_log_reads_as_sentences_and_filters_through_the_address(people
         ctx.close()
 
 
+def test_the_audit_log_says_what_a_scoped_token_may_do(people_grid, browser):  # noqa: F811
+    url, path, who = people_grid
+    made = (who.robin, "Robin Hale", "oidc")
+    audit_row(path, "token.created", (None, "Admin", "token"), ("token", 10, "Grid monitor"),
+              {"kind": "client", "owner": None, "scope": ["grid.view"]}, 600)
+    audit_row(path, "token.created", made, ("token", 11, "Nightly"), {"kind": "client", "owner": who.robin,
+                                                                      "scope": ["mfa.use", "sessions.open", "signins.use"]}, 500)
+    audit_row(path, "token.created", made, ("token", 12, "Sign-in maker"), {"kind": "client", "scope": ["signins.add", "signins.use"]}, 400)
+    audit_row(path, "token.created", made, ("token", 13, "No limit"), {"kind": "client", "owner": who.robin, "scope": None}, 300)
+    audit_row(path, "token.created", made, ("token", 14, "Newer ids"), {"kind": "client", "scope": ["tomorrow.only", HOSTILE]}, 200)
+    audit_row(path, "token.created", made, ("token", 15, "Nothing"), {"kind": "client", "scope": []}, 100)
+    audit_row(path, "token.created", made, ("token", 16, "build-01 agent"), {"kind": "agent", "owner": None}, 50)
+    ctx = signed_in_context(browser, url, path, who.robin)
+    try:
+        p = watched(ctx.new_page())
+        p.goto(url + "#/admin?tab=audit")
+        p.wait_for_selector("#audit-rows tr")
+        assert listed(p, "#audit-rows .audit-line > span") == [
+            "made the agent token “build-01 agent”",
+            "made the client token “Nothing”, which may do nothing",
+            "made the client token “Newer ids”, which may do nothing",
+            "made the client token “No limit”",
+            "made the client token “Sign-in maker”, which may only reuse saved sign-ins and add saved sign-ins",
+            "made the client token “Nightly”, which may only open browser sessions, get MFA codes and reuse saved sign-ins",
+            "made the client token “Grid monitor”, which may only see the grid"]
+        assert p.evaluate("window.__xss") is None and p.evaluate("document.querySelectorAll('#audit-rows img').length") == 0
+        # The details are what was recorded.
+        row = p.locator("#audit-rows tr", has_text="“Sign-in maker”")
+        row.locator("[data-expand]").click()
+        assert json.loads(row.locator(".audit-raw").text_content()) == {"kind": "client", "scope": ["signins.add", "signins.use"]}
+        assert p.errors == []
+    finally:
+        ctx.close()
+
+
+def test_the_demo_audit_log_says_what_grid_monitor_may_do(admin_grid, browser):  # noqa: F811
+    url, _ = admin_grid
+    ctx = _admin_context(browser)
+    try:
+        p = watched(ctx.new_page())
+        p.goto(url + "#/admin?tab=audit")
+        p.wait_for_selector("#audit-rows tr")
+        said = listed(p, "#audit-rows .audit-line > span")
+        assert "made the client token “Grid monitor”, which may only see the grid" in said
+        assert "made the client token “Example checks”" in said  # no scope: as before
+        assert p.errors == []
+    finally:
+        ctx.close()
+
+
 def test_the_single_sign_on_tab_shows_the_settings_and_what_is_wrong(people_grid, browser, monkeypatch):  # noqa: F811
     url, path, who = people_grid
     make_user(path, "Ann Admin", issuer=os.environ["GRID_OIDC_ISSUER"], subject="00u-ann")  # at the provider the grid uses
@@ -1293,18 +1397,258 @@ def test_the_single_sign_on_tab_shows_the_settings_and_what_is_wrong(people_grid
         assert (facts["Admin token"], facts["Provider sign-out"]) == ("Set", "Off")
         assert p.get_attribute(".sso-facts [data-copy]", "data-copy") == url + "auth/callback"
         assert p.locator(".sso-problem").count() == 0 and p.is_hidden("#admin-banner")
+        assert facts["Client authentication"] == ("A client secret, sent with HTTP Basic when the provider lists "
+                                                  "client_secret_basic or lists nothing, else in the request body "
+                                                  "GRID_OIDC_CLIENT_AUTH=auto")
+        assert p.locator(".sso-unused").count() == 0 and "Token file" not in facts
         assert "s3cret-client" not in p.content()
 
         # What's wrong: in full, for someone who may see people.
         monkeypatch.setenv("GRID_OIDC_CLIENT_SECRET", "")
         p.reload()
         p.wait_for_selector(".sso-problem")
-        problem = "Set GRID_OIDC_CLIENT_ID and GRID_OIDC_CLIENT_SECRET to the Grid UI's registration at the identity provider."
+        problem = ("Set GRID_OIDC_CLIENT_SECRET, or GRID_OIDC_CLIENT_AUTH=federated to use a token the platform issues, so the "
+                   "Grid UI can prove to the identity provider that it is the client.")
         assert p.text_content(".sso-problem") == problem
         assert p.text_content("#admin-banner") == problem
+        facts = dict(zip(listed(p, ".sso-facts dt"), listed(p, ".sso-facts dd")))
+        assert facts["Client authentication"] == "Not set GRID_OIDC_CLIENT_AUTH=auto"
         assert p.errors == []
     finally:
         ctx.close()
+
+
+def test_the_single_sign_on_tab_shows_the_platforms_token_as_its_file_states_it(people_grid, sso_grid, browser, monkeypatch,  # noqa: F811
+                                                                                tmp_path):
+    """With a token the platform issues: the method, the file and the claims the provider's federated credential must
+    name, as text and never the token; a token on offer that isn't used; and what the provider's discovery rules out."""
+    from ui import oidc
+    from ui.tests import fake_idp
+
+    url, path, who = people_grid
+    idp = sso_grid[2]
+    cluster, file = fake_idp.FakeCluster(), tmp_path / "platform-token"
+    token = cluster.token(subject=HOSTILE)
+    file.write_bytes(token.encode())
+    hint = ("The identity provider's federated credential must name this issuer, subject and audience exactly. The token itself "
+            "is never shown.")
+
+    def facts_after(selector):
+        p.reload()
+        p.wait_for_selector(selector)
+        return dict(zip(listed(p, ".sso-facts dt"), listed(p, ".sso-facts dd")))
+
+    def no_token_shown():
+        return all(part not in p.content() for part in [token] + token.split("."))
+
+    ctx = signed_in_context(browser, url, path, who.robin)
+    try:
+        p = watched(ctx.new_page())
+        p.goto(url + "#/admin?tab=sso")
+        p.wait_for_selector(".sso-facts")
+
+        # A client secret, and a token the platform offers: said, and left alone.
+        monkeypatch.setenv("AZURE_FEDERATED_TOKEN_FILE", str(file))
+        facts = facts_after(".sso-unused")
+        assert squash(p.text_content(".sso-unused")) == ("The platform offers a token (AZURE_FEDERATED_TOKEN_FILE). It is used only "
+                                                         "with GRID_OIDC_CLIENT_AUTH=federated and no client secret.")
+        assert facts["Client authentication"].startswith("A client secret, sent with HTTP Basic when the provider lists ")
+        assert "Token file" not in facts and p.locator(".sso-problem").count() == 0 and no_token_shown()
+
+        # The secret gone and the method left at auto: the platform's token isn't used for that. What's wrong, and the
+        # line that names the setting that would use it.
+        monkeypatch.delenv("GRID_OIDC_CLIENT_SECRET")
+        facts = facts_after(".sso-problem")
+        problem = ("Set GRID_OIDC_CLIENT_SECRET, or GRID_OIDC_CLIENT_AUTH=federated to use a token the platform issues, so the "
+                   "Grid UI can prove to the identity provider that it is the client.")
+        assert p.text_content(".sso-problem") == problem and p.text_content("#admin-banner") == problem
+        assert facts["Client authentication"].startswith("Not set GRID_OIDC_CLIENT_AUTH=auto The platform offers a token")
+        assert "Token file" not in facts and no_token_shown()
+
+        # The platform's token in use: what its file states, each as text.
+        idp.auth_methods = ["client_secret_basic", "client_secret_post", "private_key_jwt"]
+        monkeypatch.setenv("GRID_OIDC_CLIENT_AUTH", "federated")
+        facts = facts_after(".sso-facts [data-until]")
+        assert facts["Client authentication"] == "A token the platform issues (federated): no client secret GRID_OIDC_CLIENT_AUTH=federated"
+        assert facts["Token file"] == str(file) + " From AZURE_FEDERATED_TOKEN_FILE, which Azure workload identity sets in a Kubernetes pod"
+        assert not {"Managed identity", "Identity endpoint", "Credential issuer"} & set(facts)
+        assert p.locator(".sso-warning").count() == 0
+        assert facts["Token issuer"] == cluster.issuer
+        assert facts["Token subject"] == HOSTILE
+        assert facts["Token audience"] == "api://AzureADTokenExchange"
+        assert re.fullmatch(r"in \d+[mh] " + re.escape(hint), facts["Token expires"])
+        assert p.get_attribute(".sso-facts [data-until]", "title")
+        assert p.locator(".sso-facts .warn-text").count() == 0
+        assert p.locator(".sso-unused").count() == 0 and p.locator(".sso-problem").count() == 0 and p.is_hidden("#admin-banner")
+        assert no_token_shown()
+        assert p.evaluate("window.__xss") is None and p.evaluate("document.querySelectorAll('.sso-facts img').length") == 0
+
+        # A provider that lists no client assertions: its sentence, here only (the session's problem doesn't ask the provider).
+        idp.auth_methods = ["client_secret_basic", "client_secret_post"]
+        oidc.reset_caches()
+        facts = facts_after(".sso-problem")
+        assert p.text_content(".sso-problem") == ("The identity provider doesn't take client assertions: private_key_jwt isn't among "
+                                                  "the token_endpoint_auth_methods_supported its discovery document lists.")
+        assert p.is_hidden("#admin-banner")
+        assert facts["Token subject"] == HOSTILE and no_token_shown()
+
+        # A token that has expired: when, marked so, and the problem that says the platform should have replaced it.
+        idp.auth_methods = ["client_secret_basic", "client_secret_post", "private_key_jwt"]
+        oidc.reset_caches()
+        token = cluster.token(lifetime_s=-7200)
+        file.write_bytes(token.encode())
+        facts = facts_after(".sso-facts .warn-text")
+        problem = "AZURE_FEDERATED_TOKEN_FILE can't be used: the token in {} has expired; the platform should have replaced it.".format(file)
+        assert p.text_content(".sso-problem") == problem and p.text_content("#admin-banner") == problem
+        assert re.fullmatch(r"\d+h ago expired " + re.escape(hint), facts["Token expires"])
+        assert facts["Token subject"] == "system:serviceaccount:grid:grid-ui" and no_token_shown()
+
+        # A file named by the Grid UI's own setting that holds no token, and one whose token leaves claims out.
+        monkeypatch.delenv("AZURE_FEDERATED_TOKEN_FILE")
+        monkeypatch.setenv("GRID_OIDC_FEDERATED_TOKEN_FILE", str(file))
+        token = "made-up-text-that-is-no-token"
+        file.write_bytes(token.encode())
+        facts = facts_after(".sso-problem")
+        assert p.text_content(".sso-problem") == ("GRID_OIDC_FEDERATED_TOKEN_FILE can't be used: {} doesn't hold a token (three "
+                                                  "base64url parts).".format(file))
+        assert facts["Token file"] == str(file) + " GRID_OIDC_FEDERATED_TOKEN_FILE"
+        assert [facts[k] for k in ("Token issuer", "Token subject", "Token audience")] == ["The file holds no token"] * 3
+        assert facts["Token expires"] == "The file holds no token " + hint
+        assert token not in p.content()
+        token = cluster.token(subject=None, aud=None, exp=None)
+        file.write_bytes(token.encode())
+        facts = facts_after(".sso-facts")
+        assert p.locator(".sso-problem").count() == 0
+        assert (facts["Token issuer"], facts["Token subject"]) == (cluster.issuer, "Not in the token")
+        assert facts["Token audience"] == "Not in the token"
+        assert facts["Token expires"] == "It doesn't say " + hint
+        assert no_token_shown()
+        assert p.errors == []
+    finally:
+        ctx.close()
+
+    # The provider elsewhere over plain http, which only GRID_OIDC_ALLOW_HTTP=1 allows: the warning above the
+    # settings, and no banner, since nothing keeps a sign-in from working. Robin is a user of the first provider, so
+    # the admin token reads the tab.
+    far = fake_idp.serve("0.0.0.0", public_host=non_loopback_address())
+    ctx = _admin_context(browser)
+    try:
+        far.auth_methods = list(idp.auth_methods)
+        monkeypatch.setenv("GRID_OIDC_ISSUER", far.base_url)
+        monkeypatch.setenv("GRID_OIDC_ALLOW_HTTP", "1")
+        oidc.reset_caches()
+        p = watched(ctx.new_page())
+        p.goto(url + "#/admin?tab=sso")
+        p.wait_for_selector(".sso-warning")
+        assert p.text_content(".sso-warning") == W1
+        assert p.get_attribute(".sso-warning", "role") == "status"
+        assert p.locator(".sso-problem").count() == 0 and p.is_hidden("#admin-banner")
+        assert listed(p, ".sso-facts dt").index("Token file") > 0 and no_token_shown()
+        assert p.errors == []
+    finally:
+        ctx.close()
+        far.stop()
+
+
+def test_the_single_sign_on_tab_shows_a_managed_identity(people_grid, sso_grid, browser, monkeypatch):  # noqa: F811
+    """With a managed identity's token: the identity, the endpoint it comes from and what the federated credential
+    must name, then what the token states, as text and never the token or the endpoint's header; what keeps the
+    endpoint from giving one; and the warning that comes with an Azure VM's endpoint."""
+    from ui import oidc
+    from ui.tests import fake_idp
+
+    url, path, who = people_grid
+    idp = sso_grid[2]
+    endpoint = fake_idp.serve_identity()
+    monkeypatch.setitem(oidc.ENTRA_AUDIENCES, "localhost", AUDIENCE)  # the provider stands in for Entra ID
+    idp.auth_methods = ["client_secret_basic", "client_secret_post", "private_key_jwt"]
+    idp.trust(endpoint.tenant, subject=fake_idp.OBJECT_ID_MI)
+    monkeypatch.delenv("GRID_OIDC_CLIENT_SECRET")
+    monkeypatch.setenv("GRID_OIDC_CLIENT_AUTH", "federated")
+    monkeypatch.setenv("GRID_OIDC_MANAGED_IDENTITY", fake_idp.CLIENT_ID_MI)
+    monkeypatch.setenv("IDENTITY_ENDPOINT", endpoint.app_service_url)
+    monkeypatch.setenv("IDENTITY_HEADER", endpoint.header)
+    hint = "As the token states them. The token itself is never shown."
+    credential_hint = ("Add a federated credential with exactly these three values (in the portal: scenario Managed Identity, "
+                       "which fills them in). The token's own lines below are for comparing: its subject should be the "
+                       "identity's principal id; its issuer and audience may be written differently.")
+
+    def facts_after(selector):
+        p.reload()
+        p.wait_for_selector(selector)
+        return dict(zip(listed(p, ".sso-facts dt"), listed(p, ".sso-facts dd")))
+
+    def nothing_secret_shown():
+        content = p.content()
+        return endpoint.header not in content and all(
+            part not in content for token in endpoint.issued for part in [token] + token.split("."))
+
+    ctx = signed_in_context(browser, url, path, who.robin)
+    try:
+        p = watched(ctx.new_page())
+        p.goto(url + "#/admin?tab=sso")
+        p.wait_for_selector(".sso-facts")
+
+        # App Service's endpoint, a user-assigned identity: where the token comes from, what the credential must
+        # name, and the token's own lines.
+        facts = facts_after(".sso-facts [data-until]")
+        assert facts["Client authentication"] == "A token the platform issues (federated): no client secret GRID_OIDC_CLIENT_AUTH=federated"
+        assert facts["Managed identity"] == "User-assigned, client id {} GRID_OIDC_MANAGED_IDENTITY".format(fake_idp.CLIENT_ID_MI)
+        assert facts["Identity endpoint"] == (endpoint.app_service_url + " IDENTITY_ENDPOINT, which App Service, Functions and "
+                                              "Container Apps set")
+        assert facts["Credential issuer"] == idp.base_url
+        assert facts["Credential subject"] == fake_idp.OBJECT_ID_MI
+        assert facts["Credential audience"] == AUDIENCE + " " + credential_hint
+        assert facts["Token issuer"] == fake_idp.TENANT_ISSUER
+        assert facts["Token subject"] == fake_idp.OBJECT_ID_MI
+        assert facts["Token audience"] == AUDIENCE
+        assert re.fullmatch(r"in \d+[mh] " + re.escape(hint), facts["Token expires"])
+        assert "Token file" not in facts and p.locator(".sso-warning").count() == 0
+        assert p.locator(".sso-problem").count() == 0 and p.is_hidden("#admin-banner")
+        assert len(endpoint.issued) == 1 and nothing_secret_shown()
+
+        # The endpoint refuses, asked again at once: its sentence, and no token where the lines were.
+        endpoint.fault = "status_403"
+        monkeypatch.setattr(oidc, "IDENTITY_MEMO_S", 0)
+        facts = facts_after(".sso-problem")
+        assert p.text_content(".sso-problem") == (
+            "GRID_OIDC_MANAGED_IDENTITY can't be used: the managed identity endpoint in IDENTITY_ENDPOINT ({}) refused to "
+            "give a token: HTTP 403. Check that this VM or app has the user-assigned managed identity with client "
+            "id {} assigned to it.".format(endpoint.app_service_url, fake_idp.CLIENT_ID_MI))
+        assert facts["Credential subject"] == "No token was given"
+        assert facts["Credential issuer"] == idp.base_url
+        assert [facts[k] for k in ("Token issuer", "Token subject", "Token audience")] == ["No token was given"] * 3
+        assert facts["Token expires"] == "No token was given " + hint
+        assert nothing_secret_shown()
+
+        # An Azure VM's endpoint and its system-assigned identity: the hint says who else on the VM can get the token.
+        endpoint.fault = None
+        endpoint.system = "eeeeeeee-1111-2222-3333-444444444444"
+        monkeypatch.delenv("IDENTITY_ENDPOINT")
+        monkeypatch.delenv("IDENTITY_HEADER")
+        monkeypatch.setattr(oidc, "IMDS_URL", endpoint.imds_url)
+        monkeypatch.setenv("GRID_OIDC_MANAGED_IDENTITY", "system")
+        facts = facts_after(".sso-facts [data-until]")
+        assert facts["Managed identity"] == "The endpoint's default (system-assigned, if turned on) GRID_OIDC_MANAGED_IDENTITY"
+        assert facts["Identity endpoint"] == (endpoint.imds_url + " The Azure Instance Metadata Service of this VM. Every program "
+                                              "and container on this VM can get this identity's token, the grid's runners "
+                                              "included, unless a firewall rule stops them: see the README.")
+        assert facts["Credential subject"] == facts["Token subject"] == endpoint.system
+        assert p.locator(".sso-problem").count() == 0 and nothing_secret_shown()
+        assert p.evaluate("window.__xss") is None
+        assert p.errors == []
+    finally:
+        ctx.close()
+        endpoint.stop()
+
+
+def test_the_admin_page_names_no_one_platform():
+    """Sign-in without a client secret works wherever the platform gives the Grid UI a token: the Admin page's words
+    never make it AKS's alone."""
+    folder = os.path.join(os.path.dirname(__file__), os.pardir, "static", "js", "views", "admin")
+    for name in ("signin.js", "users.js"):
+        with open(os.path.join(folder, name), encoding="utf-8") as f:
+            assert "AKS" not in f.read(), name
 
 
 def test_with_only_the_admin_token_the_admin_page_shows_the_demo_and_how_to_set_up_sign_in(admin_grid, browser):  # noqa: F811

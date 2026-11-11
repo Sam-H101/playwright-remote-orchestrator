@@ -62,6 +62,12 @@ IMPLIES = {
 ALL = frozenset(PERMISSIONS)
 # What anyone may do on a grid with no sign-in configured, as they always could.
 OPEN_GRID = frozenset({"grid.view", "grid.operate"})
+# What a client token's scope can name: the things a check does with one, in the page's order. These are not
+# permissions. A scope only takes away, and sessions.open is the hub's to enforce: no role holds it.
+SESSIONS_SCOPE = "sessions.open"
+TOKEN_SCOPES = collections.OrderedDict(
+    [(SESSIONS_SCOPE, "Open browser sessions")]
+    + [(p, PERMISSIONS[p][1]) for p in ("grid.view", "mfa.use", "signins.use", "signins.add")])
 
 ADMIN, OPERATOR, TESTER, VIEWER = -1, -2, -3, -4
 # id -> (name, description, permissions before expand()).
@@ -102,6 +108,11 @@ def parse(text):
 def unparse(perms):
     """The roles.permissions value for a set of permissions: sorted and space separated."""
     return " ".join(sorted(set(perms)))
+
+
+def parse_scope(text):
+    """The ids in a stored scope. Ids this version doesn't know are left out, so they allow nothing."""
+    return frozenset(s for s in (text or "").split() if s in TOKEN_SCOPES)
 
 
 def catalogue():

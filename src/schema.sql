@@ -65,7 +65,11 @@ CREATE TABLE IF NOT EXISTS nodes (
 -- revokedAt is NULL and expiresAt is NULL or still in the future. Any row of a kind, revoked or
 -- expired included, makes the hub require a token of that kind (unless GATEWAY_ALLOW_OPEN_AGENTS /
 -- GATEWAY_ALLOW_OPEN_CLIENTS is set), so revoking the last token never lets tokenless callers in. The
--- Grid UI records who made a token in itemOwners; the hub ignores that.
+-- Grid UI records who made a token in itemOwners; the hub ignores that. scope limits what a client token
+-- may do: NULL is no limit, otherwise the scope ids, sorted and separated by spaces (an empty string
+-- allows nothing). tokenHash of a token with a scope is 'scoped:' followed by the first 57 hex characters
+-- of the token's sha256: not the sha256 of anything, so software from before scopes finds no row for it
+-- and turns it away.
 CREATE TABLE IF NOT EXISTS accessTokens (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(128) NOT NULL,
@@ -77,6 +81,7 @@ CREATE TABLE IF NOT EXISTS accessTokens (
     expiresAt DATETIME NULL,
     lastUsedAt DATETIME NULL,
     revokedAt DATETIME NULL,
+    scope VARCHAR(255) NULL,
     UNIQUE KEY uq_token_hash (tokenHash),
     KEY idx_kind (kind)
 )

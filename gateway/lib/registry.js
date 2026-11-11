@@ -1,7 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
-const { hashToken } = require('./protocol');
+const { hashToken, scopedHash, SCOPED_HASH_PREFIX } = require('./protocol');
 
 // Both registries share this interface. `info` is
 // { name, slots: [{index, healthy}], playwrightVersion, agentVersion, platform, browsers: [], remoteAddress, ephemeral, tokenId }.
@@ -13,8 +13,12 @@ const { hashToken } = require('./protocol');
 //   reapEphemeral(name)       if the node is offline and ephemeral, delete its free slots and, when no
 //                             slot is still in use, its row; in-use slots are marked down. Resolves
 //                             'removed', 'held' (in-use slots remain) or 'skipped'
-//   lookupToken(hash)         the managed access token whose sha256 hex is `hash`, as
-//                             { id, name, kind, prefix, nodeName, expiresAt, revokedAt } (times ISO-8601 UTC or null), or null
+//   lookupToken(hash)         the managed access token whose sha256 hex is `hash` (the plain hash), stored under
+//                             it or under its scoped form, as
+//                             { id, name, kind, prefix, nodeName, expiresAt, revokedAt, scoped, scope, storedTwice }
+//                             (times ISO-8601 UTC or null), or null. scoped: whether tokenHash is in the scoped
+//                             form; scope: null, or the token's scope as stored (ids separated by spaces; may be
+//                             empty); storedTwice: true when rows exist under both forms, which lets nothing in
 //   anyTokens(kind, activeOnly)  whether a token of that kind exists; revoked and expired ones count too, so
 //                             revoking or letting the last token lapse doesn't switch enforcement off.
 //                             activeOnly leaves out revoked ones (GATEWAY_ALLOW_OPEN_AGENTS / _CLIENTS)
@@ -64,6 +68,9 @@ const ADDED_COLUMNS = {
   ],
   portUsage: [
     ['claimedBy', 'VARCHAR(64) NULL'],
+  ],
+  accessTokens: [
+    ['scope', 'VARCHAR(255) NULL'],
   ],
 };
 
@@ -213,13 +220,18 @@ class MySqlRegistry {
   }
 
   async lookupToken(hash) {
-    const [[row]] = await this.query(
-      'SELECT id, name, kind, prefix, nodeName, expiresAt, revokedAt FROM accessTokens WHERE tokenHash = ?', [hash]);
-    if (!row) return null;
+    const [rows] = await this.query(
+      'SELECT id, name, kind, prefix, nodeName, expiresAt, revokedAt, tokenHash, scope FROM accessTokens WHERE tokenHash IN (?, ?)',
+      [hash, scopedHash(hash)]);
+    if (!rows.length) return null;
+    const row = rows[0];
     return {
       id: Number(row.id), name: row.name, kind: row.kind, prefix: row.prefix,
       nodeName: row.nodeName ? String(row.nodeName).toLowerCase() : null,
       expiresAt: isoUtc(row.expiresAt), revokedAt: isoUtc(row.revokedAt),
+      scoped: String(row.tokenHash).startsWith(SCOPED_HASH_PREFIX),
+      scope: row.scope == null ? null : String(row.scope),
+      storedTwice: rows.length > 1,
     };
   }
 
@@ -339,8 +351,8 @@ class MySqlRegistry {
     try {
       return await this.pool.query(sql, params);
     } catch (err) {
-      if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
-      this.log.warn(`table missing (${err.message}); recreating the schema`);
+      if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+      this.log.warn(`table or column missing (${err.message}); recreating the schema`);
       await this.applySchema();
       return this.pool.query(sql, params);
     }
@@ -505,21 +517,25 @@ class MemoryRegistry {
     return 'removed';
   }
 
-  // What the Grid UI does when it creates a token: keep only the hash. Returns the stored row; tests set its
-  // revokedAt / expiresAt (ISO-8601 strings) directly.
-  addToken(token, { name = 'test token', kind = 'agent', nodeName = null, expiresAt = null, revokedAt = null } = {}) {
+  // What the Grid UI does when it creates a token: keep only the hash and its scope. Returns the stored row;
+  // tests set its revokedAt / expiresAt (ISO-8601 strings) directly.
+  addToken(token, { name = 'test token', kind = 'agent', nodeName = null, expiresAt = null, revokedAt = null, scope = null } = {}) {
     const row = {
-      id: this.nextTokenId++, name, kind, tokenHash: hashToken(token), prefix: token.slice(0, 12),
-      nodeName: nodeName ? nodeName.toLowerCase() : null, createdAt: new Date().toISOString(), expiresAt, lastUsedAt: null, revokedAt,
+      id: this.nextTokenId++, name, kind, tokenHash: scope == null ? hashToken(token) : scopedHash(hashToken(token)), prefix: token.slice(0, 12),
+      nodeName: nodeName ? nodeName.toLowerCase() : null, createdAt: new Date().toISOString(), expiresAt, lastUsedAt: null, revokedAt, scope,
     };
     this.tokens.set(row.id, row);
     return row;
   }
 
   async lookupToken(hash) {
-    const t = [...this.tokens.values()].find((row) => row.tokenHash === hash);
-    if (!t) return null;
-    return { id: t.id, name: t.name, kind: t.kind, prefix: t.prefix, nodeName: t.nodeName, expiresAt: t.expiresAt, revokedAt: t.revokedAt };
+    const found = [...this.tokens.values()].filter((row) => row.tokenHash === hash || row.tokenHash === scopedHash(hash));
+    if (!found.length) return null;
+    const t = found[0];
+    return {
+      id: t.id, name: t.name, kind: t.kind, prefix: t.prefix, nodeName: t.nodeName, expiresAt: t.expiresAt, revokedAt: t.revokedAt,
+      scoped: String(t.tokenHash).startsWith(SCOPED_HASH_PREFIX), scope: t.scope == null ? null : String(t.scope), storedTwice: found.length > 1,
+    };
   }
 
   async anyTokens(kind, activeOnly = false) {

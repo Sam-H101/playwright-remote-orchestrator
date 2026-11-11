@@ -11,7 +11,8 @@ NODE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 def client_endpoint(url, client_token=None, node=None):
     """ the hub's /connect URL. The hub picks a free slot for the browser the check launches, on
-    `node` if one is given; there is no way to name a slot. """
+    `node` if one is given; there is no way to name a slot. A token whose scope leaves out opening
+    sessions is refused by the hub with HTTP 403. """
     if node and not NODE_NAME.match(node):
         raise ValueError("GATEWAY_NODE must be a node name ([A-Za-z0-9._-], up to 128 characters), got {!r}"
                          .format(node))

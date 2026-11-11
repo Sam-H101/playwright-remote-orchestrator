@@ -132,10 +132,20 @@ services:
       GRID_UI_ALLOWED_HOSTS: ${GRID_UI_ALLOWED_HOSTS:-}
       # Single sign-on for people, through your OpenID Connect identity provider (see the README's Users and
       # roles). All optional: left empty, the UI signs in with GRID_ADMIN_TOKEN alone, as before. Setting
-      # GRID_OIDC_ISSUER turns it on; it then needs the client id and secret and GRID_UI_PUBLIC_URL too.
+      # GRID_OIDC_ISSUER turns it on; it then needs the client id, the secret (or a token the platform issues) and
+      # GRID_UI_PUBLIC_URL too.
       GRID_OIDC_ISSUER: ${GRID_OIDC_ISSUER:-}
       GRID_OIDC_CLIENT_ID: ${GRID_OIDC_CLIENT_ID:-}
       GRID_OIDC_CLIENT_SECRET: ${GRID_OIDC_CLIENT_SECRET:-}
+      # In place of the secret, with GRID_OIDC_CLIENT_AUTH=federated only: a file inside the container that holds
+      # a token the platform issues for the identity provider (see the README's Single sign-on without a client
+      # secret). In a Kubernetes pod with Azure workload identity the platform names the file itself, and this
+      # stays empty.
+      GRID_OIDC_FEDERATED_TOKEN_FILE: ${GRID_OIDC_FEDERATED_TOKEN_FILE:-}
+      # Or, on an Azure VM with a managed identity: its client id (or system), with GRID_OIDC_CLIENT_AUTH=federated.
+      # Every container on the VM, the runners included, can get that identity's token unless a firewall rule
+      # stops them: see the README first.
+      GRID_OIDC_MANAGED_IDENTITY: ${GRID_OIDC_MANAGED_IDENTITY:-}
       GRID_UI_PUBLIC_URL: ${GRID_UI_PUBLIC_URL:-}
       GRID_OIDC_ADMINS: ${GRID_OIDC_ADMINS:-}
       GRID_OIDC_LABEL: ${GRID_OIDC_LABEL:-}
@@ -153,6 +163,11 @@ services:
       GRID_UI_READS: ${GRID_UI_READS:-}
       GRID_UI_PROXY_HOPS: ${GRID_UI_PROXY_HOPS:-}
       GRID_AUDIT_DAYS: ${GRID_AUDIT_DAYS:-}
+      # The UI's log (docker logs): from which level (empty: info), as text or json lines (empty: text),
+      # and 1 for a line per request, without its query string (empty: none).
+      GRID_UI_LOG_LEVEL: ${GRID_UI_LOG_LEVEL:-}
+      GRID_UI_LOG_FORMAT: ${GRID_UI_LOG_FORMAT:-}
+      GRID_UI_ACCESS_LOG: ${GRID_UI_ACCESS_LOG:-}
       # Encrypts the seeds on the MFA page and the sign-ins checks save there. Until it is set the page
       # takes no seeds and gives no codes, and checks can't save or reuse sign-ins. Seeds and sign-ins stored
       # under one key don't decrypt under another.

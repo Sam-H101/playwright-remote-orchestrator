@@ -15,6 +15,7 @@ import urllib.parse
 
 import flask
 import pytest
+import werkzeug.exceptions
 
 from ui import accounts, app as grid_app, auth, demo, oidc, permissions, recorder, store
 
@@ -136,12 +137,15 @@ def add_item(path, kind, name, owner=None, shares=(), vouched_for=None):
         return cur.lastrowid
 
 
-def add_client_token(path, name, owner=None):
-    """A managed client token, made by that user (None: with the admin token). Returns (its id, its value)."""
+def add_client_token(path, name, owner=None, scope=None):
+    """A managed client token, made by that user (None: with the admin token). scope is its scope as the table
+    keeps it ("" allows nothing), or None for a token without one. Returns (its id, its value)."""
     value = "pwgc_" + name
     with contextlib.closing(sqlite3.connect(path)) as con, con:
-        cur = con.execute("INSERT INTO accessTokens (name, kind, tokenHash, prefix, createdAt) VALUES (?, 'client', ?, ?, ?)",
-                          (name, hashed(value), value[:12], ts(3600)))
+        cur = con.execute("INSERT INTO accessTokens (name, kind, tokenHash, prefix, createdAt, scope) "
+                          "VALUES (?, 'client', ?, ?, ?, ?)",
+                          (name, hashed(value) if scope is None else store.scoped_token_hash(value), value[:12],
+                           ts(3600), scope))
         if owner is not None:
             con.execute("INSERT INTO itemOwners (itemKind, itemId, userId, createdAt) VALUES ('token', ?, ?, ?)",
                         (cur.lastrowid, owner, ts(3600)))
@@ -444,8 +448,8 @@ def test_deleting_an_item_takes_its_owner_and_share_rows(db):
 def test_a_client_token_says_who_made_it(db):
     legacy_id, legacy = add_client_token(db, "legacy")
     owned_id, owned = add_client_token(db, "dana-ci", owner=DANA)
-    assert store.client_token(legacy) == {"id": legacy_id, "name": "legacy", "ownerId": None}
-    assert store.client_token(owned) == {"id": owned_id, "name": "dana-ci", "ownerId": DANA}
+    assert store.client_token(legacy) == {"id": legacy_id, "name": "legacy", "ownerId": None, "scope": None}
+    assert store.client_token(owned) == {"id": owned_id, "name": "dana-ci", "ownerId": DANA, "scope": None}
     assert store.client_token_name(owned) == "dana-ci"
     assert run(db, "SELECT COUNT(*) FROM accessTokens WHERE lastUsedAt IS NOT NULL") == [(2,)]
     assert store.client_token("pwgc_wrong") is None and store.client_token("") is None
@@ -1068,14 +1072,16 @@ def test_who_checks_using_a_client_token_act_as(db, monkeypatch):
     _, danas = add_client_token(db, "dana-ci", owner=dana)
     _, erins = add_client_token(db, "erin-ci", owner=erin)
     gone_id, gones = add_client_token(db, "gone-ci", owner=999)
-    assert accounts.client_token_access(legacy) == {"id": legacy_id, "name": "legacy", "ownerId": None, "owner": None}
+    assert accounts.client_token_access(legacy) == {"id": legacy_id, "name": "legacy", "ownerId": None, "owner": None,
+                                                    "scope": None}
     found = accounts.client_token_access(danas)
     assert (found["name"], found["ownerId"], found["owner"]["name"], found["owner"]["permissions"]) == (
         "dana-ci", dana, "Dana Lee", TESTER)
     assert accounts.client_token_access(erins)["owner"]["disabled"] is True
     assert accounts.client_token_access(erins)["owner"]["permissions"] == set()
     # An owner nobody can find leaves no owner, but the token still has an owner id: never an admin's token.
-    assert accounts.client_token_access(gones) == {"id": gone_id, "name": "gone-ci", "ownerId": 999, "owner": None}
+    assert accounts.client_token_access(gones) == {"id": gone_id, "name": "gone-ci", "ownerId": 999, "owner": None,
+                                                   "scope": None}
     run(db, "DROP TABLE users")
     assert accounts.client_token_access(danas)["ownerId"] == dana
     assert accounts.client_token_access(danas)["owner"] is None
@@ -1586,7 +1592,7 @@ def test_a_check_acts_as_the_owner_of_its_client_token(db, monkeypatch):
 
     def principal(token):
         with grid_app.app.test_request_context(headers={"Authorization": "Bearer " + token}):
-            return auth.check_principal(accounts.client_token_access)
+            return auth.check_principal(accounts.client_token_access, "grid.view")
 
     assert principal("b" * auth.MIN_BOOTSTRAP_TOKEN_LENGTH) == auth.Principal("GATEWAY_CLIENT_TOKEN", "client-bootstrap")
     assert principal(legacy) == auth.Principal("client token 'legacy'", "client-token")
@@ -2321,8 +2327,10 @@ def test_the_single_sign_on_settings(admin, monkeypatch):
     monkeypatch.setenv("GRID_OIDC_ADMINS", "sub:robin.hale, Dana@Example.com, nobody@example.com")
     r = a.grid.get("/api/admin/sign-in")
     assert ok(r) == {
-        "configured": True, "problem": None, "label": "single sign-on", "issuer": ISSUER, "clientId": "grid-ui",
-        "clientAuth": "auto", "redirectUri": "http://localhost/auth/callback", "scopes": ["openid", "email", "profile"],
+        "configured": True, "problem": None, "warning": None, "label": "single sign-on", "issuer": ISSUER,
+        "clientId": "grid-ui",
+        "clientAuth": "auto", "clientMethod": "secret", "clientToken": None, "platformTokenUnused": False,
+        "redirectUri": "http://localhost/auth/callback", "scopes": ["openid", "email", "profile"],
         "groupsClaims": ["groups"], "admins": [{"entry": "sub:robin.hale", "userId": a.robin, "name": "Robin Hale"},
                                                {"entry": "Dana@Example.com", "userId": a.dana, "name": "Dana Lee"},
                                                {"entry": "nobody@example.com", "userId": None, "name": None}],
@@ -2340,8 +2348,10 @@ def test_the_single_sign_on_settings(admin, monkeypatch):
     monkeypatch.delenv("GRID_OIDC_CA_FILE")
     monkeypatch.delenv("GRID_OIDC_SCOPES")
     assert grid_app.app.test_client().get("/api/admin/sign-in", headers=ADMIN).get_json() == {
-        "configured": False, "problem": None, "label": "single sign-on", "issuer": None, "clientId": None,
-        "clientAuth": "auto", "redirectUri": None, "scopes": ["openid", "email", "profile"], "groupsClaims": ["groups"],
+        "configured": False, "problem": None, "warning": None, "label": "single sign-on", "issuer": None,
+        "clientId": None,
+        "clientAuth": "auto", "clientMethod": None, "clientToken": None, "platformTokenUnused": False,
+        "redirectUri": None, "scopes": ["openid", "email", "profile"], "groupsClaims": ["groups"],
         "admins": [], "session": {"hours": 12, "idleMinutes": 120}, "readsOpen": True, "adminToken": True,
         "endSession": False}
 
@@ -2503,6 +2513,7 @@ ROUTES = [
     ("POST", "/api/nodes/forget", {"host": "nowhere"}, GRID, 404),
     ("GET", "/api/tokens", None, TOKENS, 200),
     ("POST", "/api/tokens", [], ("strict", "tokens.own", "tokens.agents"), 400),
+    ("POST", "/api/tokens/scoped", [], ("strict", "tokens.own"), 400),
     ("POST", "/api/tokens/999999/revoke", {}, TOKENS, 404),
     ("POST", "/api/tokens/999999/delete", {}, TOKENS, 404),
     ("GET", "/api/mfa", None, ("strict", "mfa.use"), 200),
@@ -2761,3 +2772,388 @@ def test_every_action_comes_from_the_grid_page(db, monkeypatch, path):
             assert r.status_code == 401 and r.get_json()["client_token_required"] is True, why
         else:
             assert (r.status_code, r.get_json()) == (403, {"error": error}), why
+
+
+# ---- client tokens with a scope ---------------------------------------------------------------
+#
+# A scope is a second gate in front of the owner's roles: it only takes away. What a scoped token reaches is
+# still judged by its owner's permissions (test_sharing.py).
+
+CODE, CHECKOUT, SAVE, RELEASE = "/api/mfa/code", "/api/signins/checkout", "/api/signins/save", "/api/signins/release"
+# Every route that takes a client token, and the scope id it names. test_every_route_that_takes_a_client_token_
+# names_a_scope walks the app and fails when a route is missing here.
+TAKES_A_CLIENT_TOKEN = [("POST", CODE, "mfa.use"), ("POST", CHECKOUT, "signins.use"), ("POST", SAVE, "signins.use"),
+                        ("POST", RELEASE, "signins.use"), ("GET", "/status", "grid.view"),
+                        ("GET", "/api/status", "grid.view"), ("GET", "/api/events", "grid.view")]
+WRONG_TOKEN = {"error": "The client token is wrong, revoked or expired.", "client_token_required": True}
+
+
+def out_of_scope(scope):
+    """The body of the 403 a token gets whose scope leaves `scope` out."""
+    return {"error": "This client token's scope doesn't include “{}”. A token's scope can't be changed: make another "
+                     "on the Access page.".format(permissions.TOKEN_SCOPES[scope]), "out_of_scope": True, "scope": scope}
+
+
+def owner_lacks(permission):
+    """The body of the 403 a check gets whose token's owner's roles lack the permission."""
+    return {"error": "This client token's owner's roles don't include “{}”.".format(
+        permissions.PERMISSIONS[permission][1]), "forbidden": True, "permission": permission}
+
+
+def as_check(token, method, path, body=None):
+    """A request with the client token, from a browser with no cookies. A POST asks for the name 'nope', which
+    nothing is called: whoever gets past the gates is told so."""
+    return send(grid_app.app.test_client(), method, path, {"name": "nope"} if body is None else body, bearer(token))
+
+
+def token_principal(token):
+    with grid_app.app.test_request_context(headers=bearer(token)):
+        return auth.check_principal(accounts.client_token_access, "grid.view")
+
+
+def test_a_scoped_client_token_gets_only_what_its_scope_and_its_owner_both_allow(matrix, monkeypatch):
+    monkeypatch.setenv("GRID_SECRETS_KEY", "a-test-key-for-the-scope-tests-only")
+    tess = make_user(matrix, "Tess Tester", [permissions.TESTER])
+    vic = make_user(matrix, "Vic Viewer", [permissions.VIEWER])
+    codes = make_user(matrix, "Cody Codes", [add_role(matrix, "Codes", "mfa.use")])
+    _, tess_codes = add_client_token(matrix, "tess-codes", owner=tess, scope="mfa.use")
+    _, tess_signs_in = add_client_token(matrix, "tess-signs-in", owner=tess, scope="grid.view signins.add signins.use")
+    _, vics = add_client_token(matrix, "vic-ci", owner=vic, scope="grid.view mfa.use signins.use")
+    _, codys = add_client_token(matrix, "cody-ci", owner=codes, scope="grid.view mfa.use")
+    # In scope and held: on to the route, which knows no secret of that name, starts the sign-in, shows the grid.
+    assert as_check(tess_codes, "POST", CODE).status_code == 404
+    assert as_check(tess_signs_in, "POST", CHECKOUT, {"name": "new-site"}).get_json()["status"] == "sign-in"
+    for token in (tess_signs_in, vics):
+        assert as_check(token, "GET", "/api/status").status_code == 200
+    assert as_check(codys, "POST", CODE).status_code == 404
+    # Out of scope, though the owner holds it.
+    for token, method, path, scope in ((tess_codes, "POST", CHECKOUT, "signins.use"),
+                                       (tess_codes, "GET", "/api/status", "grid.view"),
+                                       (tess_signs_in, "POST", CODE, "mfa.use")):
+        r = as_check(token, method, path)
+        assert (r.status_code, r.get_json()) == (403, out_of_scope(scope)), (path, scope)
+    # In scope, and the owner's roles lack it: a scope gives nothing.
+    for path, permission in ((CODE, "mfa.use"), (CHECKOUT, "signins.use"), (SAVE, "signins.use"), (RELEASE, "signins.use")):
+        r = as_check(vics, "POST", path)
+        assert (r.status_code, r.get_json()) == (403, owner_lacks(permission)), path
+    r = as_check(codys, "GET", "/api/status")
+    assert (r.status_code, r.get_json()) == (403, NO_GRID_VIEW)
+    assert not auth._failures
+
+
+def test_out_of_scope_is_told_apart_from_the_owner_lacking_the_permission(matrix):
+    tess = make_user(matrix, "Tess Tester", [permissions.TESTER])
+    vic = make_user(matrix, "Vic Viewer", [permissions.VIEWER])
+    _, tess_reads = add_client_token(matrix, "tess-reads", owner=tess, scope="grid.view")
+    _, vic_reads = add_client_token(matrix, "vic-reads", owner=vic, scope="grid.view")
+    _, vics = add_client_token(matrix, "vic-ci", owner=vic)
+    r = as_check(tess_reads, "POST", CODE)
+    assert r.status_code == 403 and r.get_json() == {
+        "error": "This client token's scope doesn't include “Use MFA secrets”. A token's scope can't be changed: make "
+                 "another on the Access page.", "out_of_scope": True, "scope": "mfa.use"}
+    assert "forbidden" not in r.get_json() and "permission" not in r.get_json()
+    r = as_check(vics, "POST", CODE)
+    assert r.get_json() == owner_lacks("mfa.use") and "out_of_scope" not in r.get_json()
+    # Both apply: the scope is said, the first of the two gates.
+    r = as_check(vic_reads, "POST", CODE)
+    assert (r.status_code, r.get_json()) == (403, out_of_scope("mfa.use"))
+
+
+def test_a_scope_changes_nothing_in_what_the_store_is_told(db, monkeypatch):
+    """A scope is never taken out of the permissions: what is shared with a token's owner reaches the token by how
+    much its owner may do, and with less it would reach more sign-ins, not fewer."""
+    oidc_on(monkeypatch)
+    dana = make_user(db, "Dana Lee", [permissions.TESTER, add_role(db, "QA", "audit.view")], email="dana@example.com")
+    _, plain = add_client_token(db, "dana-ci", owner=dana)
+    _, limited = add_client_token(db, "dana-limited", owner=dana, scope="grid.view")
+    unscoped, scoped = token_principal(plain), token_principal(limited)
+    assert (unscoped.scope, scoped.scope) == (None, {"grid.view"})
+    assert scoped.permissions == unscoped.permissions == TESTER | {"audit.view"}
+    assert (scoped.role_ids, scoped.user_id, scoped.email) == (unscoped.role_ids, dana, "dana@example.com")
+    assert scoped._replace(scope=None, name=unscoped.name) == unscoped
+    assert auth.access(scoped) == auth.access(unscoped)
+    assert not hasattr(auth.access(scoped), "scope")
+    with grid_app.app.test_request_context():
+        told, told_unscoped = auth.actor(scoped), auth.actor(unscoped)
+    assert told._replace(name=told_unscoped.name) == told_unscoped and not hasattr(told, "scope")
+    assert all(auth.can(scoped, p) == auth.can(unscoped, p) for p in permissions.PERMISSIONS)
+
+
+def test_a_scoped_token_nobody_owns_is_still_an_admin_narrowed_by_its_scope(db, monkeypatch):
+    oidc_on(monkeypatch)
+    _, legacy = add_client_token(db, "legacy", scope="mfa.use")
+    with grid_app.app.test_request_context(headers=bearer(legacy)):
+        principal = auth.check_principal(accounts.client_token_access, "mfa.use", "mfa.use")
+    assert principal == auth.Principal("client token 'legacy'", "client-token", scope=frozenset({"mfa.use"}))
+    assert auth.is_admin(principal) and principal.permissions == permissions.ALL
+    assert auth.access(principal) == store.Access(None, (permissions.ADMIN,), permissions.ALL)
+    assert as_check(legacy, "POST", CODE).status_code == 404
+    for path in (CHECKOUT, SAVE, RELEASE):
+        r = as_check(legacy, "POST", path)
+        assert (r.status_code, r.get_json()) == (403, out_of_scope("signins.use")), path
+
+
+def test_a_scoped_token_follows_its_owners_roles_on_every_request(db, monkeypatch):
+    oidc_on(monkeypatch)
+    dana = make_user(db, "Dana Lee", [permissions.TESTER])
+    _, danas = add_client_token(db, "dana-ci", owner=dana, scope="mfa.use")
+    assert as_check(danas, "POST", CODE).status_code == 404
+    run(db, "UPDATE userRoles SET roleId = ? WHERE userId = ?", (permissions.VIEWER, dana))
+    r = as_check(danas, "POST", CODE)
+    assert (r.status_code, r.get_json()) == (403, owner_lacks("mfa.use"))
+    run(db, "UPDATE userRoles SET roleId = ? WHERE userId = ?", (permissions.TESTER, dana))
+    assert as_check(danas, "POST", CODE).status_code == 404
+
+
+def test_a_scoped_token_whose_owner_is_disabled_gets_owner_disabled(matrix):
+    """The owner is looked at before the scope: nothing is said about a scope to a token that gets nothing."""
+    erin = make_user(matrix, "Erin", [permissions.TESTER], disabled=True)
+    for name, owner, scope in (("erin-ci", erin, "mfa.use"), ("erin-nothing", erin, ""), ("gone-ci", 999, "grid.view")):
+        _, token = add_client_token(matrix, name, owner=owner, scope=scope)
+        for method, path, _ in TAKES_A_CLIENT_TOKEN:
+            r = as_check(token, method, path)
+            assert r.status_code == 403 and r.get_json()["owner_disabled"] is True, (name, path)
+            assert "out_of_scope" not in r.get_json()
+    assert not auth._failures
+
+
+def test_a_token_whose_scope_was_cleared_in_the_database_is_turned_away(db, monkeypatch, caplog):
+    """Stored as a scoped token and its scope gone: never a token with no limit."""
+    oidc_on(monkeypatch)
+    token_id, token = add_client_token(db, "limited", scope="mfa.use")
+    assert as_check(token, "POST", CODE).status_code == 404
+    run(db, "UPDATE accessTokens SET scope = NULL WHERE id = ?", (token_id,))
+    with caplog.at_level(logging.WARNING, logger="ui.store"):
+        for _ in range(2):
+            r = as_check(token, "POST", CODE)
+            assert (r.status_code, r.get_json()) == (401, WRONG_TOKEN)
+    assert caplog.text.count(store._TOKEN_FORM.format(token_id)) == 1 and token not in caplog.text
+    assert store.client_token(token) is None and accounts.client_token_access(token) is None
+    assert len(auth._failures["127.0.0.1"]) == 2  # it counts as a guess
+
+
+def test_a_token_given_a_scope_in_the_database_is_turned_away(db, monkeypatch, caplog):
+    """Software from before scopes would still take it for a token with no limit, so this version takes it for
+    nothing: a scope is given when a token is made, never after."""
+    oidc_on(monkeypatch)
+    token_id, token = add_client_token(db, "plain")
+    assert as_check(token, "POST", CODE).status_code == 404
+    for scope in ("mfa.use", ""):
+        run(db, "UPDATE accessTokens SET scope = ? WHERE id = ?", (scope, token_id))
+        with caplog.at_level(logging.WARNING, logger="ui.store"):
+            r = as_check(token, "POST", CODE)
+        assert (r.status_code, r.get_json()) == (401, WRONG_TOKEN), scope
+    assert caplog.text.count(store._TOKEN_FORM.format(token_id)) == 1
+    assert store.client_token(token) is None
+
+
+def test_a_scoped_token_is_turned_away_when_the_scope_column_is_gone(db, monkeypatch):
+    oidc_on(monkeypatch)
+    _, limited = add_client_token(db, "limited", scope="mfa.use")
+    _, plain = add_client_token(db, "plain")
+    run(db, "ALTER TABLE accessTokens DROP COLUMN scope")
+    for method, path, _ in TAKES_A_CLIENT_TOKEN:
+        r = as_check(limited, method, path)
+        assert (r.status_code, r.get_json()) == (401, WRONG_TOKEN), path
+    assert store.client_token(limited) is None
+    assert as_check(plain, "POST", CODE).status_code == 404  # a token without a scope is as it was
+    assert store.client_token(plain)["scope"] is None
+
+
+def test_one_token_stored_both_ways_is_turned_away(db, monkeypatch, caplog):
+    oidc_on(monkeypatch)
+    plain_id, token = add_client_token(db, "twice")
+    scoped_id, same = add_client_token(db, "twice", scope="mfa.use")
+    assert same == token
+    with caplog.at_level(logging.WARNING, logger="ui.store"):
+        for _ in range(2):
+            r = as_check(token, "POST", CODE)
+            assert (r.status_code, r.get_json()) == (401, WRONG_TOKEN)
+    assert (caplog.text.count(store._TWO_TOKEN_ROWS.format(plain_id, scoped_id))
+            + caplog.text.count(store._TWO_TOKEN_ROWS.format(scoped_id, plain_id))) == 1
+    assert token not in caplog.text and store.client_token(token) is None
+    assert run(db, "SELECT COUNT(*) FROM accessTokens WHERE lastUsedAt IS NOT NULL") == [(0,)]
+
+
+def nothing_is_allowed(path, stored_scope):
+    """A token with that stored scope, whoever owns it, is out of scope on every route that takes one."""
+    robin = make_user(path, "Robin Hale", [permissions.ADMIN])
+    for name, owner in (("legacy-nothing", None), ("robin-nothing", robin)):
+        _, token = add_client_token(path, name, owner=owner, scope=stored_scope)
+        for method, route, scope in TAKES_A_CLIENT_TOKEN:
+            r = as_check(token, method, route)
+            assert (r.status_code, r.get_json()) == (403, out_of_scope(scope)), (name, route)
+        r = as_check(token, "GET", "/api/status?soft=1")
+        assert (r.status_code, r.get_json()) == (403, out_of_scope("grid.view")), name
+    assert not auth._failures
+
+
+def test_a_scope_of_only_unknown_ids_allows_nothing(matrix):
+    """Ids a newer version wrote, a permission that is no scope id, and an id that only starts like one."""
+    nothing_is_allowed(matrix, "made.up grid.operate sessions.openx mfa.use.more")
+
+
+def test_an_empty_stored_scope_allows_nothing(matrix):
+    nothing_is_allowed(matrix, "")
+
+
+def test_a_scope_of_opening_sessions_alone_gets_nothing_from_the_grid_ui(matrix):
+    """sessions.open is the hub's: here it is a scope id that no route asks for."""
+    nothing_is_allowed(matrix, "sessions.open")
+
+
+def test_a_lookup_that_does_not_say_the_scope_is_an_error(db, monkeypatch):
+    """Never a principal: a token whose scope nobody read is not a token without one."""
+    oidc_on(monkeypatch)
+    _, legacy = add_client_token(db, "legacy")
+    _, danas = add_client_token(db, "dana-ci", owner=make_user(db, "Dana Lee", [permissions.TESTER]))
+
+    def lookup(token):
+        found = accounts.client_token_access(token)
+        del found["scope"]
+        return found
+
+    for token in (legacy, danas):
+        with grid_app.app.test_request_context(headers=bearer(token)):
+            with pytest.raises(KeyError):
+                auth.check_principal(lookup, "grid.view")
+            with pytest.raises(KeyError):
+                auth.reader_principal(lookup)
+
+
+def test_the_bootstrap_client_token_has_no_scope(matrix):
+    with grid_app.app.test_request_context(headers=bearer(BOOTSTRAP)):
+        principal = auth.check_principal(accounts.client_token_access, "mfa.use", "mfa.use")
+    assert principal == auth.Principal("GATEWAY_CLIENT_TOKEN", "client-bootstrap") and principal.scope is None
+    assert all(auth.in_scope(principal, scope) for scope in permissions.TOKEN_SCOPES)
+    assert as_check(BOOTSTRAP, "POST", CODE).status_code == 404
+    assert as_check(BOOTSTRAP, "GET", "/api/status").status_code == 200
+    # Nor has a person, or the admin token.
+    assert auth.Principal("Dana Lee", "oidc").scope is None and auth.in_scope(auth.Principal("Admin", "token"), "mfa.use")
+
+
+def test_without_grid_view_in_scope_a_token_cannot_read_the_grid_where_reading_needs_sign_in(matrix, monkeypatch):
+    dana = make_user(matrix, "Dana Lee", [permissions.TESTER])
+    _, codes = add_client_token(matrix, "dana-codes", owner=dana, scope="mfa.use")
+    _, reads = add_client_token(matrix, "dana-reads", owner=dana, scope="grid.view")
+    for path in ("/status", "/api/status", "/api/events", "/api/status?soft=1", "/status?soft=1"):
+        r = as_check(codes, "GET", path)
+        assert (r.status_code, r.get_json()) == (403, out_of_scope("grid.view")), path
+        assert as_check(reads, "GET", path).status_code == 200, path
+    assert "nodes" in as_check(reads, "GET", "/api/status").get_json()
+    # Where reads are open no token is looked at: not this one's scope, and a wrong one is no guess.
+    monkeypatch.setenv("GRID_UI_READS", "open")
+    for token in (codes, "pwgc_wrong"):
+        assert as_check(token, "GET", "/api/status").status_code == 200, token
+    assert not auth._failures
+
+
+def test_giving_a_scoped_token_to_a_person_keeps_its_scope(db, monkeypatch):
+    """Its row is as it was. It then acts as the person, and its scope still takes away."""
+    oidc_on(monkeypatch)
+    tess = make_user(db, "Tess Tester", [permissions.TESTER])
+    token_id, token = add_client_token(db, "limited", scope="mfa.use")
+    stored = run(db, "SELECT tokenHash, scope FROM accessTokens WHERE id = ?", (token_id,))
+    given = accounts.set_token_owner(token_id, tess, ADMIN_ACTOR)
+    assert (given["scope"], given["ownerId"]) == (["mfa.use"], tess) and "scopeLost" not in given
+    assert run(db, "SELECT tokenHash, scope FROM accessTokens WHERE id = ?", (token_id,)) == stored
+    with grid_app.app.test_request_context(headers=bearer(token)):
+        principal = auth.check_principal(accounts.client_token_access, "mfa.use", "mfa.use")
+    assert (principal.user_id, principal.permissions, principal.scope) == (tess, TESTER, {"mfa.use"})
+    assert as_check(token, "POST", CODE).status_code == 404
+    r = as_check(token, "POST", CHECKOUT)
+    assert (r.status_code, r.get_json()) == (403, out_of_scope("signins.use"))
+
+
+def test_out_of_scope_refusals_do_not_count_towards_the_guessing_limit(db, monkeypatch):
+    """The token is right. Its scope just leaves the request out."""
+    oidc_on(monkeypatch)
+    _, token = add_client_token(db, "reads", scope="grid.view")
+    for _ in range(auth.FAILURE_LIMIT + 1):
+        r = as_check(token, "POST", CODE)
+        assert (r.status_code, r.get_json()) == (403, out_of_scope("mfa.use"))
+    assert not auth._failures
+
+
+def test_putting_scoped_in_front_of_a_token_finds_nothing_and_is_not_logged(db, monkeypatch, caplog):
+    """What is kept for a scoped token starts with scoped:, and the token never does: sent that way it is any
+    unknown token, and nothing about a row is logged."""
+    oidc_on(monkeypatch)
+    _, limited = add_client_token(db, "limited", scope="mfa.use")
+    _, plain = add_client_token(db, "plain")
+    with caplog.at_level(logging.WARNING, logger="ui.store"):
+        for token in (limited, plain):
+            for prefix in ("scoped:", "scoped:scoped:"):
+                r = as_check(prefix + token, "POST", CODE)
+                assert (r.status_code, r.get_json()) == (401, WRONG_TOKEN), (prefix, token)
+                assert store.client_token(prefix + token) is None
+        assert as_check(limited, "POST", CODE).status_code == 404  # the token itself still works
+        assert as_check(plain, "POST", CODE).status_code == 404
+    assert "turned away" not in caplog.text and caplog.text == ""
+    assert len(auth._failures["127.0.0.1"]) == 4  # each one a guess, as any unknown token is
+
+
+def test_every_route_that_takes_a_client_token_names_a_scope(matrix):
+    """Every route of the app is asked three times: with no credentials, with an admin's client token that has no
+    scope, and with one whose stored scope is empty. Where the first two answers differ the route takes a client
+    token: those are exactly TAKES_A_CLIENT_TOKEN, and each refuses the empty scope as out of scope. Everywhere
+    else the token isn't looked at. So a new route that takes a client token is listed here and names a scope."""
+    robin = make_user(matrix, "Robin Hale", [permissions.ADMIN])
+    _, unscoped = add_client_token(matrix, "robin-ci", owner=robin)
+    _, empty = add_client_token(matrix, "robin-nothing", owner=robin, scope="")
+    rules = sorted({(method, rule.rule) for rule in grid_app.app.url_map.iter_rules() if rule.endpoint != "static"
+                    for method in rule.methods - {"HEAD", "OPTIONS"}})
+    assert len(rules) >= len(ROUTES)
+    takes = set()
+    for method, rule in rules:
+        path = re.sub(r"<[^>]+>", "999999", rule)
+        body = None if method == "GET" else {}
+        nobody = answer(send(grid_app.app.test_client(), method, path, body))
+        with_token = answer(send(grid_app.app.test_client(), method, path, body, bearer(unscoped)))
+        r = send(grid_app.app.test_client(), method, path, body, bearer(empty))
+        if with_token != nobody:
+            takes.add((method, rule))
+            assert r.status_code == 403 and r.get_json()["out_of_scope"] is True, (method, rule)
+            assert r.get_json()["scope"] in permissions.TOKEN_SCOPES, (method, rule)
+        else:
+            assert answer(r) == nobody, (method, rule)
+    assert takes == {(method, path) for method, path, _ in TAKES_A_CLIENT_TOKEN}
+    assert not auth._failures
+
+
+def test_out_of_scope_names_an_id_that_is_not_a_scope_without_failing():
+    with grid_app.app.test_request_context():
+        r = auth.out_of_scope("nothing.known")
+        assert (r.status_code, r.get_json()) == (403, {
+            "error": "This client token's scope doesn't include “nothing.known”. A token's scope can't be changed: "
+                     "make another on the Access page.", "out_of_scope": True, "scope": "nothing.known"})
+        r = auth.out_of_scope("signins.add", "Said otherwise.")
+        assert (r.status_code, r.get_json()) == (403, {"error": "Said otherwise.", "out_of_scope": True,
+                                                       "scope": "signins.add"})
+
+
+def test_check_principal_tests_the_scope_and_the_owners_roles(db, monkeypatch):
+    """Both, on every call, and the scope first. It can't be called without saying which scope the request needs."""
+    oidc_on(monkeypatch)
+    _, vics = add_client_token(db, "vic-ci", owner=make_user(db, "Vic Viewer", [permissions.VIEWER]),
+                               scope="grid.view mfa.use")
+    tess = make_user(db, "Tess Tester", [permissions.TESTER])
+    _, tess_reads = add_client_token(db, "tess-reads", owner=tess, scope="grid.view")
+    _, tess_codes = add_client_token(db, "tess-codes", owner=tess, scope="mfa.use")
+
+    def refused(token, *args):
+        with grid_app.app.test_request_context(headers=bearer(token)):
+            with pytest.raises(werkzeug.exceptions.HTTPException) as e:
+                auth.check_principal(accounts.client_token_access, *args)
+            return e.value.response.status_code, e.value.response.get_json()
+
+    assert refused(vics, "mfa.use", "mfa.use") == (403, owner_lacks("mfa.use"))  # in scope, not held
+    assert refused(tess_reads, "mfa.use", "mfa.use") == (403, out_of_scope("mfa.use"))  # held, out of scope
+    assert refused(tess_reads, "mfa.use") == (403, out_of_scope("mfa.use"))
+    assert refused(tess_codes, "signins.use", "signins.use") == (403, out_of_scope("signins.use"))
+    with grid_app.app.test_request_context(headers=bearer(tess_codes)):
+        assert auth.check_principal(accounts.client_token_access, "mfa.use", "mfa.use").user_id == tess
+        with pytest.raises(TypeError):
+            auth.check_principal(accounts.client_token_access)
+        with pytest.raises(TypeError):
+            auth.check_principal(accounts.client_token_access, permission="mfa.use")
