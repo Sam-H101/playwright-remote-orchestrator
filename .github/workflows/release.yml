@@ -55,7 +55,7 @@ jobs:
       previous: ${{ steps.next.outputs.previous }}
       sha: ${{ steps.next.outputs.sha }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # every tag and branch, and the merges since the last release
 
@@ -87,8 +87,11 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash .github/scripts/next-version.test.sh
+      # Every action the workflows use stays pinned to a commit SHA (.github/dependabot.yml).
+      - run: bash .github/scripts/action-pins.test.sh
+      - run: bash .github/scripts/action-pins.sh
 
   release:
     name: tag and release
@@ -100,7 +103,7 @@ jobs:
     outputs:
       publish: ${{ steps.release.outputs.publish }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # the tags as they are now: this job may be a re-run of an old one
 

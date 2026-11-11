@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
@@ -113,4 +114,37 @@ test('hub config defaults', () => {
   assert.ok(fs.existsSync(c.schemaPath));
   assert.equal(hubConfig({ HUB_DB: 'memory' }).db, 'memory');
   assert.throws(() => hubConfig({ HUB_DB: 'sqlite' }), /HUB_DB/);
+});
+
+test('scopedHash is "scoped:" and the first 57 characters of the plain hash', () => {
+  // A made-up token and its hashes, worked out with sha256 beforehand.
+  const token = `pwgc_${'A'.repeat(43)}`;
+  const plain = '1f0bc52f7fa82946861c65a388c72cfdd15561d997682cee0eba9fa2becc4bd0';
+  assert.equal(P.hashToken(token), plain);
+  assert.equal(P.hashToken(token), crypto.createHash('sha256').update(token).digest('hex'));
+  assert.equal(P.SCOPED_HASH_PREFIX, 'scoped:');
+  const scoped = P.scopedHash(plain);
+  assert.equal(scoped, 'scoped:1f0bc52f7fa82946861c65a388c72cfdd15561d997682cee0eba9fa2b');
+  assert.equal(scoped, `scoped:${plain.slice(0, 57)}`);
+  assert.equal(scoped.length, 64, 'it fits tokenHash CHAR(64)');
+  assert.doesNotMatch(scoped, /^[0-9a-f]{64}$/, 'no sha256 in hex can equal it');
+  assert.match(plain, /^[0-9a-f]{64}$/);
+  // It is made from the plain hash, not from the token, and is the sha256 of nothing that can be sent.
+  assert.notEqual(scoped, P.scopedHash(token));
+  for (const sent of [token, `scoped:${token}`, `scoped:scoped:${token}`]) assert.notEqual(P.hashToken(sent), scoped);
+  assert.equal(P.hashToken(`scoped:${token}`), 'c9795951395e62fd4872f788f64603b879af3dcdb0954109b0d77aad5eeabd7a');
+  // A token with a scope has the shape of any other client token; with scoped: in front it has not.
+  assert.equal(P.isManagedToken(token), true);
+  assert.equal(P.isManagedToken(`scoped:${token}`), false);
+});
+
+test('the schema gives accessTokens a scope column', () => {
+  const statements = splitSchema(fs.readFileSync(hubConfig({}).schemaPath, 'utf8'));
+  const table = statements.filter((stmt) => /^CREATE TABLE IF NOT EXISTS accessTokens\b/.test(stmt));
+  assert.equal(table.length, 1);
+  const columns = table[0].split(/\r?\n/).map((line) => line.trim().replace(/,$/, ''));
+  assert.ok(columns.includes('scope VARCHAR(255) NULL'), table[0]);
+  // tokenHash keeps its width (the scoped form is 64 characters too) and its unique key.
+  assert.ok(columns.includes('tokenHash CHAR(64) NOT NULL'), table[0]);
+  assert.ok(columns.includes('UNIQUE KEY uq_token_hash (tokenHash)'), table[0]);
 });

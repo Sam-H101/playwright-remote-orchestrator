@@ -755,6 +755,7 @@ a.stat:hover { text-decoration: none; border-color: var(--line-strong); }
 /* Access. */
 .tokens .tok-name { display: block; font-weight: 600; }
 .tokens .tok-prefix { color: var(--text-3); font-size: 11px; }
+.tokens .tok-scope { display: block; color: var(--text-2); font-size: 11.5px; }
 .tokens .kind { display: inline-flex; height: 20px; align-items: center; padding: 0 7px; border-radius: 4px; font-size: 11.5px; font-weight: 500; border: 1px solid var(--line); color: var(--text-2); }
 .tokens .bound { color: var(--text); }
 .tokens .soon { color: var(--warn); font-weight: 500; }

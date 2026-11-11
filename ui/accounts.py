@@ -687,7 +687,7 @@ def end_session(token, everywhere=False, address=None):
 
 def client_token_access(token):
     """The active managed client token `token` is, and who checks using it act as: {"id", "name", "ownerId",
-    "owner"}, or None. owner is user_access of the person who made it. It is None when ownerId is (an admin made
+    "owner", "scope"}, or None. owner is user_access of the person who made it. It is None when ownerId is (an admin made
     the token, and checks using it act as an admin), but also when the owner can't be found: auth.py goes by
     ownerId, so that a token whose owner is gone is never taken for an admin's. Raises TokensUnavailable when
     whose it is can't be told (store.client_token)."""
@@ -1964,7 +1964,7 @@ def set_token_owner(token_id, user_id, actor):
             store._add_owner(cur, "token", token_id, user_id)
             store._audit(cur, actor, "token.owner_set", "token", token_id, name, {"to": _user_ref(cur, user_id)})
             cur.execute(store._sql("SELECT {}, {} FROM accessTokens WHERE id = ?".format(
-                store._now_sql(), store._TOKEN_COLUMNS)), (token_id,))
+                store._now_sql(), store._token_columns(cur))), (token_id,))
             row = cur.fetchone()
     except store._MissingTables:  # the accessTokens table: there is no such token
         return None

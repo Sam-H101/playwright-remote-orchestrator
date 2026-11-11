@@ -5,7 +5,7 @@ import { app } from "../../app.js";
 import * as api from "../../api.js";
 import * as auth from "../../auth.js";
 import { html, icon, patchList, setHTML, setText } from "../../html.js";
-import { fullDate, parseTime, plural } from "../../format.js";
+import { fullDate, parseTime, plural, scopeLimit } from "../../format.js";
 import { toast } from "../../ui/toast.js";
 import { both, loader, permissionGroups, possessive } from "./common.js";
 
@@ -71,7 +71,8 @@ export function sentence(e) {
     case "group.mapped": return everyone ? "gave everyone who signs in the role " + role : "mapped the group ‘" + (d.group || name) + "’ to the role " + role;
     case "group.unmapped":
       return everyone ? "stopped giving everyone who signs in the role " + role : "stopped mapping the group ‘" + (d.group || name) + "’ to the role " + role;
-    case "token.created": return "made the " + (d.kind ? d.kind + " " : "") + "token " + quoted(name);
+    case "token.created": return "made the " + (d.kind ? d.kind + " " : "") + "token " + quoted(name)
+      + (Array.isArray(d.scope) ? ", which " + scopeLimit(d.scope) : "");
     case "token.revoked": return "revoked the token " + quoted(name);
     case "token.deleted": return "deleted the token " + quoted(name);
     case "token.owner_set": return "gave the token " + quoted(name) + " to " + toWhom(d.to);

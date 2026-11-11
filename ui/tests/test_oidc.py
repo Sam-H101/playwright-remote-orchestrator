@@ -24,7 +24,7 @@ GOOD = {
     "GRID_UI_PUBLIC_URL": "https://grid.example.com/",
 }
 SETTINGS = ("GRID_OIDC_ISSUER", "GRID_OIDC_CLIENT_ID", "GRID_OIDC_CLIENT_SECRET", "GRID_OIDC_CLIENT_AUTH",
-            "GRID_UI_PUBLIC_URL", "GRID_OIDC_LABEL", "GRID_OIDC_SCOPES", "GRID_OIDC_GROUPS_CLAIM", "GRID_OIDC_ADMINS",
+            "GRID_OIDC_FEDERATED_TOKEN_FILE", "AZURE_FEDERATED_TOKEN_FILE", "GRID_OIDC_MANAGED_IDENTITY", "GRID_UI_PUBLIC_URL", "GRID_OIDC_LABEL", "GRID_OIDC_SCOPES", "GRID_OIDC_GROUPS_CLAIM", "GRID_OIDC_ADMINS",
             "GRID_OIDC_END_SESSION", "GRID_OIDC_CA_FILE", "GRID_OIDC_ALLOW_HTTP", "GRID_OIDC_CLOCK_SKEW_S",
             "GRID_SESSION_HOURS", "GRID_SESSION_IDLE_MINUTES")
 SUBJECT = fake_idp.USER["sub"]
@@ -153,7 +153,10 @@ def test_cookie_names_follow_the_public_url(monkeypatch, public_url, names):
     assert tuple(oidc.cookie_names()) == names
 
 
-CLIENT = "Set GRID_OIDC_CLIENT_ID and GRID_OIDC_CLIENT_SECRET to the Grid UI's registration at the identity provider."
+CLIENT_ID = "Set GRID_OIDC_CLIENT_ID to the Grid UI's client id at the identity provider."
+NO_SECRET = ("Set GRID_OIDC_CLIENT_SECRET, or GRID_OIDC_CLIENT_AUTH=federated to use a token the platform issues, so the "
+             "Grid UI can prove to the identity provider that it is the client.")
+METHODS = "GRID_OIDC_CLIENT_AUTH is auto, basic, post or federated."
 PUBLIC = "Set GRID_UI_PUBLIC_URL to the address people open the Grid UI at, e.g. https://grid.example.com/."
 HTTPS = "{} must be an https URL (or set GRID_OIDC_ALLOW_HTTP=1 for development)."
 TENANT = ("GRID_OIDC_ISSUER is a multi-tenant address (common, organizations or consumers), which no ID token states "
@@ -162,8 +165,8 @@ ADMINS = "GRID_OIDC_ADMINS entry {!r} is neither an email address nor sub:<subje
 
 
 @pytest.mark.parametrize("changes, problem", [
-    ({"GRID_OIDC_CLIENT_SECRET": None}, CLIENT),
-    ({"GRID_OIDC_CLIENT_ID": None, "GRID_UI_PUBLIC_URL": None}, CLIENT),  # the first problem, not every one
+    ({"GRID_OIDC_CLIENT_SECRET": None}, NO_SECRET),
+    ({"GRID_OIDC_CLIENT_ID": None, "GRID_UI_PUBLIC_URL": None}, CLIENT_ID),  # the first problem, not every one
     ({"GRID_UI_PUBLIC_URL": None}, PUBLIC),
     ({"GRID_UI_PUBLIC_URL": "grid.example.com"}, PUBLIC),
     ({"GRID_UI_PUBLIC_URL": "ftp://grid.example.com/"}, PUBLIC),
@@ -177,7 +180,7 @@ ADMINS = "GRID_OIDC_ADMINS entry {!r} is neither an email address nor sub:<subje
     ({"GRID_OIDC_ISSUER": "https://login.microsoftonline.com/Organizations/v2.0"}, TENANT),
     ({"GRID_OIDC_ISSUER": "https://login.microsoftonline.com/consumers/"}, TENANT),
     ({"GRID_OIDC_ISSUER": "https://login.microsoftonline.com/0b6f7cd2-8a3c-4c35-a1e2-8d0e5b7f19aa/v2.0"}, None),
-    ({"GRID_OIDC_CLIENT_AUTH": "private_key_jwt"}, "GRID_OIDC_CLIENT_AUTH is auto, basic or post."),
+    ({"GRID_OIDC_CLIENT_AUTH": "private_key_jwt"}, METHODS),
     ({"GRID_OIDC_CLIENT_AUTH": "Basic"}, None),
     ({"GRID_OIDC_ADMINS": "ops@example.com, dana"}, ADMINS.format("dana")),
     ({"GRID_OIDC_ADMINS": "sub:"}, ADMINS.format("sub:")),
@@ -235,7 +238,7 @@ def test_each_problem_is_logged_once(monkeypatch, caplog):
     for _ in range(3):
         assert oidc.problem() is None
     assert [r.getMessage() for r in caplog.records] == [
-        "GRID_OIDC_CLIENT_AUTH is auto, basic or post.",
+        METHODS,
         "GRID_OIDC_ALLOW_HTTP=1: single sign-on runs over plain http, which is for development only."]
 
 
@@ -375,6 +378,7 @@ def test_an_es256_signature(idp):
 @pytest.mark.parametrize("fault, status, error", [
     ("token_400_invalid_grant", 400, "invalid_grant"),
     ("token_401_invalid_client", 401, "invalid_client"),
+    ("token_401_entra_70021", 401, "invalid_client"),
     ("token_500", 500, "server_error"),
 ])
 def test_the_token_endpoint_refusing(idp, fault, status, error):
@@ -382,6 +386,7 @@ def test_the_token_endpoint_refusing(idp, fault, status, error):
     with pytest.raises(oidc.HttpRefused) as refused:
         sign_in(idp)
     assert (refused.value.status, refused.value.error) == (status, error)
+    assert refused.value.codes == ((70021,) if fault == "token_401_entra_70021" else ())
 
 
 def test_a_token_endpoint_that_does_not_answer_in_time(idp, monkeypatch):
@@ -884,6 +889,7 @@ def test_a_provider_whose_discovery_fails(grid, idp, db, caplog, fault, code):
 @pytest.mark.parametrize("fault, code, logged", [
     ("token_400_invalid_grant", "failed", "refused a sign-in's code: HTTP 400 invalid_grant"),
     ("token_401_invalid_client", "misconfigured", "refused a sign-in's code: HTTP 401 invalid_client"),
+    ("token_401_entra_70021", "misconfigured", "refused a sign-in's code: HTTP 401 invalid_client (error codes 70021)"),
     ("token_500", "unavailable", "refused a sign-in's code: HTTP 500 server_error"),
     ("token_slow", "unavailable", "couldn't redeem a sign-in's code: the identity provider can't be reached"),
     ("jwks_oversize", "unavailable", "couldn't check a sign-in's ID token: the identity provider answered more than"),
@@ -1218,6 +1224,10 @@ def test_the_admin_token_wins_over_a_session_and_needs_no_database(grid, db, mon
     {"GRID_OIDC_CLIENT_AUTH": "private_key_jwt"},
     {"GRID_OIDC_ADMINS": "dana"},
     {"GRID_SESSION_IDLE_MINUTES": "2"},
+    {"GRID_OIDC_CLIENT_SECRET": None, "GRID_OIDC_CLIENT_AUTH": "federated",
+     "GRID_OIDC_FEDERATED_TOKEN_FILE": "/no/such/token"},
+    {"GRID_OIDC_FEDERATED_TOKEN_FILE": "/no/such/token"},
+    {"GRID_OIDC_CLIENT_SECRET": None, "AZURE_FEDERATED_TOKEN_FILE": "/no/such/token"},
 ])
 def test_single_sign_on_that_cannot_work_keeps_the_grid_protected(db, monkeypatch, changes):
     configure(monkeypatch, **changes)

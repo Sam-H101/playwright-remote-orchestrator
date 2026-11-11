@@ -12,8 +12,8 @@ import pytest
 
 from ui import accounts, app as grid_app, auth, mfa, permissions, store
 from ui.tests.test_accounts import (ADMIN, BOOTSTRAP, OPERATOR, TESTER, add_client_token, add_item,  # noqa: F401
-                                    add_mapping, add_role, answer, audit_rows, db, make_user, oidc_on, run,
-                                    sign_in_as, ts, unparsed)  # (db is a fixture)
+                                    add_mapping, add_role, answer, audit_rows, db, make_user, oidc_on, out_of_scope,
+                                    run, sign_in_as, ts, unparsed)  # (db is a fixture)
 
 KEY = "a-test-key-for-the-sharing-tests-only"
 SEED = base64.b32encode(b"12345678901234567890").decode()
@@ -1101,7 +1101,7 @@ def test_what_kind_of_token_each_person_may_make(people):
     bob("POST", "/api/tokens/{}/revoke".format(made["id"]))
     bob("POST", "/api/tokens/{}/delete".format(made["id"]))
     assert [(row[4], row[6], json.loads(row[8]) if row[8] else None) for row in audit_rows(people.path)] == [
-        ("token.created", made["id"], {"kind": "client", "owner": people.bob}),
+        ("token.created", made["id"], {"kind": "client", "owner": people.bob, "scope": None}),
         ("token.created", made["id"] + 1, {"kind": "agent", "owner": oscar}),
         ("token.created", made["id"] + 2, {"kind": "agent", "owner": hal}),
         ("token.revoked", made["id"], None),
@@ -1352,3 +1352,198 @@ def test_without_a_share_table_nothing_is_shared_or_given_away(people):
         assert "itemShares" in r.get_json()["error"]
     assert run(people.path, "SELECT userId FROM itemOwners") == [(people.bob,)]
     assert [s["name"] for s in robin("GET", "/api/mfa").get_json()["secrets"]] == ["intranet"]
+
+
+# ---- client tokens with a scope ---------------------------------------------------------------
+#
+# A scope decides which routes a token may ask (test_accounts.py). What it reaches there is its owner's, judged
+# by all of what its owner may do: a scope is never taken out of that.
+
+NOT_SHARED = {"error": "The saved sign-in 'prod-admin' belongs to someone else and isn't shared with this client "
+                       "token's owner.", "not_shared": True}
+
+
+def saved_signin(path, name, owner=None, shares=(), vouched_for=None):
+    """A saved sign-in with STATE saved by its owner's check. Returns its id."""
+    signin_id = add_item(path, "signin", name, owner=owner, shares=shares, vouched_for=vouched_for)
+    lease = store.checkout_signin("client token 'its-owners'", name)
+    store.save_signin("client token 'its-owners'", name, STATE, lease_token=lease["leaseToken"])
+    return signin_id
+
+
+def same_answers(unscoped, scoped, asked):
+    """Both tokens get the same answer to each (path, name, what is expected) of asked: 'state' and 'code' for
+    what is reached, else the key of the refusal."""
+    for path, name, expected in asked:
+        answers = [check(token, path, name=name) for token in (unscoped, scoped)]
+        first, second = [(r.status_code, r.get_json()) for r in answers]
+        if expected == "code":
+            assert first[0] == second[0] == 200 and sorted(first[1]) == sorted(second[1]), name
+            assert "code" in second[1], name
+        else:
+            assert first == second, name
+            if expected == "state":
+                assert second[1].get("state") == STATE, (name, second)
+            elif expected == 404:
+                assert second[0] == 404, (name, second)
+            else:
+                assert second[1].get(expected) is True, (name, second)
+
+
+def test_a_scope_never_makes_a_shared_sign_in_reach_a_token_its_owner_cannot_use(people):
+    """Bob shared his sign-in with Dana, who has since been given more than he has. A scope of using sign-ins
+    alone is less than Bob may do, and her token still isn't let in: it is Dana who is judged, not the scope."""
+    signin = bobs_signin(people)
+    _, before = add_client_token(people.path, "dana-before", owner=people.dana, scope="signins.use")
+    assert check(before, CHECKOUT, name="prod-admin").get_json()["state"] == STATE
+    run(people.path, "INSERT INTO userRoles (userId, roleId, grantedAt) VALUES (?, ?, ?)",
+        (people.dana, permissions.OPERATOR, ts(60)))
+    _, danas = add_client_token(people.path, "dana-ci", owner=people.dana, scope="signins.use")
+    _, robins = add_client_token(people.path, "robin-ci", owner=people.robin, scope="signins.use")
+    _, legacy = add_client_token(people.path, "legacy", scope="signins.use")
+    for token in (before, danas, robins, legacy):
+        for path, body in ((CHECKOUT, {}), (SAVE, {"state": NEWER, "baseVersion": 1, "id": signin}),
+                           (RELEASE, {"leaseToken": "x"})):
+            r = check(token, path, name="prod-admin", **body)
+            assert (r.status_code, r.get_json()) == (403, NOT_SHARED), path
+    assert signin_row(people.path)["version"] == 1
+
+
+def test_a_scoped_token_reaches_exactly_what_its_owner_reaches(people, monkeypatch):
+    """Her own, what is shared with her and with her role, what an admin vouched for, the admins': each as for a
+    token of hers without a scope, the refusals too."""
+    path = people.path
+    oscar = make_user(path, "Oscar Park", [permissions.OPERATOR])
+    saved_signin(path, "danas-own", owner=people.dana)
+    bobs_signin(people)  # shared with Dana and with QA
+    saved_signin(path, "carols", owner=people.carol)
+    saved_signin(path, "vouched", owner=people.bob, shares=[("user", oscar)], vouched_for=TESTER)
+    saved_signin(path, "not-vouched", owner=people.bob, shares=[("user", oscar)])
+    saved_signin(path, "admins-shared", shares=[("user", people.dana), ("role", people.qa), ("user", oscar)],
+                 vouched_for=permissions.ALL)
+    saved_signin(path, "admins-own")
+    bobs_secret(people)  # shared with Dana and with QA
+    store.create_mfa("danas-codes", SEED, owner_id=people.dana)
+    store.create_mfa("carols-codes", SEED, owner_id=people.carol)
+    store.create_mfa("admins-codes", SEED)
+    users = add_role(path, "Users", "mfa.use signins.use")
+    run(path, "INSERT INTO userRoles (userId, roleId, grantedAt) VALUES (?, ?, ?)", (people.erin, users, ts(60)))
+    asked = {
+        people.dana: [(CHECKOUT, "danas-own", "state"), (CHECKOUT, "prod-admin", "state"), (CHECKOUT, "carols", "not_shared"),
+                      (CHECKOUT, "admins-shared", "state"), (CHECKOUT, "admins-own", "not_shared"),
+                      (CODE, "intranet", "code"), (CODE, "danas-codes", "code"), (CODE, "carols-codes", "not_shared"),
+                      (CODE, "admins-codes", "not_shared"), (CODE, "nope", 404)],
+        people.erin: [(CHECKOUT, "prod-admin", "state"), (CHECKOUT, "admins-shared", "state"),
+                      (CHECKOUT, "carols", "not_shared"), (CODE, "intranet", "code"), (CODE, "carols-codes", "not_shared")],
+        oscar: [(CHECKOUT, "vouched", "state"), (CHECKOUT, "not-vouched", "not_shared"),
+                (CHECKOUT, "admins-shared", "state"), (CHECKOUT, "prod-admin", "not_shared")],
+    }
+    now = [STEP * 30 + 1]  # a secret gives a few codes ahead and no more: each pair of tokens asks at its own time
+    monkeypatch.setattr(store, "time", types.SimpleNamespace(time=lambda: now[0]))
+    for number, (owner, questions) in enumerate(asked.items()):
+        _, unscoped = add_client_token(path, "ci-{}".format(number), owner=owner)
+        for scope in ("mfa.use signins.use", "grid.view mfa.use signins.add signins.use"):
+            _, scoped = add_client_token(path, "ci-{}-{}".format(number, len(scope)), owner=owner, scope=scope)
+            now[0] += 300
+            same_answers(unscoped, scoped, questions)
+
+
+def test_a_scoped_ownerless_token_reaches_what_an_unscoped_one_does(people):
+    """A token nobody owns is the admins': theirs, and a Tester's only once it is shared with the admins."""
+    path = people.path
+    saved_signin(path, "admins-own")
+    bobs_signin(people)
+    saved_signin(path, "for-admins", owner=people.bob, shares=[("role", permissions.ADMIN)], vouched_for=TESTER)
+    saved_signin(path, "to-admins-by-bob", owner=people.bob, shares=[("role", permissions.ADMIN)])
+    bobs_secret(people)
+    store.create_mfa("admins-codes", SEED)
+    _, unscoped = add_client_token(path, "legacy")
+    _, scoped = add_client_token(path, "legacy-limited", scope="mfa.use signins.use")
+    same_answers(unscoped, scoped, [
+        (CHECKOUT, "admins-own", "state"), (CHECKOUT, "prod-admin", "not_shared"), (CHECKOUT, "for-admins", "state"),
+        (CHECKOUT, "to-admins-by-bob", "not_shared"), (CODE, "intranet", "code"), (CODE, "admins-codes", "code"),
+        (CODE, "nope", 404)])
+    assert issued(path) == ["client token 'legacy'", "client token 'legacy-limited'"] * 2
+
+
+def test_without_signins_add_in_scope_a_token_cannot_start_a_new_name(people):
+    """A sign-in is added by checking out a name nothing has. Its owner may; the token's scope leaves it out."""
+    signin = add_item(people.path, "signin", "danas-site", owner=people.dana)
+    _, danas = add_client_token(people.path, "dana-ci", owner=people.dana, scope="signins.use")
+    _, robins = add_client_token(people.path, "robin-ci", owner=people.robin, scope="mfa.use signins.use")
+    _, legacy = add_client_token(people.path, "legacy", scope="grid.view signins.use")
+    for token in (danas, robins, legacy):
+        r = check(token, CHECKOUT, name="brand-new")
+        assert (r.status_code, r.get_json()) == (403, {
+            "error": "There is no saved sign-in called 'brand-new', and this client token's scope doesn't include “Add "
+                     "saved sign-ins”, so it can't start one.", "out_of_scope": True, "scope": "signins.add"})
+        assert r.headers["Cache-Control"] == "no-store"
+    assert run(people.path, "SELECT name FROM savedSignins") == [("danas-site",)]
+    assert audit_rows(people.path) == [] and not auth._failures
+    # A name that is there is used in full: checked out, signed in for, saved, signed in for afresh, released.
+    lease = check(danas, CHECKOUT, name="danas-site").get_json()
+    assert (lease["status"], lease["id"]) == ("sign-in", signin)
+    assert check(danas, SAVE, name="danas-site", state=STATE, leaseToken=lease["leaseToken"]).get_json() == {
+        "saved": True, "version": 1}
+    got = check(danas, CHECKOUT, name="danas-site").get_json()
+    assert (got["status"], got["version"], got["state"]) == ("saved", 1, STATE)
+    again = check(danas, CHECKOUT, name="danas-site", rejectedVersion=1, id=signin).get_json()
+    assert again["status"] == "sign-in"
+    r = check(danas, RELEASE, name="danas-site", leaseToken=again["leaseToken"])
+    assert (r.status_code, r.get_json()) == (200, {"released": True})
+    assert signin_row(people.path, "danas-site")["leased"] is False
+    # With it in scope the name is started, as by a token without a scope.
+    _, adds = add_client_token(people.path, "dana-adds", owner=people.dana, scope="signins.add signins.use")
+    assert check(adds, CHECKOUT, name="brand-new").get_json()["status"] == "sign-in"
+    assert run(people.path, "SELECT userId FROM itemOwners WHERE itemKind = 'signin' ORDER BY itemId") == [
+        (people.dana,), (people.dana,)]
+    assert [row[4] for row in audit_rows(people.path)] == ["signin.created"]
+
+
+def test_signins_add_in_scope_still_needs_the_owner_to_hold_it(people):
+    """A scope gives nothing: the answer is the one a token without a scope gets."""
+    users = add_role(people.path, "Users", "signins.use")
+    uma = make_user(people.path, "Uma Ng", [users])
+    for name, scope in (("uma-ci", None), ("uma-adds", "signins.add signins.use")):
+        _, umas = add_client_token(people.path, name, owner=uma, scope=scope)
+        r = check(umas, CHECKOUT, name="brand-new")
+        assert (r.status_code, r.get_json()) == (404, {"error": "There is no saved sign-in called 'brand-new'."}), name
+    assert run(people.path, "SELECT COUNT(*) FROM savedSignins") == [(0,)] and audit_rows(people.path) == []
+
+
+def test_without_mfa_use_in_scope_a_token_gets_no_code_for_a_secret_its_owner_can_use(people):
+    bobs_secret(people)
+    store.create_mfa("danas-codes", SEED, owner_id=people.dana)
+    _, bobs = add_client_token(people.path, "bob-ci", owner=people.bob, scope="grid.view")
+    _, danas = add_client_token(people.path, "dana-ci", owner=people.dana, scope="signins.add signins.use")
+    _, nothing = add_client_token(people.path, "dana-nothing", owner=people.dana, scope="")
+    for token in (bobs, danas, nothing):
+        for name in ("intranet", "danas-codes", "nope"):  # nor is it told which names there are
+            r = check(token, CODE, name=name)
+            assert (r.status_code, r.get_json()) == (403, out_of_scope("mfa.use")), name
+            assert r.headers["Cache-Control"] == "no-store"
+    assert issued(people.path) == [] and run(people.path, "SELECT SUM(issuedCount) FROM mfaSecrets") == [(0,)]
+    _, codes = add_client_token(people.path, "dana-codes", owner=people.dana, scope="mfa.use")
+    for name in ("intranet", "danas-codes"):
+        assert check(codes, CODE, name=name).status_code == 200, name
+    assert issued(people.path) == ["client token 'dana-codes' (Dana Lee)"] * 2
+
+
+def test_the_sign_in_cap_counts_a_scoped_tokens_owner_as_before(people, monkeypatch):
+    """The names one person's checks add are counted by person, whichever of their tokens added them."""
+    monkeypatch.setattr(store, "SIGNIN_MAX_PER_OWNER", 2)
+    _, danas = add_client_token(people.path, "dana-ci", owner=people.dana)
+    _, limited = add_client_token(people.path, "dana-limited", owner=people.dana, scope="signins.add signins.use")
+    _, robins = add_client_token(people.path, "robin-ci", owner=people.robin, scope="signins.add signins.use")
+    assert check(limited, CHECKOUT, name="a").get_json()["status"] == "sign-in"
+    assert check(danas, CHECKOUT, name="b").get_json()["status"] == "sign-in"
+    for token in (limited, danas):
+        r = check(token, CHECKOUT, name="c")
+        assert (r.status_code, r.get_json()) == (409, {
+            "error": "This client token's owner has 2 saved sign-ins already, the most one person's checks may add. "
+                     "Delete some on the Grid UI to use new names.", "signins_full": True})
+    # Someone who sees every sign-in isn't counted, with a scope or without.
+    for name in ("c", "d", "e"):
+        assert check(robins, CHECKOUT, name=name).get_json()["status"] == "sign-in"
+    run(people.path, "DELETE FROM itemOwners WHERE itemId = (SELECT id FROM savedSignins WHERE name = 'a')")
+    assert check(limited, CHECKOUT, name="f").get_json()["status"] == "sign-in"

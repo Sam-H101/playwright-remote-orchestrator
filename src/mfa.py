@@ -16,8 +16,9 @@ Settings, from the environment:
   GRID_MFA_TOKEN  the client token to ask with; default GATEWAY_CLIENT_TOKEN, which checks already have.
                   The Grid UI accepts managed client tokens, and the bootstrap one when it is given its value.
                   A client token gets codes for the secrets its owner can use: their own and those shared
-                  with them (for any other, the Grid UI answers 403 not_shared). Legacy tokens, tokens made
-                  with the admin token, and GATEWAY_CLIENT_TOKEN act as an admin and get every secret's.
+                  with them (for any other, the Grid UI answers 403 not_shared). A token whose scope leaves
+                  out MFA codes gets 403 out_of_scope. Legacy tokens, tokens made with the admin token, and
+                  GATEWAY_CLIENT_TOKEN act as an admin and get every secret's.
 """
 import time
 

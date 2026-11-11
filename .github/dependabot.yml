@@ -1,7 +1,10 @@
 # Dependabot opens update pull requests every Monday at 06:00 UTC:
 # - npm, Go and pip: one per ecosystem for the minor and patch updates, and one for each major.
 # - Playwright: one for each new version (see below).
-# - GitHub Actions: one for everything. The workflows use major tags, so these are mostly majors.
+# - GitHub Actions: one for everything. The workflows pin each action to a commit SHA, with its version in a
+#   comment on the same line, and Dependabot moves both: every release of an action, not only the majors.
+#   .github/scripts/action-pins.sh fails any action not pinned to a commit SHA (it doesn't check the comment):
+#   release.yml runs it on each pull request into master.
 # - Base images: one per image. Their tags already take patch releases, so these are new Node and Python
 #   versions. Their checks build the images and run a check through the hub and a runner with them. That
 #   check doesn't use the Grid UI, so try a Grid UI update before merging it.
@@ -12,11 +15,12 @@
 # for an ecosystem that keeps the defaults.
 #
 # A version is only offered once it has been out for a week (cooldown), long enough for most compromised
-# releases to be caught and pulled. That only holds for exact pins: ranged and unpinned Python requirements
-# and the actions' major tags take a new release the next time they're installed or used. Base images wait
+# releases to be caught and pulled. That only holds for exact pins, as the actions' commit SHAs are: ranged
+# and unpinned Python requirements take a new release the next time they're installed. Base images wait
 # a day, the least Dependabot allows (without a cooldown it waits three): Docker Hub pushes their tags again
 # every few days, and Dependabot counts from the last push, so a week would hold back almost every update.
-# Security updates never wait.
+# Security updates never wait. The actions get none: Dependabot raises alerts for an action used by version,
+# not by commit SHA, so a fix for one comes as an ordinary update, after its week.
 #
 # Playwright is pinned once, in runner/playwright: package.json, with its integrity in package-lock.json.
 # pwrunner embeds that playwright-core, the runner image installs it, and the checks image installs the

@@ -102,7 +102,9 @@ def checkout(name, rejected_version=None, lease_s=None, signin_id=None, url=None
     rejected_version is the version of a state the site refused (it asked to sign in again), and signin_id
     the "id" it came with: the Grid UI drops it, unless someone saved a newer one meanwhile, which comes
     back instead. A sign-in the token's owner can't use raises SigninError with status 403 (not_shared),
-    and one only shared with them that has nothing usable saved, status 409 (owner_signs_in)."""
+    and one only shared with them that has nothing usable saved, status 409 (owner_signs_in). A token whose
+    scope leaves out saved sign-ins, or leaves out adding them when the name is new, raises SigninError with
+    status 403 (out_of_scope)."""
     body = {"name": name}
     if rejected_version is not None:
         body["rejectedVersion"] = rejected_version

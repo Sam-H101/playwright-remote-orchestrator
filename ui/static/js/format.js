@@ -155,6 +155,15 @@ export function connectUrl(hub, node) {
   return hubBase(hub) + "/connect" + (node ? "?node=" + encodeURIComponent(node) : "");
 }
 
+// What a client token's scope leaves it, in words: "may only see the grid". The order is the dialog's.
+const SCOPE_WORDS = [["sessions.open", "open browser sessions"], ["grid.view", "see the grid"], ["mfa.use", "get MFA codes"],
+  ["signins.use", "reuse saved sign-ins"], ["signins.add", "add saved sign-ins"]];
+export function scopeLimit(scope) {
+  const words = SCOPE_WORDS.filter(([id]) => scope.includes(id)).map(([, word]) => word);
+  if (!words.length) return "may do nothing";
+  return "may only " + (words.length > 1 ? words.slice(0, -1).join(", ") + " and " : "") + words[words.length - 1];
+}
+
 // The hub's base address from whatever was pasted as one: the /connect address the panels show (or a
 // removed /connect/<node>/<slot> one), a query, a fragment or trailing slashes are dropped, so every
 // address built on it ends in exactly one /connect.

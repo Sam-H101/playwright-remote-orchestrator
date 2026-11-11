@@ -115,6 +115,8 @@ def test_redact_hides_only_the_token(endpoint, shown):
     (401, "Unauthorized", "missing or bad gateway token",
      "the hub answered 401: missing or bad gateway token (check GATEWAY_CLIENT_TOKEN"),
     (401, "Unauthorized", "gateway token is revoked", "gateway token is revoked (check GATEWAY_CLIENT_TOKEN"),
+    (403, "Forbidden", "gateway token is not allowed to open browser sessions (its scope leaves that out)",
+     "GATEWAY_CLIENT_TOKEN's scope"),
     (404, "Not Found", "no node or static host named zz is known to the hub", "(check GATEWAY_NODE: "),
     # A hub from before /connect routing answers a bare /connect like any unknown path.
     (404, "Not Found", "not found", "(the hub has no /connect: it predates routing by browser, so upgrade it"),
@@ -146,6 +148,12 @@ def test_explain_names_the_hubs_answer_and_what_to_do(status, reason, message, e
     text = main.explain(hub_answer(status, reason, message))
     assert text.startswith("the hub answered {}: {}".format(status, message))
     assert expected in text
+
+
+def test_explain_403_without_the_hubs_sentence_still_says_what_to_do():
+    assert main.explain(hub_answer(403, "Forbidden", "")) == (
+        "the hub answered 403 (GATEWAY_CLIENT_TOKEN's scope leaves out opening browser sessions: use a token whose "
+        "scope includes it)")
 
 
 def test_explain_unknown_status_keeps_the_hubs_message():

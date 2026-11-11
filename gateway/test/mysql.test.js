@@ -10,6 +10,7 @@ const WebSocket = require('ws');
 const h = require('./helpers');
 const { hubConfig } = require('../lib/config');
 const { MySqlRegistry } = require('../lib/registry');
+const { tokenProblem } = require('../lib/tokens');
 const { silent } = require('../lib/log');
 
 const enabled = process.env.GATEWAY_TEST_MYSQL === '1';
@@ -28,14 +29,16 @@ async function newRegistry({ init = true } = {}) {
 }
 
 // What the Grid UI does: a pwga_/pwgc_ token, stored as the sha256 hex of the exact string.
-async function insertToken(kind, { nodeName = null, expires = null, revoked = false } = {}) {
+// A token with a scope is stored as "scoped:" and the first 57 characters of that hash, with its scope beside it.
+async function insertToken(kind, { nodeName = null, expires = null, revoked = false, scope = null } = {}) {
   const token = `pwg${kind === 'agent' ? 'a' : 'c'}_${crypto.randomBytes(32).toString('base64url')}`;
   const hash = crypto.createHash('sha256').update(token).digest('hex');
+  const stored = scope === null ? hash : `scoped:${hash.slice(0, 57)}`;
   const [res] = await admin.query(
-    `INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt, revokedAt)
-     VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), ${expires === null ? 'NULL' : 'UTC_TIMESTAMP() + INTERVAL ? SECOND'}, ${revoked ? 'UTC_TIMESTAMP()' : 'NULL'})`,
-    [`${kind} test`, kind, hash, token.slice(0, 12), nodeName, ...(expires === null ? [] : [expires])]);
-  return { token, hash, id: res.insertId };
+    `INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt, revokedAt${scope === null ? '' : ', scope'})
+     VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), ${expires === null ? 'NULL' : 'UTC_TIMESTAMP() + INTERVAL ? SECOND'}, ${revoked ? 'UTC_TIMESTAMP()' : 'NULL'}${scope === null ? '' : ', ?'})`,
+    [`${kind} test`, kind, stored, token.slice(0, 12), nodeName, ...(expires === null ? [] : [expires]), ...(scope === null ? [] : [scope])]);
+  return { token, hash, stored, id: res.insertId };
 }
 
 before(async () => {
@@ -94,7 +97,8 @@ test('lookupToken, anyTokens and touchToken on rows inserted with SQL', { skip }
   assert.equal(await registry.anyTokens('client', true), true, 'an expired one counts as active');
 
   const row = await registry.lookupToken(bound.hash);
-  assert.deepEqual(Object.keys(row), ['id', 'name', 'kind', 'prefix', 'nodeName', 'expiresAt', 'revokedAt']);
+  assert.deepEqual(Object.keys(row), ['id', 'name', 'kind', 'prefix', 'nodeName', 'expiresAt', 'revokedAt', 'scoped', 'scope', 'storedTwice']);
+  assert.deepEqual([row.scoped, row.scope, row.storedTwice], [false, null, false]);
   assert.equal(row.id, bound.id);
   assert.equal(row.kind, 'agent');
   assert.equal(row.prefix, bound.token.slice(0, 12));
@@ -331,4 +335,144 @@ test('hub on MySQL: /connect claims the slot in portUsage, releases it, and dial
   row = await usage('127.0.0.1');
   assert.deepEqual([row.inUse, row.claimedBy], [0, null], 'stopping the hub released it');
   assert.equal((await admin.query('SELECT COUNT(*) AS n FROM hubs WHERE instance = ?', [hub.instance]))[0][0].n, 0, 'and gave up its lease');
+});
+
+const tokenColumns = async () => (await admin.query(
+  `SELECT COLUMN_NAME AS name, IS_NULLABLE AS nullable, COLUMN_TYPE AS type FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'accessTokens' ORDER BY ORDINAL_POSITION`))[0];
+
+test('init adds accessTokens.scope', { skip }, async () => {
+  await admin.query('DROP TABLE IF EXISTS accessTokens');
+  // accessTokens as it was before scopes.
+  await admin.query(`CREATE TABLE accessTokens (
+    id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(128) NOT NULL, kind VARCHAR(16) NOT NULL, tokenHash CHAR(64) NOT NULL,
+    prefix VARCHAR(16) NOT NULL, nodeName VARCHAR(255) NULL, createdAt DATETIME NOT NULL, expiresAt DATETIME NULL,
+    lastUsedAt DATETIME NULL, revokedAt DATETIME NULL, UNIQUE KEY uq_token_hash (tokenHash), KEY idx_kind (kind))`);
+  const old = `pwgc_${crypto.randomBytes(32).toString('base64url')}`;
+  const oldHash = crypto.createHash('sha256').update(old).digest('hex');
+  await admin.query("INSERT INTO accessTokens (name, kind, tokenHash, prefix, createdAt) VALUES ('made before scopes', 'client', ?, ?, UTC_TIMESTAMP())",
+    [oldHash, old.slice(0, 12)]);
+
+  const lines = [];
+  const registry = new MySqlRegistry(config.mysql, { schemaPath: config.schemaPath, log: { ...silent, info: (line) => lines.push(line) }, retries: 2, retryDelayMs: 500 });
+  registries.push(registry);
+  await registry.init();
+  const cols = await tokenColumns();
+  assert.deepEqual(cols.filter((c) => c.name === 'scope'), [{ name: 'scope', nullable: 'YES', type: 'varchar(255)' }]);
+  assert.equal(cols.length, 11);
+  assert.deepEqual(lines.filter((l) => /scope/.test(l)), ['added the scope column to the accessTokens table']);
+
+  // No row is changed: a token made before scopes has none, and is found as before.
+  const [[stored]] = await admin.query('SELECT name, tokenHash, scope FROM accessTokens');
+  assert.deepEqual(stored, { name: 'made before scopes', tokenHash: oldHash, scope: null });
+  const row = await registry.lookupToken(oldHash);
+  assert.deepEqual([row.name, row.scoped, row.scope, row.storedTwice], ['made before scopes', false, null, false]);
+  assert.equal(tokenProblem(row, 'client'), null);
+
+  lines.length = 0;
+  await registry.applySchema(); // a second run changes nothing
+  assert.deepEqual(await tokenColumns(), cols);
+  assert.deepEqual(lines, []);
+  const [keys] = await admin.query("SHOW INDEX FROM accessTokens WHERE Key_name = 'uq_token_hash'");
+  assert.equal(keys[0].Non_unique, 0);
+});
+
+test('lookupToken finds a token by its plain hash in either form and says which', { skip }, async () => {
+  const registry = await newRegistry();
+  await admin.query('DELETE FROM accessTokens');
+  const plain = await insertToken('client');
+  const scoped = await insertToken('client', { scope: 'grid.view sessions.open' });
+  const empty = await insertToken('client', { scope: '' });
+  const agent = await insertToken('agent');
+  assert.match(plain.stored, /^[0-9a-f]{64}$/);
+  for (const t of [scoped, empty]) {
+    assert.equal(t.stored, `scoped:${t.hash.slice(0, 57)}`);
+    assert.equal(t.stored.length, 64);
+  }
+  const [stored] = await admin.query('SELECT id, tokenHash, scope FROM accessTokens ORDER BY id');
+  assert.deepEqual(stored, [
+    { id: plain.id, tokenHash: plain.hash, scope: null }, { id: scoped.id, tokenHash: scoped.stored, scope: 'grid.view sessions.open' },
+    { id: empty.id, tokenHash: empty.stored, scope: '' }, { id: agent.id, tokenHash: agent.hash, scope: null },
+  ]);
+
+  const said = async (t) => {
+    const row = await registry.lookupToken(t.hash);
+    return [row.id, row.kind, row.prefix, row.scoped, row.scope, row.storedTwice];
+  };
+  assert.deepEqual(await said(plain), [plain.id, 'client', plain.token.slice(0, 12), false, null, false]);
+  assert.deepEqual(await said(scoped), [scoped.id, 'client', scoped.token.slice(0, 12), true, 'grid.view sessions.open', false]);
+  assert.deepEqual(await said(empty), [empty.id, 'client', empty.token.slice(0, 12), true, '', false], 'an empty scope is not no scope');
+  assert.deepEqual(await said(agent), [agent.id, 'agent', agent.token.slice(0, 12), false, null, false]);
+  assert.equal(Object.hasOwn(await registry.lookupToken(scoped.hash), 'tokenHash'), false, 'the stored form is not handed on');
+  assert.equal(await registry.lookupToken(crypto.createHash('sha256').update(`scoped:${scoped.token}`).digest('hex')), null);
+
+  assert.equal(tokenProblem(await registry.lookupToken(plain.hash), 'client'), null);
+  assert.equal(tokenProblem(await registry.lookupToken(scoped.hash), 'client'), null);
+  assert.equal(tokenProblem(await registry.lookupToken(empty.hash), 'client'), 'not allowed to open browser sessions (its scope leaves that out)');
+  // Changed by hand: a scoped row with its scope taken off, and a plain row given one.
+  await admin.query('UPDATE accessTokens SET scope = NULL WHERE id = ?', [scoped.id]);
+  await admin.query("UPDATE accessTokens SET scope = 'sessions.open' WHERE id IN (?, ?)", [plain.id, agent.id]);
+  assert.deepEqual(await said(scoped), [scoped.id, 'client', scoped.token.slice(0, 12), true, null, false]);
+  assert.deepEqual(await said(plain), [plain.id, 'client', plain.token.slice(0, 12), false, 'sessions.open', false]);
+  for (const [t, kind] of [[scoped, 'client'], [plain, 'client'], [agent, 'agent']]) {
+    assert.equal(tokenProblem(await registry.lookupToken(t.hash), kind), 'not usable: its scope was lost or changed in the database');
+  }
+});
+
+test('lookupToken says when a token is stored twice', { skip }, async () => {
+  const registry = await newRegistry();
+  await admin.query('DELETE FROM accessTokens');
+  const token = await insertToken('client');
+  const single = await registry.lookupToken(token.hash);
+  assert.deepEqual([single.id, single.storedTwice], [token.id, false]);
+  // The same token again in the scoped form: the unique key does not stop it, the two values differ.
+  await admin.query(
+    "INSERT INTO accessTokens (name, kind, tokenHash, prefix, createdAt, scope) VALUES ('client test', 'client', ?, ?, UTC_TIMESTAMP(), 'sessions.open')",
+    [`scoped:${token.hash.slice(0, 57)}`, token.token.slice(0, 12)]);
+  const row = await registry.lookupToken(token.hash);
+  assert.equal(row.storedTwice, true);
+  assert.equal(tokenProblem(row, 'client'), 'not usable: it is stored twice, with and without a scope');
+
+  // The hub turns it away with 401, and another token is not affected.
+  const other = await insertToken('client', { scope: 'sessions.open' });
+  assert.equal((await registry.lookupToken(other.hash)).storedTwice, false);
+  const hubRegistry = await newRegistry({ init: false });
+  const { url } = await h.startHub({ tokenCacheMs: 0 }, hubRegistry);
+  await assert.rejects(h.connect(`${url}/connect?node=nobody&gateway_token=${token.token}`),
+    (err) => err.status === 401 && /^gateway token is not usable: it is stored twice, with and without a scope\n$/.test(err.body));
+  await assert.rejects(h.connect(`${url}/connect?node=nobody&gateway_token=${other.token}`), { status: 404 });
+});
+
+test('a dropped scope column is put back on the next lookup and scoped rows are then refused', { skip }, async () => {
+  const lines = [];
+  const registry = new MySqlRegistry(config.mysql, { schemaPath: config.schemaPath, log: { ...silent, warn: (line) => lines.push(line), info: (line) => lines.push(line) }, retries: 2, retryDelayMs: 500 });
+  registries.push(registry);
+  const { url } = await h.startHub({ tokenCacheMs: 0 }, registry);
+  await admin.query('DELETE FROM accessTokens');
+  const plain = await insertToken('client');
+  const scoped = await insertToken('client', { scope: 'grid.view sessions.open' });
+  const limited = await insertToken('client', { scope: 'grid.view' });
+  const answer = (t) => h.connect(`${url}/connect?node=nobody&gateway_token=${t.token}`).then(() => 101, (err) => [err.status, err.body.trim()]);
+  assert.deepEqual(await answer(plain), [404, 'no node or static host named nobody is known to the hub']);
+  assert.deepEqual(await answer(scoped), [404, 'no node or static host named nobody is known to the hub']);
+  assert.deepEqual(await answer(limited), [403, 'gateway token is not allowed to open browser sessions (its scope leaves that out)']);
+
+  await admin.query('ALTER TABLE accessTokens DROP COLUMN scope');
+  assert.equal((await tokenColumns()).some((c) => c.name === 'scope'), false);
+  lines.length = 0;
+  const row = await registry.lookupToken(scoped.hash);
+  assert.deepEqual([row.id, row.scoped, row.scope, row.storedTwice], [scoped.id, true, null, false]);
+  assert.deepEqual((await tokenColumns()).filter((c) => c.name === 'scope'), [{ name: 'scope', nullable: 'YES', type: 'varchar(255)' }]);
+  assert.equal(lines.length, 2, lines.join('\n'));
+  assert.match(lines[0], /^table or column missing \(Unknown column 'scope' in 'field list'\); recreating the schema$/);
+  assert.equal(lines[1], 'added the scope column to the accessTokens table');
+
+  // Every scope is gone with the column. A row in the scoped form is refused, never taken for a token
+  // with no limit; a token that never had a scope works as before.
+  const lost = [401, 'gateway token is not usable: its scope was lost or changed in the database'];
+  assert.deepEqual(await answer(scoped), lost);
+  assert.deepEqual(await answer(limited), lost);
+  assert.deepEqual(await answer(plain), [404, 'no node or static host named nobody is known to the hub']);
+  assert.equal((await admin.query('SELECT COUNT(*) AS n FROM accessTokens WHERE scope IS NOT NULL'))[0][0].n, 0);
+  assert.equal((await admin.query("SELECT COUNT(*) AS n FROM accessTokens WHERE tokenHash LIKE 'scoped:%'"))[0][0].n, 2, 'the rows stay');
 });

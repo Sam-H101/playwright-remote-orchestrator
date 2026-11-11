@@ -10,4 +10,5 @@ COPY ui /app/ui
 RUN useradd --system --create-home --shell /usr/sbin/nologin grid
 USER grid
 EXPOSE 4444
-CMD ["gunicorn", "--bind", "0.0.0.0:4444", "--workers", "2", "ui.app:app"]
+# ui/gunicorn_conf.py has gunicorn write its own lines in the Grid UI's log format (GRID_UI_LOG_FORMAT).
+CMD ["gunicorn", "--config", "python:ui.gunicorn_conf", "--bind", "0.0.0.0:4444", "--workers", "2", "ui.app:app"]

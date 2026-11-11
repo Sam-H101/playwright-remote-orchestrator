@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS accessTokens (
     createdAt TEXT NOT NULL,
     expiresAt TEXT NULL,
     lastUsedAt TEXT NULL,
-    revokedAt TEXT NULL
+    revokedAt TEXT NULL,
+    scope TEXT NULL
 );
 CREATE TABLE IF NOT EXISTS mfaSecrets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -244,14 +245,16 @@ DIRECT_CLAIMS = {("pw-static.lab.local", 3000)}
 
 DAY = 86400
 # Managed access tokens: name, kind, bound node, created / expires / last used / revoked as
-# seconds ago (negative: in the future; None: never), nodes that last registered with it.
+# seconds ago (negative: in the future; None: never), nodes that last registered with it, and a client
+# token's scope (None: no limit).
 TOKENS = [
-    ("WIN-BUILD-01 agent", "agent", "win-build-01", 40 * DAY, -325 * DAY, 180, None, ["WIN-BUILD-01"]),
-    ("Docker runners", "agent", None, 12 * DAY, None, 20, None, ["runner-7f3a9c", "runner-b81e04"]),
-    ("Example checks", "client", None, 12 * DAY, -5 * DAY, 41, None, []),
-    ("Spare Linux hosts", "agent", None, 2 * DAY, -28 * DAY, None, None, []),
-    ("Old build farm", "agent", None, 200 * DAY, None, 2 * DAY + 3600, 2 * DAY, ["MAC-QA-02"]),
-    ("Staging checks 2025", "client", None, 375 * DAY, 10 * DAY, 11 * DAY, None, []),
+    ("WIN-BUILD-01 agent", "agent", "win-build-01", 40 * DAY, -325 * DAY, 180, None, ["WIN-BUILD-01"], None),
+    ("Docker runners", "agent", None, 12 * DAY, None, 20, None, ["runner-7f3a9c", "runner-b81e04"], None),
+    ("Example checks", "client", None, 12 * DAY, -5 * DAY, 41, None, [], None),
+    ("Spare Linux hosts", "agent", None, 2 * DAY, -28 * DAY, None, None, [], None),
+    ("Old build farm", "agent", None, 200 * DAY, None, 2 * DAY + 3600, 2 * DAY, ["MAC-QA-02"], None),
+    ("Staging checks 2025", "client", None, 375 * DAY, 10 * DAY, 11 * DAY, None, [], None),
+    ("Grid monitor", "client", None, 6 * DAY, -84 * DAY, 35, None, [], ("grid.view",)),
 ]
 
 # People who signed in with single sign-on, for the Admin page: name, subject, email, whether the provider
@@ -282,8 +285,11 @@ AUDIT = [
     (32 * DAY - 180, None, ADMIN_ADDRESS, "group.mapped", "group", "qa", {"group": "qa", "role": "QA leads"}),
     (30 * DAY, None, ADMIN_ADDRESS, "user.role_added", "user", "Robin Hale", {"role": "Admin"}),
     (30 * DAY - 300, "Robin Hale", ROBIN_ADDRESS, "user.role_added", "user", "Priya Kumar", {"role": "Tester"}),
-    (12 * DAY, None, ADMIN_ADDRESS, "token.created", "token", "Example checks", {"kind": "client", "owner": None}),
+    (12 * DAY, None, ADMIN_ADDRESS, "token.created", "token", "Example checks",
+     {"kind": "client", "owner": None, "scope": None}),
     (9 * DAY, "Robin Hale", ROBIN_ADDRESS, "user.role_added", "user", "Lee Chen", {"role": "Viewer"}),
+    (6 * DAY, None, ADMIN_ADDRESS, "token.created", "token", "Grid monitor",
+     {"kind": "client", "owner": None, "scope": ["grid.view"]}),
     (3 * DAY, "Dana Lee", "10.20.6.12", "auth.signin", "user", "Dana Lee", None),
     (2 * DAY, "Robin Hale", ROBIN_ADDRESS, "user.disabled", "user", "Lee Chen",
      {"sessions": 1, "clientTokens": 0, "agentTokens": 0}),
@@ -338,13 +344,17 @@ def seed(con, now=None):
     # The hub's lease, which --heartbeat keeps renewing like a running hub does.
     cur.execute("INSERT INTO hubs (instance, host, port, startedAt, lastSeen) VALUES (?, 'hub', 4500, ?, ?)",
                 (HUB_INSTANCE, _ts(now, 2 * DAY), _ts(now, 0)))
-    for name, kind, node_name, created, expires, used, revoked, users in TOKENS:
+    for name, kind, node_name, created, expires, used, revoked, users, scope in TOKENS:
         token = ("pwga_" if kind == "agent" else "pwgc_") + secrets.token_urlsafe(32)  # thrown away: a demo
+        # A token with a scope is stored as the Grid UI stores one (store.scoped_token_hash).
+        plain = hashlib.sha256(token.encode()).hexdigest()
         cur.execute("""
-            INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt, lastUsedAt, revokedAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (name, kind, hashlib.sha256(token.encode()).hexdigest(), token[:12], node_name,
-              _ts(now, created), _ts(now, expires), _ts(now, used), _ts(now, revoked)))
+            INSERT INTO accessTokens (name, kind, tokenHash, prefix, nodeName, createdAt, expiresAt, lastUsedAt, revokedAt,
+                                      scope)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (name, kind, plain if scope is None else "scoped:" + plain[:57], token[:12], node_name,
+              _ts(now, created), _ts(now, expires), _ts(now, used), _ts(now, revoked),
+              None if scope is None else permissions.unparse(scope)))
         cur.executemany("UPDATE nodes SET tokenId = ? WHERE name = ?", [(cur.lastrowid, user) for user in users])
     _add_people(cur, now)
     con.commit()

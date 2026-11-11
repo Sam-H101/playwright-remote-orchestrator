@@ -42,7 +42,7 @@ jobs:
     env:
       IMAGE: grid-ui:test
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: build the image
         # As docker-images.yml builds it, from the repo root, but only for amd64 and into this runner's docker.
@@ -65,9 +65,12 @@ jobs:
       - name: browser tests
         # As root, so Playwright can install the system packages Chromium needs. test_live.py also checks the
         # page's JavaScript snippet with node.
+        # From 1.65 the node bundled with Playwright needs libatomic1, which the slim image lacks and
+        # `install --with-deps` can't add before that node runs.
         run: |
           docker run --rm --user root --shm-size 1g -e PYTHONUNBUFFERED=1 \
             -v "$PWD/ui/tests:/app/ui/tests:ro" "$IMAGE" sh -ec '
+              apt-get update -q > /dev/null && apt-get install -y -q --no-install-recommends libatomic1 > /dev/null
               python -m pip install --no-cache-dir --disable-pip-version-check --root-user-action=ignore -q pytest playwright
               python -m playwright install --with-deps chromium
               apt-get update -q > /dev/null && apt-get install -y -q --no-install-recommends nodejs > /dev/null
@@ -92,9 +95,9 @@ jobs:
           --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pscratch --silent"
           --health-interval 5s --health-timeout 5s --health-retries 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12' # the checks image's
           cache: pip

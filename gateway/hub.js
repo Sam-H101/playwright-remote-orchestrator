@@ -150,6 +150,11 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     setTimeout(() => socket.destroy(), 1000).unref();
   }
 
+  // 403 when the token is good but its scope leaves out opening sessions; 401 for every other token problem.
+  function tokenRefusal(verdict) {
+    return [verdict.forbidden ? 403 : 401, verdict.problem ? `gateway token is ${verdict.problem}` : 'missing or bad gateway token'];
+  }
+
   function onUpgrade(req, socket, head) {
     socket.on('error', () => {});
     if (stopping) return reject(socket, 503, 'hub is shutting down');
@@ -432,7 +437,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
       }
       if (!verdict.ok) {
         log.warn(`client ${remote} rejected: ${verdict.message}`);
-        return reject(socket, 401, verdict.problem ? `gateway token is ${verdict.problem}` : 'missing or bad gateway token');
+        return reject(socket, ...tokenRefusal(verdict));
       }
       // A managed token's hash is kept (never the token) so it can be checked again while the client waits.
       route(req, socket, head, url, remote, verdict.via === 'managed' ? P.hashToken(token) : null);
@@ -618,7 +623,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     const verdict = await tokens.checkHash('client', client.tokenHash);
     if (verdict.ok || verdict.unavailable) return client.state !== 'queued';
     log.warn(`${client.label} dropped after ${waited(client)}: ${verdict.message}`);
-    finish(client, 401, verdict.problem ? `gateway token is ${verdict.problem}` : 'missing or bad gateway token');
+    finish(client, ...tokenRefusal(verdict));
     return true;
   }
 

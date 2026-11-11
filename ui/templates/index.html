@@ -174,6 +174,21 @@
         <p class="hint" id="nt-kind-hint" hidden></p>
       </fieldset>
       <p class="hint field-note" id="nt-client-note" hidden>Checks using this token get the MFA secrets and saved sign-ins you can use, and lose them if you lose access.</p>
+      <fieldset class="field" id="nt-scope-field" aria-describedby="nt-scope-hint" hidden>
+        <legend>What it may do</legend>
+        <div class="choices">
+          <label class="choice"><input type="radio" name="limit" value="" checked><span><strong>Everything</strong><small>Whatever its owner may do</small></span></label>
+          <label class="choice"><input type="radio" name="limit" value="scope"><span><strong>Only what you pick</strong><small>A leaked token is worth less</small></span></label>
+        </div>
+        <div class="perm-list" id="nt-scope-list" role="group" aria-label="What the token may do" hidden>
+          <label class="perm-item"><input type="checkbox" name="scope" value="sessions.open" id="nt-scope-sessions"><span><strong>Open browser sessions</strong></span></label>
+          <label class="perm-item"><input type="checkbox" name="scope" value="grid.view"><span><strong>See the grid</strong></span></label>
+          <label class="perm-item"><input type="checkbox" name="scope" value="mfa.use"><span><strong>Use MFA secrets</strong></span></label>
+          <label class="perm-item"><input type="checkbox" name="scope" value="signins.use"><span><strong>Use saved sign-ins</strong></span></label>
+          <label class="perm-item"><input type="checkbox" name="scope" value="signins.add"><span><strong>Add saved sign-ins</strong></span></label>
+        </div>
+        <p class="hint" id="nt-scope-hint">It can't be changed later: to change what a token may do, make another and revoke this one.</p>
+      </fieldset>
       <div class="field" id="nt-node-field">
         <label for="nt-node">Bind to node <span class="optional">optional</span></label>
         <input type="text" id="nt-node" class="mono" maxlength="128" list="node-names" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Any node" aria-describedby="nt-node-hint">

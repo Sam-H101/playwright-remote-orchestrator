@@ -10,18 +10,31 @@ const NEGATIVE_CACHE_MS = 2000;
 const TOUCH_INTERVAL_MS = 60000;
 const MAX_CACHE_ENTRIES = 5000;
 
+const SESSIONS_SCOPE = 'sessions.open';
+const STORED_TWICE = 'not usable: it is stored twice, with and without a scope';
+const SCOPE_CHANGED = 'not usable: its scope was lost or changed in the database';
+const NO_SESSIONS = 'not allowed to open browser sessions (its scope leaves that out)';
+
 // Why a managed token row doesn't let `kind` in, or null when it does.
 function tokenProblem(row, kind, now = Date.now()) {
   if (!row) return 'unknown';
+  if (row.storedTwice) return STORED_TWICE;
   if (row.kind !== kind) return kind === 'agent' ? 'not an agent token' : 'not a client token';
   if (row.revokedAt) return 'revoked';
   if (row.expiresAt && Date.parse(row.expiresAt) <= now) return 'expired';
+  // The row says which form it is: stored as scoped it has a scope, stored by the plain hash it has none, and
+  // only a client token has one. Anything else was changed in the database. Ids this hub doesn't know allow
+  // nothing.
+  if (!!row.scoped !== (row.scope != null) || (row.scope != null && kind !== 'client')) return SCOPE_CHANGED;
+  if (row.scope != null && !String(row.scope).split(/\s+/).includes(SESSIONS_SCOPE)) return NO_SESSIONS;
   return null;
 }
 
 // Verdicts: { ok: true, via: 'env' | 'managed' | 'open', tokenId, nodeName, label }
 //           { ok: false, unavailable: true, message }   the database couldn't answer: fail closed
 //           { ok: false, message }                       missing, unknown, revoked, expired or wrong-kind token
+//           { ok: false, problem, forbidden, message }   a managed token's row refuses it; forbidden is true when
+//                                                        the token is good and its scope leaves out opening sessions
 // `allowOpen` (GATEWAY_ALLOW_OPEN_AGENTS / _CLIENTS) opts a kind back into the old rule: once every managed
 // token of it is revoked, it is let in without a token again.
 function createTokenAuth({ registry, log, envTokens = {}, allowOpen = {}, cacheMs = 10000, negativeCacheMs, touchMs = TOUCH_INTERVAL_MS }) {
@@ -122,7 +135,7 @@ function createTokenAuth({ registry, log, envTokens = {}, allowOpen = {}, cacheM
     }
     if (row) {
       const problem = tokenProblem(row, kind);
-      if (problem) return { ok: false, problem, message: `${row.kind} token ${row.prefix}... (#${row.id}) is ${problem}` };
+      if (problem) return { ok: false, problem, forbidden: problem === NO_SESSIONS, message: `${row.kind} token ${row.prefix}... (#${row.id}) is ${problem}` };
       touch(row.id);
       return { ok: true, via: 'managed', tokenId: row.id, nodeName: row.nodeName || null, label: `token ${row.prefix}... (#${row.id} "${row.name}")` };
     }
