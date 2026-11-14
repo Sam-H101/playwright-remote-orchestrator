@@ -49,16 +49,21 @@ function probe(port, timeoutMs = 2000) {
   });
 }
 
-// The watchdog preload lets run-server notice when the agent is gone; the original NODE_OPTIONS is
-// restored inside the child so browsers and other grandchildren don't inherit it.
-function childEnv() {
+// run-server's environment: the agent's, without the agent token, which a check's browser could otherwise read
+// from /proc. The watchdog preload lets run-server notice when the agent is gone; the original NODE_OPTIONS is
+// restored inside the child so browsers and other grandchildren don't inherit it. runAs (RUN_SERVER_USER) gets
+// its own HOME, USER and LOGNAME.
+function childEnv(env = process.env, runAs = null) {
   const watchdog = path.join(__dirname, 'lib', 'parent-watchdog.js');
-  const original = process.env.NODE_OPTIONS || '';
-  return {
-    ...process.env,
-    NODE_OPTIONS: `${original} --require ${JSON.stringify(watchdog)}`.trim(),
-    GATEWAY_AGENT_NODE_OPTIONS: original,
-  };
+  const original = env.NODE_OPTIONS || '';
+  const out = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() !== 'GATEWAY_AGENT_TOKEN') out[key] = value; // Windows names are case-insensitive
+  }
+  out.NODE_OPTIONS = `${original} --require ${JSON.stringify(watchdog)}`.trim();
+  out.GATEWAY_AGENT_NODE_OPTIONS = original;
+  if (runAs) Object.assign(out, { HOME: runAs.home, USER: runAs.name, LOGNAME: runAs.name });
+  return out;
 }
 
 function killTree(child) {
@@ -109,9 +114,11 @@ class Slot {
       }
     }
     const child = spawn(process.execPath, [config.cli, 'run-server', '--port', String(this.port), '--host', '127.0.0.1'], {
-      env: childEnv(),
+      env: childEnv(process.env, config.runAs),
       stdio: ['ignore', fd ?? 'pipe', fd ?? 'pipe'],
       windowsHide: true,
+      // As root, libuv also drops the supplementary groups before switching user.
+      ...(config.runAs ? { uid: config.runAs.uid, gid: config.runAs.gid } : {}),
     });
     if (fd !== null) fs.closeSync(fd);
     else {
@@ -467,6 +474,12 @@ function main() {
     process.stdout.write(config.usage);
     process.exit(0);
   }
+  if (config.runAs) {
+    log.info(`run-servers run as ${config.runAs.name} (uid ${config.runAs.uid}), not as the agent's user`);
+  } else if (process.platform !== 'win32') {
+    log.warn('run-servers run as the agent\'s own user, so a check\'s browser can read the agent token from /proc: '
+      + 'start the agent as root with RUN_SERVER_USER set to another user (see the README)');
+  }
   const agent = new Agent(config, { log });
   process.on('unhandledRejection', (err) => log.error(`unhandled rejection: ${err && err.stack ? err.stack : err}`));
   let exiting = false;
@@ -487,4 +500,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { Agent, createAgent: (config, opts) => new Agent(config, opts) };
+module.exports = { Agent, childEnv, createAgent: (config, opts) => new Agent(config, opts) };
