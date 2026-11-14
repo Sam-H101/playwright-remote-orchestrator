@@ -177,7 +177,7 @@ cd /opt/playwright-core && sudo npm ci --omit=dev
 sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright node /opt/playwright-core/node_modules/playwright-core/cli.js install --with-deps chromium
 ```
 
-On macOS drop `--with-deps`. Then run the agent at boot; it reconnects to the hub by itself. With systemd, put `GATEWAY_AGENT_TOKEN=<token>` in `/etc/playwright-agent.env` (mode 600), create a user (`sudo useradd --system --create-home pwagent`) and add `/etc/systemd/system/playwright-agent.service`:
+On macOS drop `--with-deps`. Then run the agent at boot; it reconnects to the hub by itself. With systemd, put `GATEWAY_AGENT_TOKEN=<token>` in `/etc/playwright-agent.env` (mode 600, owned by root), create a user for the browsers (`sudo useradd --system --create-home pwagent`) and add `/etc/systemd/system/playwright-agent.service`. The agent starts as root with only the capabilities to switch user and stop its run-servers, and runs them as `pwagent`, so a check's browser can't read the token (see [Security](#security)):
 
 ```ini
 [Unit]
@@ -186,10 +186,12 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-User=pwagent
+User=root
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_KILL
+NoNewPrivileges=yes
 WorkingDirectory=/opt/playwright-remote-orchestrator/gateway
 EnvironmentFile=/etc/playwright-agent.env
-Environment=HUB_URL=ws://<orchestrator-host>:4500 SLOTS=4
+Environment=HUB_URL=ws://<orchestrator-host>:4500 SLOTS=4 RUN_SERVER_USER=pwagent
 Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 Environment=PLAYWRIGHT_CLI=/opt/playwright-core/node_modules/playwright-core/cli.js
 ExecStart=/usr/bin/env node agent.js
@@ -263,6 +265,7 @@ Run-servers on agent hosts only listen on 127.0.0.1.
 ## Security
 
 * Agent tokens decide who can register a node. Anyone with an unbound one (or `GATEWAY_AGENT_TOKEN`) can register under an existing node's name and receive that node's browser sessions, unless that node uses a [bound token](#access-tokens). Treat them as secrets.
+* A check controls a browser on the runner, and that browser can read any file its user can (`file://`), `/proc` included. So the browsers must not run as the agent's user, or a check could read the agent token and use it to receive other checks' sessions. The runner image starts the agent as root and runs the run-servers as `pwuser` (`RUN_SERVER_USER`), and compose leaves the agent only the capabilities to switch user and stop them; on a Linux or macOS host, run the agent the same way (see [the systemd example](#adding-a-linux-or-macos-host-no-docker)). The run-servers never get `GATEWAY_AGENT_TOKEN` in their environment either way. Also keep files the browsers' user can read free of anything a check shouldn't see.
 * Client tokens decide who can open a browser on your runners. Without them the hub would be an open browser proxy into your runners' network. Checks send theirs as `?gateway_token=`; other clients can also use an `x-gateway-token` header. Give each pipeline the narrowest token that works: a leaked client token whose [token scope](#token-scopes) is only seeing the grid can't open a browser, get an MFA code or use a saved sign-in.
 * The hub logs a managed token only by its first 12 characters and id, and never logs the bootstrap tokens.
 * The hub port speaks plain `ws://` (tokens included). Across any network you don't trust, put a TLS-terminating reverse proxy (nginx, Caddy, Traefik, ...) in front of it, use `wss://` URLs for the agents and `GATEWAY_URL`, and allow WebSocket upgrades and long-lived connections (the agent reconnects if it hears nothing for 45 s). Where you can, also limit the hub port to your runner hosts' addresses.
@@ -765,8 +768,9 @@ Flags override the environment variables.
 | `--status-file` | `STATUS_FILE` | unset | JSON status, rewritten every 5 s |
 | `--log-dir` | `LOG_DIR` | unset | run-server output goes to `<dir>/slot-<i>.log` instead of stdout |
 | `--ephemeral` | `EPHEMERAL` | off (`1` in the runner image) | The hub removes the node `EPHEMERAL_GRACE_S` after it disconnects |
+| `--run-server-user` | `RUN_SERVER_USER` | unset (`pwuser` in the runner image) | Runs the run-servers, and so the browsers, as this user (Linux and macOS). The agent must start as root, and the user can't be root. Unset, they run as the agent's own user and the agent warns at startup (see [Security](#security)) |
 
-`PLAYWRIGHT_BROWSERS_PATH` is passed through to the run-servers.
+The run-servers get the agent's environment (`PLAYWRIGHT_BROWSERS_PATH` included) without `GATEWAY_AGENT_TOKEN`.
 
 `pwrunner run` (the Go agent) takes the same flags and variables, plus:
 

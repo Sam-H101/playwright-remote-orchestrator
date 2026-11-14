@@ -37,15 +37,19 @@ COPY gateway/package.json gateway/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY gateway/hub.js gateway/agent.js ./
 COPY gateway/lib ./lib
-RUN mkdir -p /tmp/gateway-agent && chown pwuser:pwuser /tmp/gateway-agent
+RUN mkdir -p /tmp/gateway-agent
+# The agent starts as root and runs run-server, and so the browsers, as pwuser (RUN_SERVER_USER): a check's
+# browser can read every file and /proc entry of its own user, so it must not share one with the agent and its
+# token. Leaving root drops every capability; compose also keeps only the ones the agent needs.
 ENV HUB_URL=ws://hub:4500 \
     SLOTS=4 \
     BASE_PORT=3100 \
     BROWSERS=chromium,firefox,webkit \
     PLAYWRIGHT_CLI=/app/playwright/node_modules/playwright-core/cli.js \
     STATUS_FILE=/tmp/gateway-agent/status.json \
-    EPHEMERAL=1
-USER pwuser
+    EPHEMERAL=1 \
+    RUN_SERVER_USER=pwuser
+USER root
 # Healthy while registered with the hub and the status file is fresh.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["node", "-e", "const s=JSON.parse(require('fs').readFileSync(process.env.STATUS_FILE,'utf8'));process.exit(s.registered&&Date.now()-Date.parse(s.updated)<30000?0:1)"]

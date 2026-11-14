@@ -7,7 +7,8 @@ const path = require('node:path');
 const { test } = require('node:test');
 const P = require('../lib/protocol');
 const { splitSchema } = require('../lib/registry');
-const { agentConfig, hubConfig } = require('../lib/config');
+const { agentConfig, hubConfig, runServerUser } = require('../lib/config');
+const { childEnv } = require('../agent');
 const { FAKE_CLI } = require('./helpers');
 
 test('forwardHeaders keeps Playwright headers and drops hop-by-hop, handshake and auth headers', () => {
@@ -78,6 +79,33 @@ test('agent config: flags override env, defaults apply', () => {
   assert.throws(() => agentConfig(['--name', 'a b'], env), /NODE_NAME/);
   assert.match(agentConfig([], { HUB_URL: 'ws://h', PLAYWRIGHT_CLI: FAKE_CLI }).name, /^[a-z0-9._-]+$/);
   assert.equal(agentConfig(['--name', 'Win-01'], env).name, 'win-01');
+});
+
+test('agent config: --run-server-user / RUN_SERVER_USER, from /etc/passwd, only as root and never root', () => {
+  const passwd = () => 'root:x:0:0:root:/root:/bin/bash\npwuser:x:1001:1002::/home/pwuser:/bin/bash\nodd:x::5::/:/bin/sh\n';
+  const asRoot = { platform: 'linux', getuid: () => 0, passwd };
+  const env = { HUB_URL: 'ws://env:1', PLAYWRIGHT_CLI: FAKE_CLI };
+  assert.equal(agentConfig([], env, process.cwd(), asRoot).runAs, null, 'unset: run-server runs as the agent');
+  const want = { name: 'pwuser', uid: 1001, gid: 1002, home: '/home/pwuser' };
+  assert.deepEqual(agentConfig([], { ...env, RUN_SERVER_USER: 'pwuser' }, process.cwd(), asRoot).runAs, want);
+  assert.deepEqual(agentConfig(['--run-server-user', 'pwuser'], env, process.cwd(), asRoot).runAs, want);
+  assert.throws(() => runServerUser('pwuser', { ...asRoot, getuid: () => 1000 }), /start as root/);
+  assert.throws(() => runServerUser('pwuser', { ...asRoot, platform: 'win32' }), /not supported on Windows/);
+  assert.throws(() => runServerUser('nobody-here', asRoot), /no user "nobody-here"/);
+  assert.throws(() => runServerUser('root', asRoot), /is root/);
+  assert.throws(() => runServerUser('odd', asRoot), /no usable uid/);
+  assert.throws(() => runServerUser('pw', asRoot), /no user "pw"/, 'a prefix of a name is not the name');
+});
+
+test('run-server never gets the agent token in its environment', () => {
+  const env = { GATEWAY_AGENT_TOKEN: 'secret-agent-token', Gateway_Agent_Token: 'other-case', HUB_URL: 'ws://h', HOME: '/root', NODE_OPTIONS: '--max-old-space-size=512' };
+  let out = childEnv(env);
+  assert.ok(!Object.values(out).some((v) => /secret-agent-token|other-case/.test(v)), 'no copy of the token, in any case of its name');
+  assert.deepEqual([out.HUB_URL, out.HOME, out.GATEWAY_AGENT_NODE_OPTIONS], ['ws://h', '/root', '--max-old-space-size=512']);
+  assert.match(out.NODE_OPTIONS, /^--max-old-space-size=512 --require ".*parent-watchdog\.js"$/);
+  out = childEnv(env, { name: 'pwuser', uid: 1001, gid: 1002, home: '/home/pwuser' });
+  assert.deepEqual([out.HOME, out.USER, out.LOGNAME, out.GATEWAY_AGENT_TOKEN], ['/home/pwuser', 'pwuser', 'pwuser', undefined]);
+  assert.equal(env.GATEWAY_AGENT_TOKEN, 'secret-agent-token', 'the agent keeps its own');
 });
 
 test('agent config: --ephemeral / EPHEMERAL', () => {

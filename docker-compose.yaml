@@ -65,6 +65,11 @@ services:
     restart: unless-stopped
     init: true
     shm_size: 1gb
+    # The agent starts as root only to run the browsers as pwuser (RUN_SERVER_USER in the image), out of reach of
+    # its token: it keeps the capabilities to switch user and stop them, and nothing else.
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, KILL]
+    security_opt: ["no-new-privileges:true"]
     networks:
       - playwright
     environment:

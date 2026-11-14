@@ -73,6 +73,7 @@ const AGENT_FLAGS = {
   'status-file': 'STATUS_FILE',
   'log-dir': 'LOG_DIR',
   ephemeral: 'EPHEMERAL',
+  'run-server-user': 'RUN_SERVER_USER',
 };
 // Flags that take no value: `--ephemeral` alone means true, `--ephemeral=false` turns it off.
 const BOOLEAN_FLAGS = new Set(['ephemeral']);
@@ -91,6 +92,10 @@ const AGENT_USAGE = `Usage: node agent.js --hub ws://hub:4500 [options]
   --log-dir <dir>         LOG_DIR              run-server output goes to <dir>/slot-<i>.log
   --ephemeral             EPHEMERAL=1          the hub removes this node once it has been gone for
                                                EPHEMERAL_GRACE_S (for containers named after their ID)
+  --run-server-user <u>   RUN_SERVER_USER      run run-server, and so the browsers, as this user (Linux and
+                                               macOS; the agent must start as root). Checks can read any
+                                               file and process of the browsers' user, so keep the agent
+                                               token out of its reach
 `;
 
 function parseArgs(argv) {
@@ -132,7 +137,29 @@ function resolveCli(value, cwd) {
   throw new Error('playwright-core not found; install the version runner/playwright pins (npm ci there) or set PLAYWRIGHT_CLI');
 }
 
-function agentConfig(argv = process.argv.slice(2), env = process.env, cwd = process.cwd()) {
+// The user run-server runs as (RUN_SERVER_USER), from /etc/passwd: { name, uid, gid, home }, or null to run it as
+// the agent's own user. A check's browser can read every file and /proc entry its user can, the agent's
+// environment (and so its token) included when that is the agent's user, so the agent starts as root and hands
+// run-server to another user; leaving root drops every capability. system replaces the platform, getuid and
+// /etc/passwd for tests.
+function runServerUser(name, system = {}) {
+  if (!name) return null;
+  const { platform = process.platform, getuid = process.getuid, passwd = () => fs.readFileSync('/etc/passwd', 'utf8') } = system;
+  const setting = '--run-server-user / RUN_SERVER_USER';
+  if (platform === 'win32') throw new Error(`${setting} is not supported on Windows`);
+  if (!getuid || getuid() !== 0) throw new Error(`${setting} needs the agent to start as root, so that it can start run-server as ${name}`);
+  const fields = passwd().split(/\r?\n/).map((line) => line.split(':')).find((f) => f.length >= 7 && f[0] === name);
+  if (!fields) throw new Error(`${setting}: there is no user "${name}" in /etc/passwd`);
+  const uid = Number(fields[2]);
+  const gid = Number(fields[3]);
+  if (!Number.isInteger(uid) || !Number.isInteger(gid) || fields[2] === '' || fields[3] === '') {
+    throw new Error(`${setting}: /etc/passwd has no usable uid and gid for "${name}"`);
+  }
+  if (uid === 0) throw new Error(`${setting}: "${name}" is root; run-server must run as another user than the agent`);
+  return { name, uid, gid, home: fields[5] || '/' };
+}
+
+function agentConfig(argv = process.argv.slice(2), env = process.env, cwd = process.cwd(), system = {}) {
   const args = parseArgs(argv);
   if (args.help) return { help: true, usage: AGENT_USAGE };
   const get = (flag) => args[flag] ?? env[AGENT_FLAGS[flag]] ?? undefined;
@@ -148,7 +175,8 @@ function agentConfig(argv = process.argv.slice(2), env = process.env, cwd = proc
   const statusFile = get('status-file') ? path.resolve(cwd, get('status-file')) : null;
   const logDir = get('log-dir') ? path.resolve(cwd, get('log-dir')) : null;
   const ephemeral = bool(get('ephemeral'), '--ephemeral / EPHEMERAL');
-  return { hub, token: get('token') || null, name, slots, basePort, cli, browsers, statusFile, logDir, ephemeral };
+  const runAs = runServerUser(get('run-server-user'), system);
+  return { hub, token: get('token') || null, name, slots, basePort, cli, browsers, statusFile, logDir, ephemeral, runAs };
 }
 
-module.exports = { hubConfig, agentConfig, parseArgs, resolveCli, AGENT_USAGE };
+module.exports = { hubConfig, agentConfig, parseArgs, resolveCli, runServerUser, AGENT_USAGE };
