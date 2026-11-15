@@ -38,6 +38,7 @@ var (
 	procLsaFreeMemory          = modadvapi32.NewProc("LsaFreeMemory")
 	procLsaAddAccountRights    = modadvapi32.NewProc("LsaAddAccountRights")
 	procLsaRemoveAccountRights = modadvapi32.NewProc("LsaRemoveAccountRights")
+	procRegUnLoadKeyW          = modadvapi32.NewProc("RegUnLoadKeyW")
 
 	procNetUserAdd              = modnetapi32.NewProc("NetUserAdd")
 	procNetUserSetInfo          = modnetapi32.NewProc("NetUserSetInfo")
@@ -484,6 +485,8 @@ func RemoveBrowserAccount(name string) (bool, error) {
 		}
 		if s, err := windows.UTF16PtrFromString(sid.String()); err == nil {
 			// The service unloads the profile as it stops, but Windows may hold the hive a few seconds longer.
+			// An agent that was killed (or crashed) never unloaded it, and Windows keeps that hive loaded until
+			// a reboot: after a few tries the hive is unloaded here, which an elevated process may do.
 			for try := 1; ; try++ {
 				r, _, e := procDeleteProfileW.Call(uintptr(unsafe.Pointer(s)), 0, 0)
 				if r != 0 || errors.Is(e, windows.ERROR_FILE_NOT_FOUND) || errors.Is(e, windows.ERROR_PATH_NOT_FOUND) || errors.Is(e, windows.ERROR_INVALID_PARAMETER) {
@@ -492,6 +495,9 @@ func RemoveBrowserAccount(name string) (bool, error) {
 				if try == 10 {
 					errs = append(errs, fmt.Errorf("deleting the profile of %s: %w", name, e))
 					break
+				}
+				if try == 3 {
+					unloadHive(sid.String())
 				}
 				time.Sleep(time.Second)
 			}
@@ -511,6 +517,20 @@ func RemoveBrowserAccount(name string) (bool, error) {
 		k.Close()
 	}
 	return sid != nil, errors.Join(errs...)
+}
+
+// unloadHive unloads an account's registry hives (HKEY_USERS\<sid>_Classes, then HKEY_USERS\<sid>) that a
+// process which loaded its profile left loaded by dying before UnloadUserProfile. Best effort: a hive a live
+// process still has keys open in stays, and DeleteProfile then reports it.
+func unloadHive(sid string) {
+	if err := enablePrivileges("SeBackupPrivilege", "SeRestorePrivilege"); err != nil {
+		return
+	}
+	for _, key := range []string{sid + "_Classes", sid} {
+		if k, err := windows.UTF16PtrFromString(key); err == nil {
+			procRegUnLoadKeyW.Call(uintptr(windows.HKEY_USERS), uintptr(unsafe.Pointer(k)))
+		}
+	}
 }
 
 // BrowserLauncher starts one slot's run-servers as that slot's browser account from the service
