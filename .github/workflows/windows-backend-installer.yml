@@ -407,6 +407,18 @@ jobs:
           if ($LASTEXITCODE -ne 2) { throw "Expected exit code 2, got $LASTEXITCODE" }
           $global:LASTEXITCODE = 0
 
+      # Diagnostics only: what still runs as a browser account, and whether its hive is loaded, before uninstall.
+      - name: Browser accounts' processes and hives before uninstall
+        run: |
+          $accounts = $env:BROWSER_ACCOUNTS -split ','
+          $sids = $env:BROWSER_SIDS -split ','
+          Get-CimInstance Win32_Process | ForEach-Object {
+            $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+            if ($o -and $accounts -contains $o.User) { Write-Host "runs as $($o.User): $($_.ProcessId) $($_.Name) (parent $($_.ParentProcessId)) $($_.ExecutablePath)" }
+          }
+          foreach ($sid in $sids) { Write-Host "HKEY_USERS\$sid loaded: $(Test-Path "Registry::HKEY_USERS\$sid")" }
+          exit 0
+
       - name: Uninstall
         run: |
           & $env:PWRUNNER uninstall --install-dir $env:INSTALL_DIR --remove-files --yes
