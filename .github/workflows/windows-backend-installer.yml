@@ -313,7 +313,26 @@ jobs:
             console.log(`file:// backend.json loads; file:// agent.token: ${refused}`);
             // Each slot's browsers run as its own account and keep their profiles in its temp folder: a browser
             // can list its own account's temp folder and not the other slot's, where the other session's profile is.
-            const temps = process.env.BROWSER_PROFILES.split(',').map((p) => 'file:///' + (p + '\\AppData\\Local\\Temp\\').replace(/\\/g, '/'));
+            // Where that folder is comes from the account's environment, so look for the profiles (this step runs
+            // as an administrator) under the accounts' profile folders and the system temp folders.
+            const fs = require('fs');
+            const path = require('path');
+            const found = [];
+            const walk = (dir, depth) => {
+              let entries;
+              try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+              for (const e of entries) {
+                if (!e.isDirectory() || e.isSymbolicLink()) continue;
+                const full = path.join(dir, e.name);
+                if (/^playwright_chromiumdev_profile-/.test(e.name)) found.push(full);
+                else if (depth > 0) walk(full, depth - 1);
+              }
+            };
+            for (const root of [...process.env.BROWSER_PROFILES.split(','), 'C:\\Windows\\Temp', 'C:\\Windows\\SystemTemp']) walk(root, 6);
+            console.log(`browser profiles: ${found.join(', ') || 'none found'}`);
+            const parents = [...new Set(found.map((f) => path.dirname(f)))];
+            if (parents.length !== 2) throw new Error(`expected the two sessions' profiles in two folders, found them in ${parents.length}: ${parents.join(', ')}`);
+            const temps = parents.map((p) => 'file:///' + (p + '\\').replace(/\\/g, '/'));
             for (const [i, browser] of browsers.entries()) {
               const p = await browser.newPage();
               const seen = [];
@@ -402,13 +421,20 @@ jobs:
           }
           if (Get-LocalUser -Name 'pwb-*' -ErrorAction SilentlyContinue) { throw "Browser accounts left: $((Get-LocalUser -Name 'pwb-*').Name -join ', ')" }
 
+      # upload-artifact needs one folder that holds every path, and the install and the hub's logs are on two drives.
+      - name: Collect logs
+        if: failure()
+        run: |
+          $dest = "$env:RUNNER_TEMP\backend-logs"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item "$env:INSTALL_DIR\logs" $dest -Recurse -ErrorAction SilentlyContinue
+          Copy-Item "$env:INSTALL_DIR\*.json", "$env:RUNNER_TEMP\hub*.log" $dest -ErrorAction SilentlyContinue
+          exit 0
+
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: backend-logs
-          path: |
-            C:\PlaywrightBackend\logs
-            C:\PlaywrightBackend\*.json
-            ${{ runner.temp }}\hub*.log
+          path: ${{ runner.temp }}\backend-logs
           if-no-files-found: ignore
