@@ -870,17 +870,101 @@ def _audit_entry(row):
         details = {"text": text}
     return {"id": entry_id, "occurredAt": _when(occurred), "actorId": actor_id, "actorName": actor_name,
             "actorMethod": method, "address": address, "action": action, "targetKind": target_kind,
-            "targetId": target_id, "targetName": target_name, "details": details}
+            "targetId": target_id, "targetName": target_name, "targetHidden": False, "actorHidden": False,
+            "details": details}
 
 
-def user_detail(user_id, viewer, history=False, session_id=None):
+def _visible_ids(cur, tables, kind, ids, access):
+    """Which of ids, of items of a kind ('mfa', 'signin' or 'token'), the viewer may see now, by the rules their
+    own pages use (store._visible_clause, store._token_rights). Someone who may see every item of the kind sees
+    all of them, gone or not; anyone else sees none of those gone, as by id a missing item and a hidden one answer
+    alike."""
+    ids = {int(i) for i in ids if i is not None}
+    every = "tokens.all" if kind == "token" else store._PERMISSION_GROUPS[kind] + ".all"
+    if every in access.permissions:
+        return ids
+    if not ids:
+        return set()
+    listed = ", ".join(str(i) for i in sorted(ids))
+    if kind != "token":
+        table = store._ITEM_TABLES[kind]
+        if table.lower() not in tables:
+            return set()
+        clause, params = store._visible_clause(kind, "x", access, tables)
+        cur.execute(store._sql("SELECT x.id FROM {} x WHERE x.id IN ({}){}".format(table, listed, clause)), params)
+        return {row[0] for row in cur.fetchall()}
+    if "accesstokens" not in tables:
+        return set()
+    cur.execute(store._sql("SELECT id, kind FROM accessTokens WHERE id IN ({})".format(listed)))
+    kinds = dict(cur.fetchall())
+    owners = {}
+    if kinds and "itemowners" in tables:
+        cur.execute(store._sql("SELECT itemId, userId FROM itemOwners WHERE itemKind = 'token' AND itemId IN ({})"
+                               .format(listed)))
+        owners = dict(cur.fetchall())
+    return {i for i, kind_of in kinds.items() if store._token_rights(kind_of, owners.get(i), access)}
+
+
+# The audit targets whose names are private: only those an item is shared with may know it.
+_PRIVATE_TARGETS = ("mfa", "signin", "token")
+
+
+def _hide_private_names(cur, tables, entries, access):
+    """Take the name off each entry (as _audit_entry gives them) about an MFA secret, a saved sign-in or a token
+    the viewer may not see (_visible_ids): targetName None and targetHidden True. The action, time and id stay, so
+    the history still reads ("added an MFA secret you may not see"). Reading the audit log or seeing people
+    doesn't make those names anyone's: they are private to whoever the item is shared with. An entry the viewer
+    made themselves keeps its name, which they knew when they made it.
+
+    A check's entry names its client token in actorName ("client token 'nightly' (Dana Lee)"), so one by a token
+    the viewer may not see (someone else's, without tokens.all) names only whose it is: "client token (Dana Lee)",
+    with actorHidden True. Tokens never change hands, so its owner is the entry's actorId.
+
+    Without access (this module's own callers), every name shows. Returns entries."""
+    if access is None:
+        return entries
+
+    def theirs(entry):
+        return access.user_id is not None and entry["actorId"] == access.user_id
+
+    def hidden_maybe(entry):
+        return entry["targetKind"] in _PRIVATE_TARGETS and entry["targetName"] is not None and not theirs(entry)
+
+    def token_hidden(entry):
+        return entry["actorMethod"] == "client-token" and "tokens.all" not in access.permissions and not theirs(entry)
+
+    wanted = collections.defaultdict(set)
+    for entry in entries:
+        if hidden_maybe(entry):
+            wanted[entry["targetKind"]].add(entry["targetId"])
+    seen = {kind: _visible_ids(cur, tables, kind, ids, access) for kind, ids in wanted.items()}
+    owners = {e["actorId"] for e in entries if token_hidden(e) and e["actorId"] is not None}
+    names = {}
+    if owners and "users" in tables:
+        cur.execute(store._sql("SELECT id, name FROM users WHERE id IN ({})".format(_ids(owners))))
+        names = dict(cur.fetchall())
+    for entry in entries:
+        if hidden_maybe(entry) and entry["targetId"] not in seen[entry["targetKind"]]:
+            entry["targetName"], entry["targetHidden"] = None, True
+        if token_hidden(entry):
+            owner = names.get(entry["actorId"])
+            entry["actorName"] = "client token ({})".format(owner) if owner else "client token"
+            entry["actorHidden"] = True
+    return entries
+
+
+def user_detail(user_id, viewer, history=False, session_id=None, access=None):
     """One person for the Admin page's sheet, or None when there is no such user: {"user": User plus "issuer",
     "groups", "disabledAt" and "disabledBy", "permissions": [{"id", "via": [the ids of the roles that give it]}]
     (what they may do now, in the role editor's order), "sessions": the ones still working (none while their
     sessions can't work: _signs_in), "current" being session_id (the viewer's), "owns": {"mfa", "signins":
-    [{"id", "name"}], "tokens": [{"id", "name", "kind", "status"}]}, "history": the last HISTORY_LIMIT audit
-    entries they made or were the target of (only with history: whoever may read the audit log), "canManage",
-    "cannotManage": why not, or None}."""
+    [{"id", "name", "hidden"}], "tokens": [{"id", "name", "hidden", "kind", "status"}]}, "history": the last
+    HISTORY_LIMIT audit entries they made or were the target of (only with history: whoever may read the audit
+    log), "canManage", "cannotManage": why not, or None}.
+
+    access is what the viewer may see of MFA secrets, saved sign-ins and tokens (store.Access): the name of one
+    they may not see is None in owns, with hidden True, and in history as _hide_private_names leaves it. Seeing
+    people shows how many of each someone has, never what they are called. Without access, every name shows."""
     if not _may_be("user", user_id):
         return None
     store.ensure_schema()
@@ -920,13 +1004,18 @@ def user_detail(user_id, viewer, history=False, session_id=None):
                     cur.execute(store._sql("SELECT t.id, t.name{} FROM {} t JOIN itemOwners o ON o.itemKind = ? "
                                            "AND o.itemId = t.id WHERE o.userId = ? ORDER BY t.name, t.id"
                                            .format(extra, table)), (kind, user_id))
-                    for item in cur.fetchall():
-                        entry = {"id": item[0], "name": item[1]}
+                    items = cur.fetchall()
+                    shown = None if access is None else _visible_ids(cur, tables, kind, [i[0] for i in items], access)
+                    for item in items:
+                        hidden = shown is not None and item[0] not in shown
+                        entry = {"id": item[0], "name": None if hidden else item[1], "hidden": hidden}
                         if kind == "token":
                             entry["kind"] = item[2]
                             entry["status"] = store._token_status(now, store._parse_time(item[3]),
                                                                   store._parse_time(item[4]))
                         owns[key].append(entry)
+                    # Those without a name last, by id: where they fell among the others would tell their names apart.
+                    owns[key].sort(key=lambda e: (e["hidden"], e["id"] if e["hidden"] else 0))
             reason = _cannot_manage(viewer, found)
             detail = {"user": user, "permissions": [{"id": p, "via": roles} for p, roles in via.items()],
                       "sessions": sessions, "owns": owns, "canManage": reason is None, "cannotManage": reason}
@@ -936,7 +1025,7 @@ def user_detail(user_id, viewer, history=False, session_id=None):
                     cur.execute(store._sql("SELECT " + _AUDIT_COLUMNS + " FROM auditLog WHERE actorId = ? OR "
                                            "(targetKind = 'user' AND targetId = ?) ORDER BY id DESC LIMIT {}"
                                            .format(HISTORY_LIMIT)), (user_id, user_id))
-                    entries = [_audit_entry(r) for r in cur.fetchall()]
+                    entries = _hide_private_names(cur, tables, [_audit_entry(r) for r in cur.fetchall()], access)
                 detail["history"] = entries
             return detail
     except store._MissingTables:  # dropped in between
@@ -1976,13 +2065,15 @@ def set_token_owner(token_id, user_id, actor):
 # ---- audit log ----------------------------------------------------------------------------
 
 
-def audit_log(before=None, limit=50, actor=None, category=None, target=None):
+def audit_log(before=None, limit=50, actor=None, category=None, target=None, access=None):
     """The audit log for the Admin page, newest first: {"ready", "entries": [as _audit_entry gives them], "next":
     the id to pass as before for the page after, or None, "keptDays": store.audit_days()}.
 
     before is the id the page starts below (keyset paging: a row written meanwhile never shifts a page); actor a
     users.id, "token" (the admin token) or "checks" (client tokens); category one of AUDIT_CATEGORIES; target
-    (kind, id) of what was changed. ready is False while the database has no auditLog table."""
+    (kind, id) of what was changed. ready is False while the database has no auditLog table. access is what the
+    viewer may see of MFA secrets, saved sign-ins and tokens (store.Access): reading the audit log doesn't bring
+    that with it, so the names of those they may not see are left out (_hide_private_names)."""
     clauses, params = [], []
     if before is not None:
         clauses.append("id < ?")
@@ -2010,8 +2101,9 @@ def audit_log(before=None, limit=50, actor=None, category=None, target=None):
             cur.execute(store._sql("SELECT {} FROM auditLog{} ORDER BY id DESC LIMIT ?".format(_AUDIT_COLUMNS, where)),
                         params + [int(limit) + 1])
             rows = cur.fetchall()
+            entries = _hide_private_names(cur, store._tables(cur), [_audit_entry(row) for row in rows[:limit]],
+                                          access)
     except store._MissingTables:  # dropped in between
         return {"ready": False, "entries": [], "next": None, "keptDays": store.audit_days()}
-    entries = [_audit_entry(row) for row in rows[:limit]]
     return {"ready": True, "entries": entries, "next": entries[-1]["id"] if len(rows) > limit else None,
             "keptDays": store.audit_days()}

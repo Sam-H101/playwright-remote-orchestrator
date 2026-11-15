@@ -3,6 +3,7 @@ wipe>, plus DB_HOST/DB_PORT/DB_USER/DB_PASSWORD. The savedSignins table in that 
 import base64
 import datetime
 import os
+import secrets
 import threading
 
 import pytest
@@ -216,8 +217,40 @@ def test_checks_use_their_sign_ins_with_a_managed_client_token(mysql):
     assert r.get_json() == {"saved": True, "version": 1}
     r = client.post("/api/signins/checkout", json={"name": "contoso"}, headers=headers)
     assert r.get_json()["state"] == state()
-    assert sql("SELECT savedBy, lastUsedBy FROM savedSignins") == (("client token 'nightly checks'",) * 2,)
+    kept = "\x1f{}.\x1fclient token 'nightly checks'".format(token["id"])  # with its id: store.by_token
+    assert sql("SELECT savedBy, lastUsedBy FROM savedSignins") == ((kept,) * 2,)
     r = client.get("/api/signins", headers={"X-Grid-Token": "s3cret"})
     assert r.status_code == 200 and COOKIE not in r.get_data(as_text=True)
+    (listed,) = r.get_json()["signins"]  # the admin token may see every token
+    assert (listed["savedBy"], listed["lastUsedBy"], listed["savedByHidden"]) == ("client token 'nightly checks'",) * 2 + (False,)
     store.revoke_token(token["id"])
     assert client.post("/api/signins/checkout", json={"name": "contoso"}, headers=headers).status_code == 401
+
+
+def test_a_client_tokens_name_shows_only_to_whoever_may_see_it(mysql):
+    """What a check's client token saved and reused is kept with the token's id (store.by_token): listed, the token is
+    named only to its owner and whoever may see every token, and anyone else is told whose it is. A name kept before
+    ids were is matched against the tokens there are."""
+    store.ensure_schema()
+    subject = secrets.token_hex(8)
+    sql("INSERT INTO users (issuer, subject, name, createdAt) VALUES ('https://idp.example', %s, 'Dana Lee', "
+        "UTC_TIMESTAMP())", (subject,))
+    ((dana,),) = sql("SELECT id FROM users WHERE subject = %s", (subject,))
+    token = store.create_token("dana-signins-mysql", "client")
+    sql("INSERT INTO itemOwners (itemKind, itemId, userId, createdAt) VALUES ('token', %s, %s, UTC_TIMESTAMP())",
+        (token["id"], dana))
+    name = "client token 'dana-signins-mysql' (Dana Lee)"
+    kept = store.by_token(name, token["id"], dana)
+    got = store.checkout_signin(kept, "contoso")
+    assert store.save_signin(kept, "contoso", state(), lease_token=got["leaseToken"])["saved"] is True
+    assert store.checkout_signin(name, "contoso")["status"] == "saved"  # unmarked, as kept before ids
+    assert sql("SELECT savedBy, lastUsedBy FROM savedSignins") == ((kept, name),)
+
+    def listed(user_id, *more):
+        (row,) = store.list_signins(store.Access(user_id, (), frozenset({"signins.use", "signins.all"} | set(more))))["signins"]
+        return [(row[k], row[k + "Hidden"], row[k + "Owner"]) for k in ("savedBy", "lastUsedBy")]
+
+    assert listed(dana + 1000) == [(None, True, "Dana Lee")] * 2
+    assert listed(dana) == [(name, False, None)] * 2
+    assert listed(None, "tokens.all") == [(name, False, None)] * 2
+    assert [(s["savedBy"], s["lastUsedBy"]) for s in store.list_signins()["signins"]] == [(name, name)]

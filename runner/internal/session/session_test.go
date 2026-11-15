@@ -99,17 +99,83 @@ func (r *reports) all() []protocol.OpenFailed {
 	return append([]protocol.OpenFailed{}, r.list...)
 }
 
+// endpoint stands for the slot's secret run-server path.
+const endpoint = "/0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
 func manager(h *hub, port int, rep *reports, timings config.Timings) *Manager {
+	return managerAt(h, port, endpoint, rep, timings)
+}
+
+func managerAt(h *hub, port int, path string, rep *reports, timings config.Timings) *Manager {
 	return NewManager(Options{
 		HubURL: "ws" + strings.TrimPrefix(h.srv.URL, "http"), Token: "tok", Timings: timings, Logger: logging.Discard(),
-		SlotPort: func(i int) (int, bool) { return port, i == 1 },
-		Report:   rep.add,
+		Slot:   func(i int) (int, string, bool) { return port, path, i == 1 },
+		Report: rep.add,
 	})
 }
 
 func open(slot string, headers map[string]any) protocol.Open {
-	raw, _ := json.Marshal(map[string]any{"type": "open", "id": id, "slot": json.RawMessage(slot), "path": "/", "query": "a=1", "headers": headers})
+	return openPath(slot, "/", headers)
+}
+
+func openPath(slot, path string, headers map[string]any) protocol.Open {
+	raw, _ := json.Marshal(map[string]any{"type": "open", "id": id, "slot": json.RawMessage(slot), "path": path, "query": "a=1", "headers": headers})
 	return protocol.ParseOpen(raw)
+}
+
+// "/" (what clients ask for) goes to the slot's secret endpoint; any other path is passed on as it is.
+func TestSessionDialsTheSecretEndpoint(t *testing.T) {
+	for _, c := range []struct{ asked, want string }{{"/", endpoint}, {"/other", "/other"}, {endpoint, endpoint}} {
+		u, h, rep := newUpstream(t), newHub(t), &reports{}
+		m := manager(h, u.port, rep, config.DefaultTimings)
+		ctx, cancel := context.WithCancel(context.Background())
+		go m.HandleOpen(ctx, openPath("1", c.asked, nil))
+		select {
+		case d := <-h.conns:
+			d.CloseNow()
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: no data channel; reports %v", c.asked, rep.all())
+		}
+		cancel()
+		u.mu.Lock()
+		got := u.req.URL.Path + "?" + u.req.URL.RawQuery
+		u.mu.Unlock()
+		if got != c.want+"?a=1" {
+			t.Fatalf("asked %s: dialled %s, want %s?a=1", c.asked, got, c.want)
+		}
+	}
+}
+
+// The endpoint path never reaches the hub, not even inside an error that quotes the URL.
+func TestOpenFailuresHideTheEndpoint(t *testing.T) {
+	h := newHub(t)
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	closedPort := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	rep := &reports{}
+	managerAt(h, closedPort, endpoint, rep, config.DefaultTimings).HandleOpen(context.Background(), open("1", nil))
+	got := rep.all()
+	if len(got) != 1 || strings.Contains(got[0].Message, endpoint[1:]) || !strings.HasPrefix(got[0].Message, fmt.Sprintf("run-server on port %d: ", closedPort)) {
+		t.Fatalf("%+v", got)
+	}
+	// The upstream answers with an error page that quotes the path.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no endpoint at "+r.URL.Path, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	port, _ := strconv.Atoi(srv.URL[strings.LastIndex(srv.URL, ":")+1:])
+	rep = &reports{}
+	managerAt(h, port, endpoint, rep, config.DefaultTimings).HandleOpen(context.Background(), open("1", nil))
+	got = rep.all()
+	if len(got) != 1 || got[0].Status == nil || *got[0].Status != 400 || strings.Contains(got[0].Message, endpoint[1:]) || !strings.Contains(got[0].Message, "no endpoint at /<endpoint>") {
+		t.Fatalf("%+v", got)
+	}
+	// A slot whose run-server is not running has no endpoint: nothing is dialled.
+	rep = &reports{}
+	managerAt(h, port, "", rep, config.DefaultTimings).HandleOpen(context.Background(), open("1", nil))
+	if got = rep.all(); len(got) != 1 || got[0].Message != fmt.Sprintf("run-server on port %d: not running", port) {
+		t.Fatalf("%+v", got)
+	}
 }
 
 func TestSessionForwardsHeadersAndPipes(t *testing.T) {

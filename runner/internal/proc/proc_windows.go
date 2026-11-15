@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strconv"
@@ -19,8 +20,14 @@ func hide(cmd *exec.Cmd) {
 	cmd.SysProcAttr.CreationFlags |= createNoWindow
 }
 
+// SetUser is Unix only: on Windows the service starts run-server with the browser account's token.
+func SetUser(cmd *exec.Cmd, uid, gid uint32) error {
+	return errors.New("starting run-server as another user by uid is not supported on Windows")
+}
+
 // KillTree ends a process and its descendants: run-server's browsers are its children and outlive a
-// plain kill. taskkill /T /F does it; TerminateProcess is the fallback for the process itself.
+// plain kill. taskkill /T /F does it; TerminateProcess is the fallback for the process itself. The
+// service runs as SYSTEM, which may end the browser account's processes too.
 func KillTree(pid int) error {
 	tk := exec.Command("taskkill", "/pid", strconv.Itoa(pid), "/T", "/F")
 	hide(tk)

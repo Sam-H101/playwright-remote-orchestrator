@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Sam-H101/playwright-remote-orchestrator/runner/internal/config"
+	"github.com/Sam-H101/playwright-remote-orchestrator/runner/internal/logging"
 	"github.com/Sam-H101/playwright-remote-orchestrator/runner/internal/proc"
 	"github.com/Sam-H101/playwright-remote-orchestrator/runner/internal/protocol"
 	"github.com/Sam-H101/playwright-remote-orchestrator/runner/internal/runtime"
@@ -209,6 +210,11 @@ func (r *run) stopExisting() error {
 				}
 				r.log.Infof("Removed service '%s' (--no-service)", p.ServiceName)
 				r.prev.ServiceExisted = false
+				var listed []string
+				if r.old != nil {
+					listed = append([]string{r.old.BrowserAccount}, r.old.BrowserAccounts...)
+				}
+				removeBrowserAccounts(winsys.StaleBrowserAccounts(p.ServiceName, 0, listed...), r.log)
 			} else {
 				r.log.Warnf("Service '%s' from an earlier install still exists; remove it elevated (pwrunner uninstall) or it starts a second agent at boot.", p.ServiceName)
 			}
@@ -374,6 +380,60 @@ func copyTree(src, dst string) error {
 	})
 }
 
+// browserAccount creates or repairs the local account each slot's run-server and its browsers run as, with
+// a new password each time. As LocalSystem a check's browser could read every file on the machine,
+// agent.token included; as its slot's account it reads what Users can, and not the browser profiles of
+// checks running at the same time in other slots, which are their own accounts'.
+func (r *run) browserAccount() error {
+	if r.p.NoService {
+		r.log.Infof("No service: run-servers and their browsers run as %s", currentUser())
+		return nil
+	}
+	r.accounts = nil
+	for i, name := range winsys.BrowserAccountNames(r.p.ServiceName, r.p.Slots) {
+		comment := fmt.Sprintf("Runs the browsers of slot %d of the %s Playwright runner service. Managed by pwrunner install.", i+1, r.p.ServiceName)
+		created, err := winsys.EnsureBrowserAccount(name, comment)
+		if err != nil {
+			return fmt.Errorf("browser account '%s' (slot %d): %w", name, i+1, err)
+		}
+		r.accounts = append(r.accounts, name)
+		if created {
+			r.log.Infof("Created the local account '%s' that slot %d's run-server and its browsers run as", name, i+1)
+		} else {
+			r.log.Infof("Repaired the local account '%s' that slot %d's run-server and its browsers run as, with a new password", name, i+1)
+		}
+	}
+	return nil
+}
+
+// removeStaleAccounts deletes the browser accounts this install no longer uses: the single account of an
+// install from before each slot had its own, and those of slots above the slot count. Only once the new
+// backend.json is written: a failure before that restarts the previous install, which may still need them.
+func (r *run) removeStaleAccounts() {
+	if r.p.NoService || !r.elevated {
+		return
+	}
+	var listed []string
+	if r.old != nil {
+		listed = append([]string{r.old.BrowserAccount}, r.old.BrowserAccounts...)
+	}
+	removeBrowserAccounts(winsys.StaleBrowserAccounts(r.p.ServiceName, r.p.Slots, listed...), r.log)
+}
+
+// removeBrowserAccounts deletes browser accounts (when the service, or a slot, goes away), logging those
+// that existed and warning about failures.
+func removeBrowserAccounts(names []string, log *logging.Logger) {
+	for _, name := range names {
+		removed, err := winsys.RemoveBrowserAccount(name)
+		if removed {
+			log.Infof("Removed the browser account '%s'", name)
+		}
+		if err != nil {
+			log.Warnf("removing the browser account '%s': %v", name, err)
+		}
+	}
+}
+
 func (r *run) writeConfig() error {
 	p := r.p
 	tokenFile := r.dir("agent.token")
@@ -400,7 +460,7 @@ func (r *run) writeConfig() error {
 	b := config.Backend{
 		HubURL: p.HubURL, NodeName: p.Name, Slots: p.Slots, BasePort: p.BasePort, PlaywrightVersion: m.PlaywrightVersion,
 		Browsers: p.Browsers, NodeExe: runtime.NodeBinary(p.InstallDir), NodeVersion: m.NodeVersion, PlaywrightCLI: runtime.CLI(p.InstallDir),
-		BrowsersPath: r.dir("browsers"), ServiceName: p.ServiceName, ServiceAccount: "LocalSystem", ReportURL: p.ReportURL,
+		BrowsersPath: r.dir("browsers"), ServiceName: p.ServiceName, ServiceAccount: "LocalSystem", BrowserAccounts: r.accounts, ReportURL: p.ReportURL,
 		InstallDir: p.InstallDir, DownloadHost: p.DownloadHost, RunnerVersion: r.version, InstalledAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 	if p.NoService {
@@ -414,6 +474,9 @@ func (r *run) writeConfig() error {
 	}
 	written, _, err := config.ReadBackend(r.dir("backend.json"))
 	r.cfg = &written
+	if err == nil {
+		r.removeStaleAccounts()
+	}
 	return err
 }
 

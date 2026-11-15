@@ -27,8 +27,10 @@ services:
       context: .
       dockerfile: docker/hub/Dockerfile
     restart: unless-stopped
+    # The hub is the one service on the runners' network too.
     networks:
       - playwright
+      - runners
     ports:
       - "${GATEWAY_PORT:-4500}:4500"
     environment:
@@ -65,17 +67,26 @@ services:
     restart: unless-stopped
     init: true
     shm_size: 1gb
-    # The agent starts as root only to run the browsers as pwuser (RUN_SERVER_USER in the image), out of reach of
-    # its token: it keeps the capabilities to switch user and stop them, and nothing else.
+    # The agent starts as root only to run each slot's browsers as a user of their own (pwuser1, pwuser2, ...:
+    # RUN_SERVER_USER=pwuser{slot} in the image), out of reach of its token and of the other slots' checks: it
+    # keeps the capabilities to switch user and stop them, and nothing else. NET_ADMIN and SETPCAP
+    # are for the image's entrypoint, which closes RUNNER_BLOCKED_NETWORKS to the browsers and then drops both
+    # before the agent starts.
     cap_drop: [ALL]
-    cap_add: [SETUID, SETGID, KILL]
+    cap_add: [SETUID, SETGID, KILL, NET_ADMIN, SETPCAP]
     security_opt: ["no-new-privileges:true"]
+    # A check controls a browser here, so the runners sit on a network of their own with the hub and nothing else:
+    # a check can't reach MySQL, the Grid UI or the checks' containers through them.
     networks:
-      - playwright
+      - runners
     environment:
       HUB_URL: ws://hub:4500
       GATEWAY_AGENT_TOKEN: ${GATEWAY_AGENT_TOKEN:?set GATEWAY_AGENT_TOKEN in .env (see .env.example)}
       SLOTS: ${RUNNER_SLOTS:-4}
+      # Networks the browsers can't reach, comma-separated. The default is link-local, where a cloud VM's metadata
+      # service hands out its managed identity's tokens; add your internal ranges that checks never need. Empty
+      # turns it off (and NET_ADMIN and SETPCAP above can then go).
+      RUNNER_BLOCKED_NETWORKS: ${RUNNER_BLOCKED_NETWORKS-169.254.0.0/16}
     depends_on:
       hub:
         condition: service_healthy
@@ -198,3 +209,9 @@ networks:
     ipam:
       config:
         - subnet: 172.50.221.0/24
+  # The runners and the hub only (see the runner service).
+  runners:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.50.222.0/24

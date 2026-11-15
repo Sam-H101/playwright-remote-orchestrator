@@ -317,8 +317,8 @@ def test_what_people_see_and_use_of_each_others_items(mysql, monkeypatch):
     store.create_mfa("admins", SEED)
     store.issue_mfa_code("client token 'dana-ci' (Dana Lee)", name="intranet", access=dana)
     store.issue_mfa_code("GATEWAY_CLIENT_TOKEN", name="admins", access=admin)
-    with pytest.raises(store.NotShared):
-        store.issue_mfa_code("client token 'carol-ci' (Carol Diaz)", name="intranet", access=carol)
+    # By name as by id, it isn't there for whoever may not use it.
+    assert store.issue_mfa_code("client token 'carol-ci' (Carol Diaz)", name="intranet", access=carol) is None
     assert store.peek_mfa_code(secret, access=carol) is None and store.delete_mfa(secret, carol) is False
     with pytest.raises(store.NotPermitted):
         store.delete_mfa(secret, dana)

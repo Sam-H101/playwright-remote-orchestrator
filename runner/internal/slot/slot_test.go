@@ -131,3 +131,81 @@ func TestPrefixWriter(t *testing.T) {
 		t.Fatalf("%q", out)
 	}
 }
+
+// run-server prints its endpoint ("Listening on ws://127.0.0.1:3100/<path>"): the path never reaches the
+// slot log, however the output is split into writes.
+func TestRedactWriter(t *testing.T) {
+	secret := "/" + strings.Repeat("ab", 32)
+	text := "Listening on ws://127.0.0.1:3100" + secret + "\npartial " + secret + secret + " end\nno newline " + secret
+	for step := 1; step <= len(text); step += 7 {
+		var b strings.Builder
+		w := &redactWriter{w: &b, secret: []byte(secret), mask: []byte(PathMask)}
+		for i := 0; i < len(text); i += step {
+			w.Write([]byte(text[i:min(i+step, len(text))]))
+		}
+		if strings.Contains(b.String(), "no newline") {
+			t.Fatal("a partial line went out before Flush")
+		}
+		w.Flush()
+		want := "Listening on ws://127.0.0.1:3100/<endpoint>\npartial /<endpoint>/<endpoint> end\nno newline /<endpoint>"
+		if b.String() != want {
+			t.Fatalf("step %d: %q", step, b.String())
+		}
+	}
+	// A line too long to hold goes out in parts, and a secret across the cut is still masked.
+	var b strings.Builder
+	w := &redactWriter{w: &b, secret: []byte(secret), mask: []byte(PathMask)}
+	long := strings.Repeat("x", maxHeldLine) + secret[:10]
+	w.Write([]byte(long))
+	if b.Len() == 0 {
+		t.Fatal("a long line must not be held whole")
+	}
+	w.Write([]byte(secret[10:] + "\n"))
+	w.Flush()
+	if strings.Contains(b.String(), secret[1:11]) || !strings.HasSuffix(b.String(), "x/<endpoint>\n") {
+		t.Fatalf("long line: ...%q", b.String()[b.Len()-40:])
+	}
+}
+
+// A Prepare that fails keeps run-server from starting at all (the Windows service when the browser
+// account is missing must not fall back to running the browsers as LocalSystem).
+func TestPrepareFailureStartsNothing(t *testing.T) {
+	var b strings.Builder
+	var mu sync.Mutex
+	calls := 0
+	s := New(Options{
+		Index: 1, Port: freePort(t), NodeExe: filepath.Join(t.TempDir(), "must-not-run"), CLI: "cli.js",
+		Timings: config.Timings{HealthMs: 100, RestartBaseMs: 20, RestartMaxMs: 40, StableMs: 60000},
+		Logger:  logging.New(&lockedWriter{w: &b, mu: &mu}, nil),
+		Prepare: func(cmd *exec.Cmd) error {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			return os.ErrNotExist
+		},
+	})
+	done := make(chan struct{})
+	go func() { s.Run(t.Context()); close(done) }()
+	waitFor(t, "two failed starts", 5*time.Second, func() bool { return s.Status().Restarts >= 2 })
+	s.Stop()
+	<-done
+	if st := s.Status(); st.PID != nil || st.Healthy {
+		t.Fatalf("%+v", st)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls < 2 || !strings.Contains(b.String(), "run-server exited (not started: file does not exist)") {
+		t.Fatalf("calls %d, log:\n%s", calls, b.String())
+	}
+}
+
+type lockedWriter struct {
+	w  *strings.Builder
+	mu *sync.Mutex
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}

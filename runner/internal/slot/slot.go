@@ -5,7 +5,10 @@ package slot
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -21,12 +24,15 @@ import (
 )
 
 type Options struct {
-	Index    int
-	Port     int
-	NodeExe  string
-	CLI      string   // playwright-core cli.js
-	Env      []string // the child's environment, NODE_OPTIONS included (see NodeOptions)
-	LogDir   string   // "" -> the agent's log, prefixed "[slot i]"
+	Index   int
+	Port    int
+	NodeExe string
+	CLI     string   // playwright-core cli.js
+	Env     []string // the child's environment, NODE_OPTIONS included (see NodeOptions)
+	// Prepare, when set, runs on each run-server command before it starts (to start it as another
+	// account); an error means run-server is not started and counts as a crash.
+	Prepare  func(cmd *exec.Cmd) error
+	LogDir   string // "" -> the agent's log, prefixed "[slot i]"
 	Timings  config.Timings
 	OnHealth func(index int, healthy bool) // a health transition: the agent sends an urgent heartbeat
 	OnChange func()                        // anything else runtime.json shows (pid, restarts)
@@ -42,9 +48,14 @@ type Status struct {
 	Since       *time.Time
 }
 
+// PathEnv carries run-server's endpoint path to the watchdog preload, which passes it on as --path and
+// removes it from the environment. Never the command line: every user can read that in /proc.
+const PathEnv = "GATEWAY_AGENT_RUN_SERVER_PATH"
+
 type Slot struct {
 	o        Options
 	mu       sync.Mutex
+	path     string // the running run-server's secret endpoint path, "" while none runs
 	pid      int
 	healthy  bool
 	restarts int
@@ -106,6 +117,36 @@ func (s *Slot) Status() Status {
 	return st
 }
 
+// Path is the endpoint path of the run-server running now: "/" and 32 random bytes in hex, new at every
+// start, "" while none runs. run-server answers WebSocket upgrades at this path only (HTTP 400 at any
+// other), so a browser of another slot that reaches this port on 127.0.0.1 can't open a session here.
+// It is a secret: it must not reach logs, runtime.json or the hub.
+func (s *Slot) Path() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path
+}
+
+// NewPath is a new random endpoint path.
+func NewPath() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "/" + hex.EncodeToString(b[:]), nil
+}
+
+// withEnv is env with name set to value (any earlier value of name removed).
+func withEnv(env []string, name, value string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); !strings.EqualFold(k, name) {
+			out = append(out, kv)
+		}
+	}
+	return append(out, name+"="+value)
+}
+
 // Healthy is the slot's health as last probed.
 func (s *Slot) Healthy() bool {
 	s.mu.Lock()
@@ -155,7 +196,7 @@ func (s *Slot) Run(ctx context.Context) {
 			}
 		}
 		s.mu.Lock()
-		s.pid, s.since = 0, nil
+		s.pid, s.since, s.path = 0, nil, ""
 		if time.Since(started) >= ms(s.o.Timings.StableMs) {
 			s.backoff = ms(s.o.Timings.RestartBaseMs)
 		}
@@ -185,6 +226,19 @@ func (s *Slot) start() (<-chan error, *exec.Cmd, error) {
 	cmd.Env = s.o.Env
 	cmd.Stdin = nil
 	proc.Hide(cmd)
+	if s.o.Prepare != nil {
+		if err := s.o.Prepare(cmd); err != nil {
+			return nil, nil, fmt.Errorf("not started: %w", err)
+		}
+	}
+	path, err := NewPath()
+	if err != nil {
+		return nil, nil, fmt.Errorf("not started: %w", err)
+	}
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = withEnv(cmd.Env, PathEnv, path)
 	var file *os.File
 	if s.o.LogDir != "" {
 		f, err := openSlotLog(s.o.LogDir, s.o.Index)
@@ -194,28 +248,38 @@ func (s *Slot) start() (<-chan error, *exec.Cmd, error) {
 			file = f
 		}
 	}
+	// run-server prints its endpoint ("Listening on ws://127.0.0.1:<port><path>"), and the slot logs are readable
+	// by other slots' users, so its output goes through a pipe that masks the path.
+	var out io.Writer = &prefixWriter{log: s.o.Logger, prefix: fmt.Sprintf("[slot %d] ", s.o.Index)}
 	if file != nil {
-		cmd.Stdout, cmd.Stderr = file, file
-	} else {
-		w := &prefixWriter{log: s.o.Logger, prefix: fmt.Sprintf("[slot %d] ", s.o.Index)}
-		cmd.Stdout, cmd.Stderr = w, w
-		cmd.WaitDelay = time.Second // browsers inheriting the pipe must not hold Wait
+		out = file
 	}
-	err := cmd.Start()
-	if file != nil {
-		file.Close()
+	w := &redactWriter{w: out, secret: []byte(path), mask: []byte(PathMask)}
+	cmd.Stdout, cmd.Stderr = w, w
+	cmd.WaitDelay = time.Second // browsers inheriting the pipe must not hold Wait
+	closeOut := func() {
+		w.Flush()
+		if file != nil {
+			file.Close()
+		}
 	}
+	err = cmd.Start()
 	if err != nil {
+		closeOut()
 		return nil, nil, err
 	}
 	now := time.Now()
 	s.mu.Lock()
-	s.pid, s.since = cmd.Process.Pid, &now
+	s.pid, s.since, s.path = cmd.Process.Pid, &now, path
 	s.mu.Unlock()
 	s.o.Logger.Infof("slot %d: started run-server on 127.0.0.1:%d (pid %d)", s.o.Index, s.o.Port, cmd.Process.Pid)
 	s.changed()
 	exit := make(chan error, 1)
-	go func() { exit <- cmd.Wait() }()
+	go func() {
+		err := cmd.Wait()
+		closeOut()
+		exit <- err
+	}()
 	return exit, cmd, nil
 }
 
@@ -285,7 +349,7 @@ func (s *Slot) kill(cmd *exec.Cmd, exit <-chan error) {
 		s.o.Logger.Warnf("slot %d: run-server (pid %d) did not exit within 8s", s.o.Index, cmd.Process.Pid)
 	}
 	s.mu.Lock()
-	s.pid, s.since = 0, nil
+	s.pid, s.since, s.path = 0, nil, ""
 	s.mu.Unlock()
 	s.setHealthy(false)
 }
@@ -319,6 +383,48 @@ func openSlotLog(dir string, index int) (*os.File, error) {
 		}
 	}
 	return os.Create(file)
+}
+
+// PathMask replaces the endpoint path in run-server's output.
+const PathMask = "/<endpoint>"
+
+// redactWriter passes a child's output on with every occurrence of secret replaced by mask. It holds back a
+// partial line (one that could end in part of the secret) until its newline or Flush; a line too long to
+// hold is passed on except for its last len(secret)-1 bytes.
+type redactWriter struct {
+	w            io.Writer
+	secret, mask []byte
+	mu           sync.Mutex
+	rest         []byte
+}
+
+const maxHeldLine = 64 << 10
+
+func (r *redactWriter) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Masked as a whole first (the mask has no part of the secret in it, so masking again changes nothing):
+	// after that, only the last len(secret)-1 bytes can hold the start of a secret that later output completes.
+	r.rest = bytes.ReplaceAll(append(r.rest, p...), r.secret, r.mask)
+	cut := bytes.LastIndexByte(r.rest, '\n') + 1
+	if cut == 0 && len(r.rest) > maxHeldLine {
+		cut = len(r.rest) - (len(r.secret) - 1)
+	}
+	if cut > 0 {
+		r.w.Write(r.rest[:cut]) // the child's output is best effort: its writes never fail
+		r.rest = append(r.rest[:0:0], r.rest[cut:]...)
+	}
+	return len(p), nil
+}
+
+// Flush passes on what is held back (when the child has exited).
+func (r *redactWriter) Flush() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.rest) > 0 {
+		r.w.Write(r.rest)
+		r.rest = nil
+	}
 }
 
 // prefixWriter logs each complete line of a child's output.

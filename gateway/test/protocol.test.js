@@ -7,7 +7,7 @@ const path = require('node:path');
 const { test } = require('node:test');
 const P = require('../lib/protocol');
 const { splitSchema } = require('../lib/registry');
-const { agentConfig, hubConfig, runServerUser } = require('../lib/config');
+const { agentConfig, hubConfig, runServerUser, runServerUsers, sharedRunServerUser } = require('../lib/config');
 const { childEnv } = require('../agent');
 const { FAKE_CLI } = require('./helpers');
 
@@ -87,14 +87,31 @@ test('agent config: --run-server-user / RUN_SERVER_USER, from /etc/passwd, only 
   const env = { HUB_URL: 'ws://env:1', PLAYWRIGHT_CLI: FAKE_CLI };
   assert.equal(agentConfig([], env, process.cwd(), asRoot).runAs, null, 'unset: run-server runs as the agent');
   const want = { name: 'pwuser', uid: 1001, gid: 1002, home: '/home/pwuser' };
-  assert.deepEqual(agentConfig([], { ...env, RUN_SERVER_USER: 'pwuser' }, process.cwd(), asRoot).runAs, want);
-  assert.deepEqual(agentConfig(['--run-server-user', 'pwuser'], env, process.cwd(), asRoot).runAs, want);
+  assert.deepEqual(agentConfig([], { ...env, RUN_SERVER_USER: 'pwuser' }, process.cwd(), asRoot).runAs, [want, want, want, want], 'one user, every slot');
+  assert.deepEqual(agentConfig(['--run-server-user', 'pwuser', '--slots', '2'], env, process.cwd(), asRoot).runAs, [want, want]);
   assert.throws(() => runServerUser('pwuser', { ...asRoot, getuid: () => 1000 }), /start as root/);
   assert.throws(() => runServerUser('pwuser', { ...asRoot, platform: 'win32' }), /not supported on Windows/);
   assert.throws(() => runServerUser('nobody-here', asRoot), /no user "nobody-here"/);
   assert.throws(() => runServerUser('root', asRoot), /is root/);
   assert.throws(() => runServerUser('odd', asRoot), /no usable uid/);
   assert.throws(() => runServerUser('pw', asRoot), /no user "pw"/, 'a prefix of a name is not the name');
+});
+
+test('agent config: RUN_SERVER_USER with {slot} gives each slot its own user', () => {
+  const passwd = () => ['root:x:0:0:root:/root:/bin/bash', 'pw1:x:2001:2001::/home/pw1:/bin/sh', 'pw2:x:2002:2002::/home/pw2:/bin/sh',
+    'pw3:x:2003:2003::/home/pw3:/bin/sh', 'twin:x:2001:2001::/home/twin:/bin/sh', 'zero1:x:0:0::/:/bin/sh'].join('\n');
+  const asRoot = { platform: 'linux', getuid: () => 0, passwd };
+  const env = { HUB_URL: 'ws://env:1', PLAYWRIGHT_CLI: FAKE_CLI };
+  const runAs = agentConfig(['--slots', '3'], { ...env, RUN_SERVER_USER: 'pw{slot}' }, process.cwd(), asRoot).runAs;
+  assert.deepEqual(runAs.map((u) => [u.name, u.uid, u.gid, u.home]), [['pw1', 2001, 2001, '/home/pw1'], ['pw2', 2002, 2002, '/home/pw2'], ['pw3', 2003, 2003, '/home/pw3']]);
+  assert.equal(sharedRunServerUser(runAs), false);
+  assert.equal(sharedRunServerUser(runServerUsers('pw1', 2, asRoot)), true, 'a plain name is shared by the slots');
+  assert.equal(sharedRunServerUser(runServerUsers('pw1', 1, asRoot)), false, 'one slot shares with no one');
+  assert.throws(() => runServerUsers('pw{slot}', 4, asRoot), /no user "pw4"/, 'every slot needs its user');
+  assert.throws(() => runServerUsers('zero{slot}', 1, asRoot), /"zero1" is root/);
+  // Two names with one uid are one user.
+  const sameUid = { ...asRoot, passwd: () => passwd().replace('pw2:x:2002', 'pw2:x:2001') };
+  assert.throws(() => runServerUsers('pw{slot}', 2, sameUid), /"pw1" and "pw2" are the same user \(uid 2001\); each slot needs its own/);
 });
 
 test('run-server never gets the agent token in its environment', () => {
@@ -106,6 +123,22 @@ test('run-server never gets the agent token in its environment', () => {
   out = childEnv(env, { name: 'pwuser', uid: 1001, gid: 1002, home: '/home/pwuser' });
   assert.deepEqual([out.HOME, out.USER, out.LOGNAME, out.GATEWAY_AGENT_TOKEN], ['/home/pwuser', 'pwuser', 'pwuser', undefined]);
   assert.equal(env.GATEWAY_AGENT_TOKEN, 'secret-agent-token', 'the agent keeps its own');
+  // run-server's secret path goes in its environment only, and one the agent was started with is never passed on.
+  out = childEnv({ ...env, GATEWAY_AGENT_RUN_SERVER_PATH: '/stale' }, null, '/abc');
+  assert.equal(out.GATEWAY_AGENT_RUN_SERVER_PATH, '/abc');
+  assert.equal(childEnv({ ...env, gateway_agent_run_server_path: '/stale' }).gateway_agent_run_server_path, undefined);
+});
+
+test('the watchdog hands run-server its secret path as --path and keeps it from the browsers', () => {
+  const { execFileSync } = require('node:child_process');
+  const watchdog = path.join(__dirname, '..', 'lib', 'parent-watchdog.js');
+  // With -e there is no script in argv, so the arguments start at argv[1].
+  const show = 'console.log(JSON.stringify({ argv: process.argv.slice(1), env: process.env.GATEWAY_AGENT_RUN_SERVER_PATH ?? null }))';
+  const run = (args) => JSON.parse(execFileSync(process.execPath, ['--require', watchdog, '-e', show, '--', ...args], {
+    env: { ...process.env, GATEWAY_AGENT_RUN_SERVER_PATH: '/0123abcd' }, encoding: 'utf8',
+  }));
+  assert.deepEqual(run(['run-server', '--port', '1']), { argv: ['run-server', '--port', '1', '--path', '/0123abcd'], env: null });
+  assert.deepEqual(run(['other']), { argv: ['other'], env: null }, 'only run-server gets --path; the variable is gone either way');
 });
 
 test('agent config: --ephemeral / EPHEMERAL', () => {

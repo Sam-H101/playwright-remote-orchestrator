@@ -1329,6 +1329,42 @@ def test_the_audit_log_reads_as_sentences_and_filters_through_the_address(people
         ctx.close()
 
 
+def test_names_their_reader_may_not_see_are_left_out_of_the_audit_log_and_a_persons_sheet(people_grid, browser):  # noqa: F811
+    """Quinn reads the audit log and sees people, but none of Bob's MFA secrets or tokens: what Bob did reads in full
+    but for their names, and his sheet counts what he owns without naming it."""
+    url, path, who = people_grid
+    secret = add_item(path, "mfa", "github-2fa", owner=who.bob)
+    token, _ = add_client_token(path, "nightly-ci", owner=who.bob)
+    bob, bobs_check = (who.bob, "Bob Stone", "oidc"), (who.bob, "client token 'nightly-ci' (Bob Stone)", "client-token")
+    audit_row(path, "mfa.created", bob, ("mfa", secret, "github-2fa"), seconds_ago=400)
+    audit_row(path, "token.created", bob, ("token", token, "nightly-ci"), {"kind": "client", "owner": who.bob}, 300)
+    audit_row(path, "mfa.code_used", bobs_check, ("mfa", secret, "github-2fa"), seconds_ago=200)
+    audit_row(path, "mfa.shared", bob, ("mfa", secret, "github-2fa"),
+              {"grantee": {"kind": "user", "id": who.dana, "name": "Dana Lee"}}, 100)
+    quinn = make_user(path, "Quinn Reader", [who.qa, add_role(path, "People viewers", "users.view")])
+    ctx = signed_in_context(browser, url, path, quinn)
+    try:
+        p = watched(ctx.new_page())
+        p.goto(url + "#/admin?tab=audit&actor={}".format(who.bob))
+        rows_are(p, "#audit-rows tr", 4)
+        assert listed(p, "#audit-rows .audit-line > span") == [
+            "shared an MFA secret you may not see with Dana Lee", "took a code of an MFA secret you may not see",
+            "made a client token you may not see", "added an MFA secret you may not see"]
+        assert listed(p, "#audit-rows .cell-who")[1] == "client token (Bob Stone)check"
+        open_sheet(p, url, who.bob)
+        p.click("#user-tab-owns")
+        assert listed(p, "#user-part-owns .user-owns li") == ["One you may not see", "One you may not see · client · active"]
+        p.click("#user-tab-history")
+        assert listed(p, "#user-part-history .user-history li span:last-child")[:4] == [
+            "Bob Stone shared an MFA secret you may not see with Dana Lee",
+            "client token (Bob Stone) took a code of an MFA secret you may not see",
+            "Bob Stone made a client token you may not see", "Bob Stone added an MFA secret you may not see"]
+        assert "github-2fa" not in p.content() and "nightly-ci" not in p.content()
+        assert p.errors == []
+    finally:
+        ctx.close()
+
+
 def test_the_audit_log_says_what_a_scoped_token_may_do(people_grid, browser):  # noqa: F811
     url, path, who = people_grid
     made = (who.robin, "Robin Hale", "oidc")

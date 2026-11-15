@@ -122,7 +122,7 @@ class StubGridUi:
     def save(self, name, state, lease_token, base_version, signin_id, max_age_s):
         row = self.rows.get(name)
         if row is None:
-            return 404, {"error": "There is no saved sign-in called {!r}.".format(name)}
+            return 404, {"error": "There is no saved sign-in called {!r} that this client token's owner may use.".format(name)}
         if not (isinstance(state, dict) and isinstance(state.get("cookies"), list) and isinstance(state.get("origins"), list)):
             return 400, {"error": "Send the state as Playwright's storage_state."}
         now = time.time()
@@ -147,7 +147,7 @@ class StubGridUi:
     def release(self, name, lease_token):
         row = self.rows.get(name)
         if row is None:
-            return 404, {"error": "There is no saved sign-in called {!r}.".format(name)}
+            return 404, {"error": "There is no saved sign-in called {!r} that this client token's owner may use.".format(name)}
         released = row["lease"] is not None and row["lease"] == lease_token and row["leaseUntil"] > time.time()
         if released:
             row.update(lease=None, leaseUntil=0)
@@ -655,7 +655,8 @@ def test_the_requests_one_by_one(grid_ui, clock):
     ("checkout", 400, {"error": "A sign-in name is 1-64 letters, digits, '.', '_' and '-'."}, "1-64"),
     ("save", 409, {"error": "lease_lost"}, "lease_lost"),
     ("save", 413, {"error": "too_large"}, "too_large"),
-    ("save", 404, {"error": "There is no saved sign-in called 'contoso-monitor'."}, "no saved sign-in"),
+    ("save", 404, {"error": "There is no saved sign-in called 'contoso-monitor' that this client token's owner may "
+                            "use."}, "no saved sign-in"),
     ("release", 503, {"error": "The database is unavailable."}, "database"),
     ("checkout", 502, "<html>Bad gateway</html>", "Bad Gateway"),  # not the Grid UI's answer: the HTTP reason
 ])

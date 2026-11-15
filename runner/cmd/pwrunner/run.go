@@ -30,23 +30,35 @@ func runAgent(args []string) error {
 		log.SetDebug(true)
 	}
 	if s.Watchdog == "" {
-		if s.Watchdog, err = writeWatchdog(); err != nil {
+		dir, err := writeWatchdog()
+		if err != nil {
 			return fmt.Errorf("can't write parent-watchdog.js: %w", err)
 		}
+		defer os.RemoveAll(dir)
+		s.Watchdog = filepath.Join(dir, "parent-watchdog.js")
 	}
 	a := agent.New(s, version, log)
 	return service.RunConsole(func(ctx context.Context) error { return a.Run(ctx) })
 }
 
-// writeWatchdog puts the built-in parent-watchdog.js in <temp>\pwrunner-<version>\ (rewritten at every
-// start) for run-servers to preload.
+// writeWatchdog puts the built-in parent-watchdog.js in a new folder under the temp folder for run-servers
+// to preload, and returns the folder. A new folder rather than a fixed name: with --run-server-user the
+// agent runs as root, and another user could have created a fixed path in /tmp first, or linked it
+// elsewhere. The folder is world-readable so a run-server started as another user can load the file.
 func writeWatchdog() (string, error) {
-	dir := filepath.Join(os.TempDir(), "pwrunner-"+safe(version))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir, err := os.MkdirTemp("", "pwrunner-"+safe(version)+"-")
+	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "parent-watchdog.js")
-	return path, os.WriteFile(path, assets.ParentWatchdogJS, 0o644)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "parent-watchdog.js"), assets.ParentWatchdogJS, 0o644); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
 }
 
 func safe(s string) string {

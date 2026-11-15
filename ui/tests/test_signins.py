@@ -765,9 +765,11 @@ def test_managed_client_tokens(client, db, monkeypatch):
     assert run(db, "SELECT COUNT(*) FROM savedSignins") == [(0,)]
     managed = {"Authorization": "Bearer " + active["token"]}
     lease = check(client, "checkout", managed, name="contoso").get_json()["leaseToken"]
-    assert row(db)["leaseHolder"] == "client token 'nightly checks'"
+    kept = "\x1f{}.\x1fclient token 'nightly checks'".format(active["id"])  # with its id: store.by_token
+    assert row(db)["leaseHolder"] == kept
     assert check(client, "save", managed, name="contoso", state=STATE, leaseToken=lease).status_code == 200
-    assert row(db)["savedBy"] == "client token 'nightly checks'"
+    assert row(db)["savedBy"] == kept
+    assert store.list_signins()["signins"][0]["savedBy"] == "client token 'nightly checks'"
     assert run(db, "SELECT name FROM accessTokens WHERE lastUsedAt IS NOT NULL") == [("nightly checks",)]
 
 

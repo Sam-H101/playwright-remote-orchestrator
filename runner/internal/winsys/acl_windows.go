@@ -429,12 +429,17 @@ func ReadTokenFile(path string) (string, bool, error) {
 
 // EnablePrivileges turns on SeTakeOwnershipPrivilege and SeRestorePrivilege for this process.
 func EnablePrivileges() error {
+	return enablePrivileges("SeTakeOwnershipPrivilege", "SeRestorePrivilege")
+}
+
+// enablePrivileges turns on privileges this process's account holds; it fails on one the account lacks.
+func enablePrivileges(names ...string) error {
 	var token windows.Token
 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &token); err != nil {
 		return err
 	}
 	defer token.Close()
-	for _, name := range []string{"SeTakeOwnershipPrivilege", "SeRestorePrivilege"} {
+	for _, name := range names {
 		var luid windows.LUID
 		n, _ := windows.UTF16PtrFromString(name)
 		if err := windows.LookupPrivilegeValue(nil, n, &luid); err != nil {

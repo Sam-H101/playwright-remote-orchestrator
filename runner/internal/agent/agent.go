@@ -4,7 +4,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -37,10 +40,9 @@ func New(s config.Settings, version string, log *logging.Logger) *Agent {
 	log.Redact(s.Token.Value())
 	a := &Agent{s: s, version: version, pwVersion: config.PlaywrightVersion(s.PlaywrightCLI), log: log}
 	a.writer = status.NewWriter(s.StatusFile, log)
-	env := childEnv(s)
 	for i := 1; i <= s.Slots; i++ {
 		a.slots = append(a.slots, slot.New(slot.Options{
-			Index: i, Port: s.BasePort + i - 1, NodeExe: s.NodeExe, CLI: s.PlaywrightCLI, Env: env, LogDir: s.LogDir,
+			Index: i, Port: s.BasePort + i - 1, NodeExe: s.NodeExe, CLI: s.PlaywrightCLI, Env: childEnv(s, i), Prepare: runServerAs(s, i), LogDir: s.LogDir,
 			Timings: s.Timings, Logger: log,
 			OnHealth: func(int, bool) { a.changed(true) },
 			OnChange: func() { a.changed(false) },
@@ -60,19 +62,21 @@ func New(s config.Settings, version string, log *logging.Logger) *Agent {
 	})
 	a.sessions = session.NewManager(session.Options{
 		HubURL: s.Hub, Token: s.Token, Timings: s.Timings, Logger: log,
-		SlotPort: func(i int) (int, bool) {
-			if i < 1 || i > s.Slots {
-				return 0, false
+		Slot: func(i int) (int, string, bool) {
+			if i < 1 || i > len(a.slots) {
+				return 0, "", false
 			}
-			return s.BasePort + i - 1, true
+			return s.BasePort + i - 1, a.slots[i-1].Path(), true
 		},
 		Report: a.hub.SendOpenFailed,
 	})
 	return a
 }
 
-// childEnv is the run-servers' environment: the allow-list of decision 14 plus the watchdog preload.
-func childEnv(s config.Settings) []string {
+// childEnv is slot i's run-server environment: the allow-list of decision 14 plus the watchdog preload. The
+// agent token is never in it, so a check's browser can't read it from its own environment. With RunAs (Unix)
+// the slot user's HOME, USER and LOGNAME replace the agent's. The slot adds its endpoint path at each start.
+func childEnv(s config.Settings, i int) []string {
 	environ := os.Environ()
 	orig := proc.LookupEnv(environ, "NODE_OPTIONS")
 	nodeOptions, stash := slot.NodeOptions(orig, s.Watchdog)
@@ -88,7 +92,77 @@ func childEnv(s config.Settings) []string {
 		// The watchdog restores NODE_OPTIONS from the stash only when the stash variable exists.
 		env = append(env, "GATEWAY_AGENT_NODE_OPTIONS=")
 	}
+	if u, ok := slotUser(s, i); ok {
+		env = proc.ForUser(env, []string{"HOME=" + u.Home, "USER=" + u.Name, "LOGNAME=" + u.Name})
+	}
 	return env
+}
+
+func slotUser(s config.Settings, i int) (config.RunAs, bool) {
+	if i < 1 || i > len(s.RunAs) {
+		return config.RunAs{}, false
+	}
+	return s.RunAs[i-1], true
+}
+
+// runServerAs is how slot i's run-server is started as another account than the agent's, or nil to start it
+// as the agent's own. With launchers, a slot without one is never started (as the agent's account, or
+// another slot's).
+func runServerAs(s config.Settings, i int) func(*exec.Cmd) error {
+	switch {
+	case s.Launchers != nil:
+		if i < 1 || i > len(s.Launchers) || s.Launchers[i-1].Prepare == nil {
+			return func(*exec.Cmd) error {
+				return fmt.Errorf("slot %d has no browser account, and run-server is not started as the service's account", i)
+			}
+		}
+		return s.Launchers[i-1].Prepare
+	case s.RunAs != nil:
+		u, ok := slotUser(s, i)
+		if !ok {
+			return func(*exec.Cmd) error { return fmt.Errorf("slot %d has no run-server user", i) }
+		}
+		return func(cmd *exec.Cmd) error { return proc.SetUser(cmd, u.UID, u.GID) }
+	}
+	return nil
+}
+
+// runAsSummary says who runs the run-servers, for the startup log: "pwuser (uid 1001)" when one user runs
+// every slot, else "pwuser1 (uid 1001) in slot 1, pwuser2 (uid 1002) in slot 2, ...".
+func runAsSummary(s config.Settings) string {
+	names := make([]string, s.Slots)
+	for i := 1; i <= s.Slots; i++ {
+		switch {
+		case s.Launchers != nil:
+			if i <= len(s.Launchers) {
+				names[i-1] = s.Launchers[i-1].Account
+			}
+			if names[i-1] == "" {
+				names[i-1] = "nobody (no browser account, so not started)"
+			}
+		default:
+			u, _ := slotUser(s, i)
+			names[i-1] = fmt.Sprintf("%s (uid %d)", u.Name, u.UID)
+		}
+	}
+	if sharedUser(names) {
+		return names[0]
+	}
+	parts := make([]string, len(names))
+	for i, n := range names {
+		parts[i] = fmt.Sprintf("%s in slot %d", n, i+1)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// sharedUser reports whether every slot runs as the same user.
+func sharedUser(names []string) bool {
+	for _, n := range names {
+		if n != names[0] {
+			return false
+		}
+	}
+	return len(names) > 0
 }
 
 func (a *Agent) register() protocol.Register {
@@ -155,6 +229,24 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.log.Infof("playwright %s, run-servers on 127.0.0.1:%d-%d", a.pwVersion, s.BasePort, s.BasePort+s.Slots-1)
 	if s.Token == "" {
 		a.log.Warnf("no GATEWAY_AGENT_TOKEN set; the hub will reject this agent if it requires one")
+	}
+	switch {
+	case s.Launchers != nil:
+		a.log.Infof("run-servers run as %s, not as the service's account", runAsSummary(s))
+	case s.RunAs != nil:
+		a.log.Infof("run-servers run as %s, not as the agent's user", runAsSummary(s))
+		if s.Slots > 1 && s.RunAs[0].UID == s.RunAs[len(s.RunAs)-1].UID {
+			// config allows one user for every slot (a name without {slot}) or one per slot, never a mix.
+			name := s.RunAs[0].Name
+			a.log.Warnf("slots 1-%d all run as %s: a check can read the browser profiles (cookies, storage) of checks running at the same time "+
+				"in the other slots; give each slot its own user with RUN_SERVER_USER=%s{slot} (see the README)", s.Slots, name, name)
+		}
+	case goruntime.GOOS != "windows":
+		a.log.Warnf("run-servers run as the agent's own user, so a check's browser can read the agent token from /proc: " +
+			"start the agent as root with RUN_SERVER_USER set to another user (see the README)")
+	default:
+		a.log.Warnf("run-servers run as this console's user, so a check's browser can read any file that user can, a token file included: " +
+			"install the service (pwrunner install), which runs the browsers as an account of their own")
 	}
 
 	slotCtx, stopSlots := context.WithCancel(context.Background())

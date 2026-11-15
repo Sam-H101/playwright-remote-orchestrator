@@ -329,8 +329,10 @@ def cannot_decrypt(error):
 
 @app.errorhandler(store.NotShared)
 def not_shared(error):
-    # A check asked by name for an MFA secret or a sign-in someone else has: names are shared by everyone on the
-    # grid, so saying so tells nothing that "the name is taken" doesn't, and the check's author learns why.
+    # A check that may start saved sign-ins under new names checked out one someone else has and hasn't shared:
+    # it would have started the name were it free, so it knows the name is taken whatever it is told, and its
+    # author learns why. That is the one place a check can tell an item it may not use from a missing one. Every
+    # other check route answers those two alike (_no_signin, _no_secret_called).
     return _private(jsonify(error=str(error), not_shared=True), 403)
 
 
@@ -1108,10 +1110,11 @@ def admin_users():
 @_people_gate("users.view")
 def admin_user(user_id):
     """One person: what they may do and why, their sessions, what they own, and with audit.view what they did and
-    what was done to them."""
+    what was done to them. The names of MFA secrets, saved sign-ins and tokens the viewer may not see are left
+    out of both."""
     session_id = (g.get("signed_in_user") or {}).get("session_id")
     return _user_answer(user_id, accounts.user_detail(user_id, g.actor, auth.can(g.principal, "audit.view"),
-                                                      session_id))
+                                                      session_id, auth.access(g.principal)))
 
 
 @app.post("/api/admin/users/<int:user_id>/roles/add")
@@ -1257,13 +1260,14 @@ def _audit_target():
 @_people_gate("audit.view")
 def admin_audit():
     """The audit log, newest first: ?before=<id> (next of the page before), ?limit= (1 to 200),
-    ?actor=<user id>|token|checks, ?category= and ?target=<kind>:<id>."""
+    ?actor=<user id>|token|checks, ?category= and ?target=<kind>:<id>. audit.view brings no MFA secret, saved
+    sign-in or token with it: the names of those the viewer may not see are left out."""
     category = request.args.get("category") or None
     if category is not None and category not in accounts.AUDIT_CATEGORIES:
         raise accounts.InvalidRequest("category is one of {}.".format(", ".join(accounts.AUDIT_CATEGORIES)))
     return _private(jsonify(accounts.audit_log(_arg_int("before", None, 1, store._MAX_TOKEN_ID),
                                                _arg_int("limit", 50, 1, accounts.AUDIT_LIMIT), _audit_actor(),
-                                               category, _audit_target())))
+                                               category, _audit_target(), auth.access(g.principal))))
 
 
 @app.get("/api/admin/sign-in")
@@ -1310,6 +1314,12 @@ def mfa_busy(error):
     response = jsonify(error=str(error), retry_after_s=round(error.retry_after_s, 1))
     response.headers["Retry-After"] = str(max(1, int(error.retry_after_s + 0.999)))
     return _private(response, 429)
+
+
+def _by(principal):
+    """Who took a code or used a sign-in, as the store keeps it: a managed client token's name with its id, so that
+    only those who may see that token are shown its name (store.by_token)."""
+    return store.by_token(principal.name, principal.token_id, principal.user_id)
 
 
 @app.get("/api/mfa")
@@ -1370,11 +1380,17 @@ def peek_mfa_code(entry_id):
 @auth.permission_required("mfa.use", refuse_when_unconfigured=True)
 def use_mfa_code(entry_id):
     """A code for someone to type somewhere, handed out like a check's so no check gets the same one."""
-    code = store.issue_mfa_code(g.principal.name if g.principal else "Admin", secret_id=entry_id, label="Grid UI",
+    code = store.issue_mfa_code(_by(g.principal) if g.principal else "Admin", secret_id=entry_id, label="Grid UI",
                                 access=auth.access(g.principal), actor=g.actor)
     if code is None:
         return _no_secret(entry_id)
     return _private(jsonify(code))
+
+
+def _no_secret_called(name):
+    # The same for a secret that isn't there and one the token's owner may not use.
+    return _private(jsonify(error="There is no MFA secret called {!r} that this client token's owner may use."
+                                  .format(name.strip())), 404)
 
 
 @app.post(CHECK_CODE_PATH)
@@ -1382,8 +1398,9 @@ def check_mfa_code():
     """A code for a check, which sends its client token and {"name", "label"?, "minValidS"?}.
 
     The answer's waitS is how long to wait before typing the code (when it comes from the next window)
-    and validForS how long it works from now. A secret the token's owner may not use is refused with
-    not_shared."""
+    and validForS how long it works from now. A secret the token's owner may not use is answered exactly as
+    one that isn't there: a check can't add a secret, so a different answer would tell it which names
+    someone else keeps."""
     principal = auth.check_principal(accounts.client_token_access, "mfa.use", "mfa.use")
     body = request.get_json(silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("name"), str) or not body["name"].strip():
@@ -1391,10 +1408,10 @@ def check_mfa_code():
     min_valid = body.get("minValidS")
     if min_valid is not None and (isinstance(min_valid, bool) or not isinstance(min_valid, (int, float)) or min_valid < 0):
         return _private(jsonify(error="minValidS is a number of seconds, 0 or more."), 400)
-    code = store.issue_mfa_code(principal.name, name=body["name"].strip(), label=body.get("label"),
+    code = store.issue_mfa_code(_by(principal), name=body["name"].strip(), label=body.get("label"),
                                 min_valid_s=min_valid, access=auth.access(principal))
     if code is None:
-        return _private(jsonify(error="There is no MFA secret called {!r}.".format(body["name"].strip())), 404)
+        return _no_secret_called(body["name"])
     return _private(jsonify(code))
 
 
@@ -1460,7 +1477,9 @@ def _check_signin_request():
 
 
 def _no_signin(name):
-    return _private(jsonify(error="There is no saved sign-in called {!r}.".format(name.strip())), 404)
+    # The same for a sign-in that isn't there and one the token's owner may not use.
+    return _private(jsonify(error="There is no saved sign-in called {!r} that this client token's owner may use."
+                                  .format(name.strip())), 404)
 
 
 @app.get("/api/signins")
@@ -1502,18 +1521,23 @@ def checkout_signin():
     """A check's saved sign-in, or its turn to sign in. It sends its client token and {"name",
     "rejectedVersion"?, "id"?, "leaseS"?}; the answer's status is "saved" (with the state), "sign-in" (with a
     lease token) or "wait" (with retryAfterS). rejectedVersion is the version of a state the site refused,
-    and id the id it came with. A sign-in the token's owner may not use is refused with not_shared, and one
-    shared with them that has nothing usable saved with owner_signs_in: only its owner's checks sign in for it.
-    A name nobody added is refused with out_of_scope when the token's scope leaves out adding sign-ins."""
+    and id the id it came with. A sign-in shared with the token's owner that has nothing usable saved is
+    refused with owner_signs_in: only its owner's checks sign in for it.
+
+    A check that may not start sign-ins under new names is answered alike for a name nobody added and for one
+    its token's owner may not use: 404, or out_of_scope when the token's scope leaves out adding sign-ins. One
+    that may start them gets not_shared for a name someone else has and hasn't shared: it would have started
+    the name were it free, so it knows the name is taken whatever it is told (store.NotShared)."""
     principal, body = _check_signin_request()
-    answer = store.checkout_signin(principal.name, body.get("name"), body.get("rejectedVersion"), body.get("leaseS"),
+    answer = store.checkout_signin(_by(principal), body.get("name"), body.get("rejectedVersion"), body.get("leaseS"),
                                    body.get("id"), access=auth.access(principal), actor=auth.actor(principal),
                                    may_add=auth.in_scope(principal, "signins.add"))
-    if answer["status"] == "missing":  # a name nobody added, and this check may not add names
+    if answer["status"] == "missing":  # nobody added it, or it isn't this check's to use, and it may not add names
         if not auth.in_scope(principal, "signins.add"):
             return _private(auth.out_of_scope("signins.add", (
-                "There is no saved sign-in called {!r}, and this client token's scope doesn't include "
-                "“Add saved sign-ins”, so it can't start one.").format(body["name"].strip())), 403)
+                "There is no saved sign-in called {!r} that this client token's owner may use, and this client "
+                "token's scope doesn't include “Add saved sign-ins”, so it can't start one.")
+                .format(body["name"].strip())), 403)
         return _no_signin(body["name"])
     if answer["status"] == "owner-signs-in":
         return _private(jsonify(error="Nothing usable is saved for {!r}, and only its owner's checks may sign in for "
@@ -1527,9 +1551,10 @@ def save_signin():
     """The state a check is signed in with: {"name", "state", "maxAgeS"?} and either the "leaseToken" of the
     sign-in it just made or the "baseVersion" and "id" of the state it reused (cookies roll over). Only the
     checks of a sign-in's stewards save a reused state again: anyone else's is answered with the reason
-    "shared"."""
+    "shared". A sign-in the token's owner may not use is answered as one that isn't there: saving never
+    starts a name."""
     principal, body = _check_signin_request()
-    answer = store.save_signin(principal.name, body.get("name"), body.get("state"), body.get("leaseToken"),
+    answer = store.save_signin(_by(principal), body.get("name"), body.get("state"), body.get("leaseToken"),
                                body.get("baseVersion"), body.get("maxAgeS"), body.get("id"),
                                access=auth.access(principal))
     if answer is None:
@@ -1539,7 +1564,9 @@ def save_signin():
 
 @app.post(CHECK_RELEASE_PATH)
 def release_signin():
-    """{"name", "leaseToken"}: the lease of a sign-in that failed, so the next check signs in at once."""
+    """{"name", "leaseToken"}: the lease of a sign-in that failed, so the next check signs in at once. A
+    sign-in the token's owner may not use is answered as one that isn't there, unless the token holds its
+    lease."""
     principal, body = _check_signin_request()
     released = store.release_signin(body.get("name"), body.get("leaseToken"), access=auth.access(principal))
     if released is None:

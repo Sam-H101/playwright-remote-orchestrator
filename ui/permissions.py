@@ -47,7 +47,9 @@ PERMISSIONS = collections.OrderedDict([
                       "Disable and enable users, end their sessions, revoke their tokens, give and take roles, "
                       "make, change and delete custom roles and map groups, but only with permissions they have "
                       "themselves.")),
-    ("audit.view", ("People", "Read the audit log", "Read every recorded change.")),
+    ("audit.view", ("People", "Read the audit log",
+                    "Read every recorded change. The names of MFA secrets, saved sign-ins and tokens show only to "
+                    "those who may see them.")),
 ])
 # What holding a permission brings with it. expand() follows these all the way down.
 IMPLIES = {

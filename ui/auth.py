@@ -30,9 +30,10 @@ from . import oidc, permissions, store
 # nothing about permissions vouches for an admin, as every principal was before roles existed. scope: a client
 # token's scope (None: no limit; people and the bootstrap token have none). It is kept apart from permissions on
 # purpose: what a token reaches is judged by its owner's permissions, and a smaller set there would reach more
-# shared sign-ins, not fewer.
-Principal = namedtuple("Principal", "name method user_id permissions role_ids email scope",
-                       defaults=(None, permissions.ALL, (), None, None))
+# shared sign-ins, not fewer. token_id: a managed client token's accessTokens.id (None for anyone else), so what it
+# takes or saves records which token it was (store.by_token).
+Principal = namedtuple("Principal", "name method user_id permissions role_ids email scope token_id",
+                       defaults=(None, permissions.ALL, (), None, None, None))
 
 # What anyone but an admin is told about single sign-on that can't work as configured: the problem itself may
 # name a file path, so it goes to the log, the admin token and people who may see the settings (users.view).
@@ -413,7 +414,7 @@ def _token_principal(lookup):
         abort(make_response(jsonify(error="The client token is wrong, revoked or expired.", client_token_required=True), 401))
     name = "client token '{}'".format(found["name"])
     if found["ownerId"] is None:
-        return Principal(name, "client-token", scope=found["scope"])
+        return Principal(name, "client-token", scope=found["scope"], token_id=found["id"])
     owner = found["owner"]
     if owner is None:
         _owner_refused("This client token belongs to a person this grid no longer knows, so it gets nothing from the "
@@ -422,7 +423,8 @@ def _token_principal(lookup):
         _owner_refused("This client token belongs to {}, whose account is disabled, so it gets nothing from the Grid "
                        "UI. An admin can enable them, or revoke the token.".format(owner["name"]))
     return principal_for_user(owner, "client-token",
-                              name="{} ({})".format(name, owner["name"])[:255])._replace(scope=found["scope"])
+                              name="{} ({})".format(name, owner["name"])[:255])._replace(scope=found["scope"],
+                                                                                          token_id=found["id"])
 
 
 def in_scope(principal, scope):

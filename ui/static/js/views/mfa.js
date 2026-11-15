@@ -35,6 +35,14 @@ function codeMarkup(code) {
 }
 
 const settings = (s) => s.digits + " digits · " + s.period + " s · " + s.algorithm;
+// Who took a code or used a sign-in (s[key]), as text; none when nobody did. The server leaves out the name of a
+// client token the viewer may not see (s[key + "Hidden"]), and says whose token it is when it can (s[key + "Owner"]).
+function byText(s, key, none) {
+  if (s[key + "Hidden"]) return s[key + "Owner"] ? "a client token of " + s[key + "Owner"] : "another person's client token";
+  return s[key] || none;
+}
+// The same as markup, a token's name left out set apart from names.
+const byMarkup = (s, key, none) => (s[key + "Hidden"] ? html`<span class="by-hidden dim">${byText(s, key, none)}</span>` : byText(s, key, none));
 const who = (s) => [s.issuer, s.account].filter(Boolean).join(" · ");
 // Whose rows the page lists: the person's own, those shared with them, or (with mfa.all or signins.all)
 // everyone's. Each row's access says why they see it.
@@ -376,7 +384,7 @@ export function createMfa(section) {
 
   function lastCell(s) {
     if (!s.lastIssuedAt) return html`<span class="dim">Never</span>`;
-    return html`<span><span data-ago="${s.lastIssuedAt}"></span> <span class="dim">to</span> <span class="issued-to">${s.lastIssuedTo || "–"}</span></span>`;
+    return html`<span><span data-ago="${s.lastIssuedAt}"></span> <span class="dim">to</span> <span class="issued-to">${byMarkup(s, "lastIssuedTo", "–")}</span></span>`;
   }
 
   function secretRow(s) {
@@ -395,7 +403,7 @@ export function createMfa(section) {
     return html`<tr data-key="${i.id}">
       <td class="cell-when" title="${fullDate(parseTime(i.issuedAt))}"><span data-ago="${i.issuedAt}"></span></td>
       <td class="cell-secret" data-label="Secret"><code class="mono">${i.name}</code></td>
-      <td class="cell-to" data-label="Handed to">${i.issuedTo}</td>
+      <td class="cell-to" data-label="Handed to">${byMarkup(i, "issuedTo", "–")}</td>
       <td class="cell-label" data-label="Label">${i.label ? i.label : html`<span class="dim">–</span>`}</td></tr>`;
   }
 
@@ -493,9 +501,9 @@ export function createMfa(section) {
   function savedCell(s) {
     if (leased(s)) {
       return html`<div class="stack"><span class="tag live"><span class="spinner" aria-hidden="true"></span>Signing in now</span>
-        <small><span class="who">${s.leaseHolder || "A check"}</span> · <span data-lease-left="${s.id}" role="timer"></span></small></div>`;
+        <small><span class="who">${byMarkup(s, "leaseHolder", "A check")}</span> ·<span data-lease-left="${s.id}" role="timer"></span></small></div>`;
     }
-    const by = html`<span class="dim">by</span> <span class="who">${s.savedBy || "–"}</span>`;
+    const by = html`<span class="dim">by</span> <span class="who">${byMarkup(s, "savedBy", "–")}</span>`;
     if (s.saved && s.expired) return html`<div class="stack"><span class="tag note">Expired</span><small>Saved <span data-ago="${s.savedAt}"></span> ${by}</small></div>`;
     if (s.saved) {
       return html`<div class="stack"><span><span data-ago="${s.savedAt}"></span> ${by}</span>
@@ -514,7 +522,7 @@ export function createMfa(section) {
         ? html`<span data-until="${s.expiresAt}"></span>` : html`<span class="dim">–</span>`}</td>
       <td class="cell-runs" data-label="Runs" title="${s.lastUsedAt ? "Last reused " + fullDate(parseTime(s.lastUsedAt)) : ""}"><div class="stack">
         <span class="count">Reused ${plural(s.useCount, "time")}</span>
-        ${s.lastUsedAt ? html`<small>Last <span data-ago="${s.lastUsedAt}"></span> by <span class="who">${s.lastUsedBy || "–"}</span></small>` : ""}
+        ${s.lastUsedAt ? html`<small>Last <span data-ago="${s.lastUsedAt}"></span> by <span class="who">${byMarkup(s, "lastUsedBy", "–")}</span></small>` : ""}
         <small>Signed in ${plural(s.signInCount, "time")} · refreshed ${s.refreshCount}</small></div></td>
       <td class="cell-asked" data-label="Asked again" title="${fullDate(parseTime(s.lastRejectedAt))}">${s.rejectedCount
         ? html`<div class="stack"><span class="count">${plural(s.rejectedCount, "time")}</span><small>Last <span data-ago="${s.lastRejectedAt}"></span></small></div>`
@@ -583,7 +591,7 @@ export function createMfa(section) {
   function signinFacts(s) {
     const facts = [["Domains", s.domains.join(", ") || "–"],
       ["Runs", "Reused " + plural(s.useCount, "time") + " · signed in " + plural(s.signInCount, "time")]];
-    if (leased(s)) facts.push(["Signing in", s.leaseHolder || "A check"]);
+    if (leased(s)) facts.push(["Signing in", byText(s, "leaseHolder", "A check")]);
     return facts;
   }
 

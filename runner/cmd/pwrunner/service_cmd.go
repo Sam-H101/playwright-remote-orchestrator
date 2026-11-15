@@ -69,6 +69,18 @@ func serviceCmd(args []string) error {
 	if ev != nil {
 		defer ev.Close()
 	}
+	// The service is LocalSystem, and a check's browser can read any file its account can: each slot's
+	// run-server and browsers start as that slot's browser account instead, so a check can't read the agent
+	// token or the browser profiles of checks in other slots either. A slot without an account is not started.
+	var browsers []*winsys.BrowserLauncher
+	if asService && startErr == nil {
+		for i := 1; i <= s.Slots; i++ {
+			l := winsys.NewBrowserLauncher(b.SlotAccount(i), i)
+			defer l.Close()
+			browsers = append(browsers, l)
+			s.Launchers = append(s.Launchers, config.Launcher{Account: b.SlotAccount(i), Prepare: l.Prepare})
+		}
+	}
 
 	os.Remove(filepath.Join(dir, "pwrunner.old.exe"))
 	if job, err := winsys.NewKillOnCloseJob(); err == nil {
@@ -91,6 +103,17 @@ func serviceCmd(args []string) error {
 			return &service.ExitCodeError{Code: 2, Err: startErr}
 		}
 		slog.Infof("service starting: pwrunner %s, node %s, %d slots, hub %s", version, s.Name, s.Slots, s.Hub)
+		// The agent still connects and reports such a slot unhealthy, and the slot retries, so the node shows up
+		// as broken rather than missing.
+		for i, l := range browsers {
+			if err := l.Open(); err != nil {
+				slog.Errorf("slot %d: run-server can't start: %v", i+1, err)
+				log.Errorf("slot %d: run-server can't start: %v", i+1, err)
+				if ev != nil {
+					ev.Error(5, fmt.Sprintf("pwrunner can't start the run-server of slot %d: %v", i+1, err))
+				}
+			}
+		}
 		a := agent.New(s, version, log)
 		if ev != nil && asService {
 			ev.Info(1, fmt.Sprintf("pwrunner %s started: node %s, %d slots, hub %s", version, s.Name, s.Slots, s.Hub))

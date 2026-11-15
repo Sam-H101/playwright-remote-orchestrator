@@ -1587,18 +1587,18 @@ def test_a_check_acts_as_the_owner_of_its_client_token(db, monkeypatch):
     oidc_on(monkeypatch)
     monkeypatch.setenv("GATEWAY_CLIENT_TOKEN", "b" * auth.MIN_BOOTSTRAP_TOKEN_LENGTH)
     dana = make_user(db, "Dana Lee", roles=[permissions.TESTER], email="dana@example.com")
-    _, legacy = add_client_token(db, "legacy")
-    _, danas = add_client_token(db, "dana-ci", owner=dana)
+    legacy_id, legacy = add_client_token(db, "legacy")
+    danas_id, danas = add_client_token(db, "dana-ci", owner=dana)
 
     def principal(token):
         with grid_app.app.test_request_context(headers={"Authorization": "Bearer " + token}):
             return auth.check_principal(accounts.client_token_access, "grid.view")
 
     assert principal("b" * auth.MIN_BOOTSTRAP_TOKEN_LENGTH) == auth.Principal("GATEWAY_CLIENT_TOKEN", "client-bootstrap")
-    assert principal(legacy) == auth.Principal("client token 'legacy'", "client-token")
+    assert principal(legacy) == auth.Principal("client token 'legacy'", "client-token", token_id=legacy_id)
     assert auth.is_admin(principal(legacy))
     assert principal(danas) == auth.Principal("client token 'dana-ci' (Dana Lee)", "client-token", dana, TESTER,
-                                              (permissions.TESTER,), "dana@example.com")
+                                              (permissions.TESTER,), "dana@example.com", token_id=danas_id)
     run(db, "UPDATE userRoles SET roleId = ? WHERE userId = ?", (permissions.VIEWER, dana))
     assert principal(danas).permissions == {"grid.view"}  # at each use: a demotion counts at once
 
@@ -2004,8 +2004,9 @@ def test_one_persons_sheet(admin):
                         {"id": "mfa.add", "via": [permissions.TESTER, a.qa]},
                         {"id": "signins.use", "via": [permissions.TESTER, a.qa]},
                         {"id": "signins.add", "via": [permissions.TESTER, a.qa]}],
-        "sessions": [], "owns": {"mfa": [{"id": a.secret, "name": "intranet"}], "signins": [],
-                                 "tokens": [{"id": a.token, "name": "dana-ci", "kind": "client", "status": "active"}]},
+        "sessions": [], "owns": {"mfa": [{"id": a.secret, "name": "intranet", "hidden": False}], "signins": [],
+                                 "tokens": [{"id": a.token, "name": "dana-ci", "hidden": False, "kind": "client",
+                                             "status": "active"}]},
         "history": [], "canManage": True, "cannotManage": None}
     # Their own: the session this browser is, and why they can't change their own access.
     mine = ok(a.grid.get("/api/admin/users/{}".format(a.robin)))
@@ -2029,6 +2030,10 @@ def test_one_persons_sheet(admin):
     assert "history" not in seen
     assert (seen["canManage"], seen["cannotManage"], seen["user"]["canManage"]) == (
         False, "Your roles don't include “Manage people and roles”.", False)
+    # How many she has of each, never what they are called: Vera may see none of them.
+    assert seen["owns"] == {"mfa": [{"id": a.secret, "name": None, "hidden": True}], "signins": [],
+                            "tokens": [{"id": a.token, "name": None, "hidden": True, "kind": "client",
+                                        "status": "active"}]}
     assert ok(a.grid.get("/api/admin/users/999"), 404) == {"error": "There is no user 999."}
 
 
@@ -2290,6 +2295,8 @@ def test_the_audit_log(admin):
                  "targetId": a.secret, "targetName": "intranet",
                  "details": {"text": '{"grantee":{"kind":"user","na'}},
     }
+    for entry in entries.values():
+        entry.update(targetHidden=False, actorHidden=False)  # Robin may see everything
     assert ok(a.grid.get("/api/admin/audit")) == {
         "ready": True, "entries": [entries[i] for i in (fourth, third, second, first)], "next": None, "keptDays": 365}
     # Newest first, a page at a time: the next page starts below the last id shown.
@@ -2319,6 +2326,71 @@ def test_the_audit_log(admin):
                          ("target=people:3", "target is <kind>:<id>, the kind one of user, role, group, token, mfa, "
                                              "signin, slot, node.")]:
         assert ok(a.grid.get("/api/admin/audit?" + query), 400) == {"error": error}
+
+
+def test_the_audit_log_names_only_the_items_its_reader_may_see(admin):
+    """Reading the audit log, or seeing people, brings no MFA secret, saved sign-in or token with it: their names
+    are private to whoever they are shared with. An entry about one the reader may not see keeps its action, time
+    and id, and loses its name, in the log and in a person's history alike; one that is gone is no one's to see but
+    whoever may see every one of its kind. An entry its reader made keeps its name: they knew it. A check's entry
+    names its token as who made it: to whoever may not see that token, only whose it is."""
+    a = admin
+    dana = store.Actor(a.dana, "Dana Lee", "oidc", "10.0.0.9", TESTER)
+    danas_check = store.Actor(a.dana, "client token 'dana-ci' (Dana Lee)", "client-token", "10.0.0.9", TESTER)
+    robin = store.Actor(a.robin, "Robin Hale", "oidc", "10.0.0.8", permissions.ALL)
+    auditors = add_role(a.path, "Auditors", "users.view audit.view")
+    ada = make_user(a.path, "Ada Audit", [auditors])
+    quinn = make_user(a.path, "Quinn QA", [auditors, a.qa])  # QA: the secret is shared with it
+    rows = [audited(a.path, dana, "mfa.created", ("mfa", a.secret, "intranet")),
+            audited(a.path, dana, "token.created", ("token", a.token, "dana-ci"), {"kind": "client", "owner": a.dana}),
+            audited(a.path, dana, "signin.created", ("signin", 77, "gone-now"), {"owner": a.dana}),
+            audited(a.path, robin, "user.role_added", ("user", a.dana, "Dana Lee"),
+                    {"role": {"id": -2, "name": "Operator"}}),
+            audited(a.path, danas_check, "mfa.code_used", ("mfa", a.secret, "intranet")),
+            audited(a.path, store.Actor(ada, "Ada Audit", "oidc", None, frozenset()), "mfa.code_viewed",
+                    ("mfa", a.secret, "intranet"))]
+
+    def named(entries):
+        return {e["id"]: (e["actorName"], e["actorHidden"], e["targetName"], e["targetHidden"])
+                for e in entries if e["id"] in rows}
+
+    by_check, by_anonymous_check = ("client token 'dana-ci' (Dana Lee)", False), ("client token (Dana Lee)", True)
+    by = [("Dana Lee", False)] * 3 + [("Robin Hale", False), by_check, ("Ada Audit", False)]
+    hidden, shown = (None, True), (lambda name: (name, False))
+    for who, expected in (
+            (ada, [hidden, hidden, hidden, shown("Dana Lee"), hidden, shown("intranet")]),
+            (quinn, [shown("intranet"), hidden, hidden, shown("Dana Lee"), shown("intranet"), shown("intranet")]),
+            (a.robin, [shown("intranet"), shown("dana-ci"), shown("gone-now"), shown("Dana Lee"), shown("intranet"),
+                       shown("intranet")])):
+        client = a.grid if who == a.robin else grid_app.app.test_client()
+        if who != a.robin:
+            sign_in_as(client, who)
+        actors = [by_anonymous_check if actor == by_check and who != a.robin else actor for actor in by]
+        expected = {row: actor + target for row, actor, target in zip(rows, actors, expected)}
+        assert named(ok(client.get("/api/admin/audit"))["entries"]) == expected, who
+        # Narrowed to the item, it is still only its action and time.
+        assert named(ok(client.get("/api/admin/audit?target=mfa:{}".format(a.secret)))["entries"]) == {
+            row: expected[row] for row in (rows[0], rows[4], rows[5])}, who
+        sheet = ok(client.get("/api/admin/users/{}".format(a.dana)))
+        assert named(sheet["history"]) == {row: expected[row] for row in rows[:5]}, who
+        assert [(x["name"], x["hidden"]) for x in sheet["owns"]["mfa"] + sheet["owns"]["tokens"]] == [
+            expected[rows[0]][2:], expected[rows[1]][2:]], who
+    entry = next(e for e in ok(a.grid.get("/api/admin/audit"))["entries"] if e["id"] == rows[0])
+    sign_in_as(a.grid, ada)
+    seen = next(e for e in ok(a.grid.get("/api/admin/audit"))["entries"] if e["id"] == rows[0])
+    assert seen == dict(entry, targetName=None, targetHidden=True)
+
+
+def test_a_persons_sheet_lists_what_they_own_that_the_viewer_may_not_see_last(admin):
+    """Where a nameless item fell among the named ones, in their order by name, would tell its name apart."""
+    a = admin
+    for name in ("alpha", "zulu"):
+        add_item(a.path, "mfa", name, owner=a.dana)  # shared with nobody
+    viewer = grid_app.app.test_client()
+    sign_in_as(viewer, make_user(a.path, "Quinn QA", [add_role(a.path, "People viewers", "users.view"), a.qa]))
+    owned = ok(viewer.get("/api/admin/users/{}".format(a.dana)))["owns"]["mfa"]
+    assert [(x["name"], x["hidden"]) for x in owned] == [("intranet", False), (None, True), (None, True)]
+    assert [x["id"] for x in owned[1:]] == sorted(x["id"] for x in owned[1:])
 
 
 def test_the_single_sign_on_settings(admin, monkeypatch):
@@ -2870,7 +2942,7 @@ def test_a_scope_changes_nothing_in_what_the_store_is_told(db, monkeypatch):
     assert (unscoped.scope, scoped.scope) == (None, {"grid.view"})
     assert scoped.permissions == unscoped.permissions == TESTER | {"audit.view"}
     assert (scoped.role_ids, scoped.user_id, scoped.email) == (unscoped.role_ids, dana, "dana@example.com")
-    assert scoped._replace(scope=None, name=unscoped.name) == unscoped
+    assert scoped._replace(scope=None, name=unscoped.name, token_id=unscoped.token_id) == unscoped
     assert auth.access(scoped) == auth.access(unscoped)
     assert not hasattr(auth.access(scoped), "scope")
     with grid_app.app.test_request_context():
@@ -2881,10 +2953,11 @@ def test_a_scope_changes_nothing_in_what_the_store_is_told(db, monkeypatch):
 
 def test_a_scoped_token_nobody_owns_is_still_an_admin_narrowed_by_its_scope(db, monkeypatch):
     oidc_on(monkeypatch)
-    _, legacy = add_client_token(db, "legacy", scope="mfa.use")
+    legacy_id, legacy = add_client_token(db, "legacy", scope="mfa.use")
     with grid_app.app.test_request_context(headers=bearer(legacy)):
         principal = auth.check_principal(accounts.client_token_access, "mfa.use", "mfa.use")
-    assert principal == auth.Principal("client token 'legacy'", "client-token", scope=frozenset({"mfa.use"}))
+    assert principal == auth.Principal("client token 'legacy'", "client-token", scope=frozenset({"mfa.use"}),
+                                       token_id=legacy_id)
     assert auth.is_admin(principal) and principal.permissions == permissions.ALL
     assert auth.access(principal) == store.Access(None, (permissions.ADMIN,), permissions.ALL)
     assert as_check(legacy, "POST", CODE).status_code == 404

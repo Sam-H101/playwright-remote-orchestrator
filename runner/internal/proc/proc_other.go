@@ -16,7 +16,18 @@ func hide(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
-// KillTree sends SIGTERM to the process group, then SIGKILL after 5 s if it is still there.
+// SetUser makes cmd start as uid/gid with no supplementary groups (an empty list, so the agent's groups
+// are dropped rather than inherited). The agent must run as root.
+func SetUser(cmd *exec.Cmd, uid, gid uint32) error {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{}}
+	return nil
+}
+
+// KillTree sends SIGTERM to the process group, then SIGKILL after 5 s if it is still there. As root it
+// reaches a group that runs as another user (--run-server-user) too.
 func KillTree(pid int) error {
 	target := -pid
 	if pgid, err := syscall.Getpgid(pid); err != nil || pgid != pid {

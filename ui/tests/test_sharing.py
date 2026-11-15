@@ -100,12 +100,23 @@ def signin_row(path, name="prod-admin"):
     ((version, saved, leased, saved_by, refreshes, rejected),) = run(
         path, "SELECT version, stateCipher IS NOT NULL, leaseHash IS NOT NULL, savedBy, refreshCount, rejectedCount "
               "FROM savedSignins WHERE name = ?", (name,))
-    return {"version": version, "saved": bool(saved), "leased": bool(leased), "savedBy": saved_by,
+    return {"version": version, "saved": bool(saved), "leased": bool(leased), "savedBy": store.by_name(saved_by),
             "refreshCount": refreshes, "rejectedCount": rejected}
 
 
 def issued(path):
-    return [to for (to,) in run(path, "SELECT issuedTo FROM mfaIssues ORDER BY id")]
+    """Who each code went to, by name: a client token's is kept with its id (store.by_token), left out here."""
+    return [store.by_name(to) for (to,) in run(path, "SELECT issuedTo FROM mfaIssues ORDER BY id")]
+
+
+def no_secret(name):
+    """A check's answer, with 404, for a secret called name that isn't there or its token's owner may not use."""
+    return {"error": "There is no MFA secret called {!r} that this client token's owner may use.".format(name)}
+
+
+def no_signin(name):
+    """A check's answer, with 404, for a sign-in called name that isn't there or its token's owner may not use."""
+    return {"error": "There is no saved sign-in called {!r} that this client token's owner may use.".format(name)}
 
 
 # ---- the page: who may do what to an item by its id ---------------------------------------------
@@ -224,9 +235,7 @@ def test_a_hidden_secret_that_does_not_decrypt_answers_like_any_hidden_one(peopl
     for r in (carol("GET", "/api/mfa/{}/code".format(secret)), carol("POST", "/api/mfa/{}/use".format(secret))):
         assert (r.status_code, r.get_json()) == (404, {"error": "There is no MFA secret {}.".format(secret)})
     r = check(carols, CODE, name="old-intranet")
-    assert (r.status_code, r.get_json()) == (403, {
-        "error": "The MFA secret 'old-intranet' belongs to someone else and isn't shared with this client token's "
-                 "owner.", "not_shared": True})
+    assert (r.status_code, r.get_json()) == (404, no_secret("old-intranet"))
     # It really doesn't decrypt: its owner is told so.
     assert caller(people.bob)("GET", "/api/mfa/{}/code".format(secret)).get_json()["cannot_decrypt"] is True
     assert run(people.path, "SELECT issuedCount FROM mfaSecrets") == [(0,)]
@@ -525,10 +534,16 @@ def test_a_sign_in_shared_with_a_role_an_admin_also_has_never_reaches_the_admins
     assert bob("POST", path, {"role": permissions.TESTER}).status_code == 200
     assert run(people.path, "SELECT vouchedFor FROM itemShares") == [(None,), (None,)]
     for token in (robins, BOOTSTRAP):
-        for route, body in ((CHECKOUT, {}), (SAVE, {"state": NEWER, "baseVersion": 1, "id": lease["id"]}),
+        # Its checks may start sign-ins, so a checkout would have started a free name: that it is taken, they are
+        # told. Saving and releasing never start one: to those it isn't there.
+        r = check(token, CHECKOUT, name="prod-admin")
+        assert (r.status_code, r.get_json()["not_shared"]) == (403, True)
+        for route, body in ((SAVE, {"state": NEWER, "baseVersion": 1, "id": lease["id"]}),
                             (RELEASE, {"leaseToken": "x"})):
             r = check(token, route, name="prod-admin", **body)
-            assert (r.status_code, r.get_json()["not_shared"]) == (403, True), route
+            assert (r.status_code, r.get_json()) == (404, no_signin("prod-admin")), route
+            r = check(token, route, name="no-such-sign-in", **body)
+            assert (r.status_code, r.get_json()) == (404, no_signin("no-such-sign-in")), route
     assert check(carols, CHECKOUT, name="prod-admin").get_json()["state"] == STATE
     (row,) = caller(people.robin)("GET", "/api/signins").get_json()["signins"]
     assert (row["access"], row["usable"]) == ("shared", False)
@@ -701,7 +716,7 @@ def test_a_check_that_stops_being_a_steward_while_it_signs_in_saves_nothing(peop
 @pytest.mark.parametrize("ends", ["save", "release"])
 def test_a_check_that_may_no_longer_use_a_sign_in_still_ends_its_lease(people, ends):
     """The same with the admins' sign-in shared with nobody: once the role loses that permission, Sid's check may
-    not use it at all. Its save is refused as anyone's it isn't shared with, and its release is still taken:
+    not use it at all. Its save is answered as if the sign-in weren't there, and its release is still taken:
     either way its lease ends, so Robin's check signs in at once."""
     managers = add_role(people.path, "Sign-in managers", "grid.view tokens.own signins.all")
     sid = make_user(people.path, "Sid Park", [permissions.TESTER, managers])
@@ -714,16 +729,16 @@ def test_a_check_that_may_no_longer_use_a_sign_in_still_ends_its_lease(people, e
                                 {"permissions": ["grid.view", "tokens.own"]}).status_code == 200
     if ends == "save":
         r = check(sids, SAVE, name="plain-admin", state=NEWER, leaseToken=lease["leaseToken"])
-        assert (r.status_code, r.get_json()["not_shared"]) == (403, True)
+        assert (r.status_code, r.get_json()) == (404, no_signin("plain-admin"))
     else:
         r = check(sids, RELEASE, name="plain-admin", leaseToken=lease["leaseToken"])
         assert (r.status_code, r.get_json()) == (200, {"released": True})
     assert signin_row(people.path, "plain-admin") == {"version": 0, "saved": False, "leased": False, "savedBy": None,
                                                       "refreshCount": 0, "rejectedCount": 0}
     assert check(robins, CHECKOUT, name="plain-admin").get_json()["status"] == "sign-in"
-    # A lease it no longer holds is anyone's it isn't shared with.
+    # Holding no lease of it any more, it is told the sign-in isn't there.
     r = check(sids, RELEASE, name="plain-admin", leaseToken=lease["leaseToken"])
-    assert (r.status_code, r.get_json()["not_shared"]) == (403, True)
+    assert (r.status_code, r.get_json()) == (404, no_signin("plain-admin"))
 
 
 def statements(monkeypatch, ask):
@@ -781,7 +796,7 @@ def test_a_sign_in_given_to_someone_else_loses_its_shares_and_any_sign_in_under_
     assert (given["leaseHolder"], given["usable"], "warning" in given) == (None, False, False)
     assert run(people.path, "SELECT COUNT(*) FROM itemShares") == [(0,)]
     r = check(bobs, SAVE, name="prod-admin", state=STATE, leaseToken=lease["leaseToken"])
-    assert (r.status_code, r.get_json()["not_shared"]) == (403, True)  # it isn't his any more
+    assert (r.status_code, r.get_json()) == (404, no_signin("prod-admin"))  # it isn't his any more
     assert check(danas, CHECKOUT, name="prod-admin").get_json()["status"] == "sign-in"
     # Shared back with him, his check still can't save what it signed in with: its lease went with the sign-in.
     caller(people.dana)("POST", "/api/signins/{}/shares/add".format(signin), {"user": people.bob})
@@ -1134,21 +1149,28 @@ def test_the_grids_first_client_token_and_its_last_are_not_a_testers_to_switch(p
 # ---- checks: MFA secrets and saved sign-ins by name ---------------------------------------------
 
 
-def test_a_check_asking_for_someone_elses_secret_is_told_so(people):
+def answered(r):
+    """(status, JSON, Cache-Control) of an answer: what tells two answers apart."""
+    return r.status_code, r.get_json(), r.headers.get("Cache-Control")
+
+
+@pytest.mark.parametrize("scope", [None, "mfa.use"])
+def test_a_check_asking_for_someone_elses_secret_is_told_what_it_would_be_of_a_missing_one(people, scope):
+    """A check can't add a secret, so a different answer would tell it which names someone else keeps that it may
+    not use: it gets exactly the answer for a name nobody added, whatever its token's scope."""
     bobs_secret(people)
-    _, carols = add_client_token(people.path, "carol-ci", owner=people.carol)
-    r = check(carols, CODE, name="intranet")
-    assert (r.status_code, r.get_json()) == (403, {
-        "error": "The MFA secret 'intranet' belongs to someone else and isn't shared with this client token's owner.",
-        "not_shared": True})
-    assert r.headers["Cache-Control"] == "no-store"
-    r = check(carols, CODE, name="nope")
-    assert (r.status_code, r.get_json()) == (404, {"error": "There is no MFA secret called 'nope'."})
+    _, carols = add_client_token(people.path, "carol-ci", owner=people.carol, scope=scope)
+    hidden, missing = check(carols, CODE, name="intranet"), check(carols, CODE, name="nope")
+    assert answered(hidden) == (404, no_secret("intranet"), "no-store")
+    assert answered(missing) == (404, no_secret("nope"), "no-store")
     assert run(people.path, "SELECT issuedCount FROM mfaSecrets") == [(0,)] and issued(people.path) == []
 
 
 def test_a_check_asking_for_someone_elses_sign_in_is_told_so_at_once(people):
-    """Not sent round the checkout's loop: the row is there, it just isn't this check's."""
+    """Not sent round the checkout's loop: the row is there, it just isn't this check's. Its token's owner may start
+    sign-ins under new names, so a free name would have been started: that this one is taken, it is told (the one
+    answer that tells it, and one it can't do without). Saving and releasing never start a name: those are answered
+    as for a name nobody added."""
     signin = bobs_signin(people, saved=False)
     _, carols = add_client_token(people.path, "carol-ci", owner=people.carol)
     answers = []
@@ -1161,17 +1183,45 @@ def test_a_check_asking_for_someone_elses_sign_in_is_told_so_at_once(people):
     assert (answers[0].status_code, answers[0].get_json()) == (403, not_shared)
     for path, body in ((SAVE, {"state": STATE, "baseVersion": 0, "id": signin}), (SAVE, {"state": STATE, "leaseToken": "x"}),
                        (RELEASE, {"leaseToken": "x"})):
-        r = check(carols, path, name="prod-admin", **body)
-        assert (r.status_code, r.get_json()) == (403, not_shared), path
+        hidden, missing = check(carols, path, name="prod-admin", **body), check(carols, path, name="nope", **body)
+        assert answered(hidden) == (404, no_signin("prod-admin"), "no-store"), path
+        assert answered(missing) == (404, no_signin("nope"), "no-store"), path
     assert signin_row(people.path) == {"version": 0, "saved": False, "leased": False, "savedBy": None,
                                        "refreshCount": 0, "rejectedCount": 0}
+
+
+@pytest.mark.parametrize("why", ["role", "scope"])
+def test_a_check_that_may_not_add_sign_ins_cant_tell_someone_elses_from_a_missing_one(people, why):
+    """Its token's owner may only use sign-ins (role), or its scope leaves out adding them (scope): it couldn't
+    start a free name either, so every route answers someone else's exactly as one nobody added."""
+    if why == "role":
+        users = add_role(people.path, "Users", "signins.use")
+        _, token = add_client_token(people.path, "uma-ci", owner=make_user(people.path, "Uma Ng", [users]))
+    else:
+        _, token = add_client_token(people.path, "carol-ci", owner=people.carol, scope="signins.use")
+    signin = bobs_signin(people)
+    for path, body in ((CHECKOUT, {}), (CHECKOUT, {"rejectedVersion": 1, "id": signin}),
+                       (SAVE, {"state": NEWER, "baseVersion": 1, "id": signin}), (SAVE, {"state": NEWER, "leaseToken": "x"}),
+                       (RELEASE, {"leaseToken": "x"})):
+        hidden, missing = check(token, path, name="prod-admin", **body), check(token, path, name="nope", **body)
+        if path == CHECKOUT and why == "scope":
+            assert answered(hidden) == (403, cannot_start("prod-admin"), "no-store")
+            assert answered(missing) == (403, cannot_start("nope"), "no-store")
+        else:
+            assert answered(hidden) == (404, no_signin("prod-admin"), "no-store"), path
+            assert answered(missing) == (404, no_signin("nope"), "no-store"), path
+    # Nothing was added, and Bob's state, the one the refused version named included, is as it was.
+    assert run(people.path, "SELECT name FROM savedSignins") == [("prod-admin",)]
+    assert signin_row(people.path) == {"version": 1, "saved": True, "leased": False,
+                                       "savedBy": "client token 'bob-ci' (Bob Stone)", "refreshCount": 0,
+                                       "rejectedCount": 0}
 
 
 def test_only_checks_that_may_add_sign_ins_add_names(people):
     users = add_role(people.path, "Users", "signins.use")
     _, umas = add_client_token(people.path, "uma-ci", owner=make_user(people.path, "Uma Ng", [users]))
     r = check(umas, CHECKOUT, name="brand-new")
-    assert (r.status_code, r.get_json()) == (404, {"error": "There is no saved sign-in called 'brand-new'."})
+    assert (r.status_code, r.get_json()) == (404, no_signin("brand-new"))
     assert run(people.path, "SELECT COUNT(*) FROM savedSignins") == [(0,)]
 
     _, danas = add_client_token(people.path, "dana-ci", owner=people.dana)
@@ -1246,10 +1296,11 @@ def test_admins_checks_use_a_testers_sign_in_only_once_it_is_shared_with_them(pe
     token = {"an admin's": lambda: add_client_token(people.path, "robin-ci", owner=people.robin)[1],
              "a legacy token's": lambda: add_client_token(people.path, "legacy")[1],
              "the bootstrap token's": lambda: BOOTSTRAP}[whose]()
-    for path, body in ((CHECKOUT, {}), (SAVE, {"state": NEWER, "baseVersion": 1, "id": signin}),
-                       (RELEASE, {"leaseToken": "x"})):
+    r = check(token, CHECKOUT, name="prod-admin")
+    assert r.status_code == 403 and r.get_json()["not_shared"] is True
+    for path, body in ((SAVE, {"state": NEWER, "baseVersion": 1, "id": signin}), (RELEASE, {"leaseToken": "x"})):
         r = check(token, path, name="prod-admin", **body)
-        assert r.status_code == 403 and r.get_json()["not_shared"] is True, path
+        assert (r.status_code, r.get_json()) == (404, no_signin("prod-admin")), path
     share(people.path, "signin", signin, "role", permissions.ADMIN, vouched_for=TESTER)  # as only an admin can
     assert check(token, CHECKOUT, name="prod-admin").get_json()["state"] == STATE
     assert check(token, SAVE, name="prod-admin", state=NEWER, baseVersion=1, id=signin).get_json()["reason"] == "shared"
@@ -1359,8 +1410,12 @@ def test_without_a_share_table_nothing_is_shared_or_given_away(people):
 # A scope decides which routes a token may ask (test_accounts.py). What it reaches there is its owner's, judged
 # by all of what its owner may do: a scope is never taken out of that.
 
-NOT_SHARED = {"error": "The saved sign-in 'prod-admin' belongs to someone else and isn't shared with this client "
-                       "token's owner.", "not_shared": True}
+def cannot_start(name):
+    """The 403 a token whose scope leaves out adding sign-ins gets for a name nobody added, or one its owner may not
+    use."""
+    return {"error": "There is no saved sign-in called {!r} that this client token's owner may use, and this client "
+                     "token's scope doesn't include “Add saved sign-ins”, so it can't start one.".format(name),
+            "out_of_scope": True, "scope": "signins.add"}
 
 
 def saved_signin(path, name, owner=None, shares=(), vouched_for=None):
@@ -1371,28 +1426,35 @@ def saved_signin(path, name, owner=None, shares=(), vouched_for=None):
     return signin_id
 
 
-def same_answers(unscoped, scoped, asked):
+def same_answers(unscoped, scoped, scope, asked):
     """Both tokens get the same answer to each (path, name, what is expected) of asked: 'state' and 'code' for
-    what is reached, else the key of the refusal."""
+    what is reached, 404 for a name nobody added, else 'hidden' for one their owner may not use. That one is the
+    answer for a name nobody added too, but a checkout by a token that may start sign-ins under new names would
+    have started a free one, so the token is told it is taken (not_shared); one whose scope leaves that out
+    (scope, the scoped token's) isn't, and is answered as for a name nobody added."""
     for path, name, expected in asked:
         answers = [check(token, path, name=name) for token in (unscoped, scoped)]
         first, second = [(r.status_code, r.get_json()) for r in answers]
         if expected == "code":
             assert first[0] == second[0] == 200 and sorted(first[1]) == sorted(second[1]), name
             assert "code" in second[1], name
+        elif expected == "hidden" and path == CODE:
+            assert first == second == (404, no_secret(name)), name
+        elif expected == "hidden":
+            assert first[0] == 403 and first[1]["not_shared"] is True, (name, first)
+            assert second == (first if "signins.add" in scope.split() else (403, cannot_start(name))), (name, second)
         else:
             assert first == second, name
             if expected == "state":
                 assert second[1].get("state") == STATE, (name, second)
-            elif expected == 404:
-                assert second[0] == 404, (name, second)
             else:
-                assert second[1].get(expected) is True, (name, second)
+                assert expected == 404 and second[0] == 404, (name, second)
 
 
 def test_a_scope_never_makes_a_shared_sign_in_reach_a_token_its_owner_cannot_use(people):
     """Bob shared his sign-in with Dana, who has since been given more than he has. A scope of using sign-ins
-    alone is less than Bob may do, and her token still isn't let in: it is Dana who is judged, not the scope."""
+    alone is less than Bob may do, and her token still isn't let in: it is Dana who is judged, not the scope. Such
+    a token can't start a sign-in either, so it is answered as for a name nobody added."""
     signin = bobs_signin(people)
     _, before = add_client_token(people.path, "dana-before", owner=people.dana, scope="signins.use")
     assert check(before, CHECKOUT, name="prod-admin").get_json()["state"] == STATE
@@ -1405,7 +1467,8 @@ def test_a_scope_never_makes_a_shared_sign_in_reach_a_token_its_owner_cannot_use
         for path, body in ((CHECKOUT, {}), (SAVE, {"state": NEWER, "baseVersion": 1, "id": signin}),
                            (RELEASE, {"leaseToken": "x"})):
             r = check(token, path, name="prod-admin", **body)
-            assert (r.status_code, r.get_json()) == (403, NOT_SHARED), path
+            expected = (403, cannot_start("prod-admin")) if path == CHECKOUT else (404, no_signin("prod-admin"))
+            assert (r.status_code, r.get_json()) == expected, path
     assert signin_row(people.path)["version"] == 1
 
 
@@ -1429,14 +1492,14 @@ def test_a_scoped_token_reaches_exactly_what_its_owner_reaches(people, monkeypat
     users = add_role(path, "Users", "mfa.use signins.use")
     run(path, "INSERT INTO userRoles (userId, roleId, grantedAt) VALUES (?, ?, ?)", (people.erin, users, ts(60)))
     asked = {
-        people.dana: [(CHECKOUT, "danas-own", "state"), (CHECKOUT, "prod-admin", "state"), (CHECKOUT, "carols", "not_shared"),
-                      (CHECKOUT, "admins-shared", "state"), (CHECKOUT, "admins-own", "not_shared"),
-                      (CODE, "intranet", "code"), (CODE, "danas-codes", "code"), (CODE, "carols-codes", "not_shared"),
-                      (CODE, "admins-codes", "not_shared"), (CODE, "nope", 404)],
+        people.dana: [(CHECKOUT, "danas-own", "state"), (CHECKOUT, "prod-admin", "state"), (CHECKOUT, "carols", "hidden"),
+                      (CHECKOUT, "admins-shared", "state"), (CHECKOUT, "admins-own", "hidden"),
+                      (CODE, "intranet", "code"), (CODE, "danas-codes", "code"), (CODE, "carols-codes", "hidden"),
+                      (CODE, "admins-codes", "hidden"), (CODE, "nope", 404)],
         people.erin: [(CHECKOUT, "prod-admin", "state"), (CHECKOUT, "admins-shared", "state"),
-                      (CHECKOUT, "carols", "not_shared"), (CODE, "intranet", "code"), (CODE, "carols-codes", "not_shared")],
-        oscar: [(CHECKOUT, "vouched", "state"), (CHECKOUT, "not-vouched", "not_shared"),
-                (CHECKOUT, "admins-shared", "state"), (CHECKOUT, "prod-admin", "not_shared")],
+                      (CHECKOUT, "carols", "hidden"), (CODE, "intranet", "code"), (CODE, "carols-codes", "hidden")],
+        oscar: [(CHECKOUT, "vouched", "state"), (CHECKOUT, "not-vouched", "hidden"),
+                (CHECKOUT, "admins-shared", "state"), (CHECKOUT, "prod-admin", "hidden")],
     }
     now = [STEP * 30 + 1]  # a secret gives a few codes ahead and no more: each pair of tokens asks at its own time
     monkeypatch.setattr(store, "time", types.SimpleNamespace(time=lambda: now[0]))
@@ -1445,7 +1508,7 @@ def test_a_scoped_token_reaches_exactly_what_its_owner_reaches(people, monkeypat
         for scope in ("mfa.use signins.use", "grid.view mfa.use signins.add signins.use"):
             _, scoped = add_client_token(path, "ci-{}-{}".format(number, len(scope)), owner=owner, scope=scope)
             now[0] += 300
-            same_answers(unscoped, scoped, questions)
+            same_answers(unscoped, scoped, scope, questions)
 
 
 def test_a_scoped_ownerless_token_reaches_what_an_unscoped_one_does(people):
@@ -1459,9 +1522,9 @@ def test_a_scoped_ownerless_token_reaches_what_an_unscoped_one_does(people):
     store.create_mfa("admins-codes", SEED)
     _, unscoped = add_client_token(path, "legacy")
     _, scoped = add_client_token(path, "legacy-limited", scope="mfa.use signins.use")
-    same_answers(unscoped, scoped, [
-        (CHECKOUT, "admins-own", "state"), (CHECKOUT, "prod-admin", "not_shared"), (CHECKOUT, "for-admins", "state"),
-        (CHECKOUT, "to-admins-by-bob", "not_shared"), (CODE, "intranet", "code"), (CODE, "admins-codes", "code"),
+    same_answers(unscoped, scoped, "mfa.use signins.use", [
+        (CHECKOUT, "admins-own", "state"), (CHECKOUT, "prod-admin", "hidden"), (CHECKOUT, "for-admins", "state"),
+        (CHECKOUT, "to-admins-by-bob", "hidden"), (CODE, "intranet", "code"), (CODE, "admins-codes", "code"),
         (CODE, "nope", 404)])
     assert issued(path) == ["client token 'legacy'", "client token 'legacy-limited'"] * 2
 
@@ -1474,9 +1537,7 @@ def test_without_signins_add_in_scope_a_token_cannot_start_a_new_name(people):
     _, legacy = add_client_token(people.path, "legacy", scope="grid.view signins.use")
     for token in (danas, robins, legacy):
         r = check(token, CHECKOUT, name="brand-new")
-        assert (r.status_code, r.get_json()) == (403, {
-            "error": "There is no saved sign-in called 'brand-new', and this client token's scope doesn't include “Add "
-                     "saved sign-ins”, so it can't start one.", "out_of_scope": True, "scope": "signins.add"})
+        assert (r.status_code, r.get_json()) == (403, cannot_start("brand-new"))
         assert r.headers["Cache-Control"] == "no-store"
     assert run(people.path, "SELECT name FROM savedSignins") == [("danas-site",)]
     assert audit_rows(people.path) == [] and not auth._failures
@@ -1507,7 +1568,7 @@ def test_signins_add_in_scope_still_needs_the_owner_to_hold_it(people):
     for name, scope in (("uma-ci", None), ("uma-adds", "signins.add signins.use")):
         _, umas = add_client_token(people.path, name, owner=uma, scope=scope)
         r = check(umas, CHECKOUT, name="brand-new")
-        assert (r.status_code, r.get_json()) == (404, {"error": "There is no saved sign-in called 'brand-new'."}), name
+        assert (r.status_code, r.get_json()) == (404, no_signin("brand-new")), name
     assert run(people.path, "SELECT COUNT(*) FROM savedSignins") == [(0,)] and audit_rows(people.path) == []
 
 
@@ -1547,3 +1608,90 @@ def test_the_sign_in_cap_counts_a_scoped_tokens_owner_as_before(people, monkeypa
         assert check(robins, CHECKOUT, name=name).get_json()["status"] == "sign-in"
     run(people.path, "DELETE FROM itemOwners WHERE itemId = (SELECT id FROM savedSignins WHERE name = 'a')")
     assert check(limited, CHECKOUT, name="f").get_json()["status"] == "sign-in"
+
+
+# ---- who used an item: a client token's name is its owner's ------------------------------------------------
+
+
+def by(row, key):
+    """What a listed item says of who used it: (the name, whether it was left out, whose token it is then)."""
+    return row[key], row[key + "Hidden"], row[key + "Owner"]
+
+
+def test_whom_codes_went_to_names_a_client_token_only_to_whoever_may_see_it(people):
+    """Dana, whom Bob's secret is shared with, sees that a check of Bob's took a code, never what Bob called its
+    token: the answer doesn't carry it at all. Bob sees his own token's name, and Robin (who may see every token)
+    every name. People's names show to everyone the secret is shared with, as they always did."""
+    bobs_id, bobs = add_client_token(people.path, "bob-ci", owner=people.bob)
+    _, admins = add_client_token(people.path, "made-by-an-admin")
+    secret = bobs_secret(people)
+    assert check(bobs, CODE, name="intranet", minValidS=0).status_code == 200
+    assert caller(people.dana)("POST", "/api/mfa/{}/use".format(secret)).status_code == 200
+    assert check(admins, CODE, name="intranet", minValidS=0).status_code == 200  # never MfaBusy
+    bob_ci, admin_ci = "client token 'bob-ci' (Bob Stone)", "client token 'made-by-an-admin'"
+
+    def seen(who):
+        r = caller(who)("GET", "/api/mfa")
+        (row,) = r.get_json()["secrets"]
+        return r.get_data(as_text=True), by(row, "lastIssuedTo"), [by(i, "issuedTo") for i in r.get_json()["issues"]]
+
+    text, last, issues = seen(people.dana)
+    assert "bob-ci" not in text and "made-by-an-admin" not in text
+    assert last == (None, True, None)  # the admins' token: nobody's name to give
+    assert issues == [(None, True, None), ("Dana Lee", False, None), (None, True, "Bob Stone")]
+    text, last, issues = seen(people.bob)
+    assert "made-by-an-admin" not in text
+    assert issues == [(None, True, None), ("Dana Lee", False, None), (bob_ci, False, None)]
+    _, last, issues = seen(people.robin)
+    assert last == (admin_ci, False, None)
+    assert issues == [(admin_ci, False, None), ("Dana Lee", False, None), (bob_ci, False, None)]
+    # A token deleted since is still its owner's: what was kept says whose it was.
+    run(people.path, "DELETE FROM accessTokens WHERE id = ?", (bobs_id,))
+    assert seen(people.bob)[2][2] == (bob_ci, False, None)
+    assert seen(people.dana)[2][2] == (None, True, "Bob Stone")
+    # The store's own callers get every name, without the marks.
+    assert [i["issuedTo"] for i in store.list_mfa()["issues"]] == [admin_ci, "Dana Lee", bob_ci]
+
+
+def test_who_saved_and_reused_a_sign_in_names_a_client_token_only_to_whoever_may_see_it(people):
+    """savedBy, lastUsedBy and leaseHolder alike, in the listing and in what a share and a forget answer with. A
+    name kept before tokens' ids were (bobs_signin saves it so) is matched against the tokens there are."""
+    _, bobs = add_client_token(people.path, "bob-ci", owner=people.bob)
+    _, danas = add_client_token(people.path, "dana-ci", owner=people.dana)
+    signin = bobs_signin(people)
+    assert check(danas, CHECKOUT, name="prod-admin").get_json()["status"] == "saved"
+    bob_ci, dana_ci = "client token 'bob-ci' (Bob Stone)", "client token 'dana-ci' (Dana Lee)"
+
+    def seen(who, key=None):
+        r = caller(who)("GET", "/api/signins")
+        (row,) = r.get_json()["signins"]
+        if key:
+            return by(row, key)
+        return r.get_data(as_text=True), by(row, "savedBy"), by(row, "lastUsedBy")
+
+    text, saved, used = seen(people.bob)
+    assert "dana-ci" not in text
+    assert (saved, used) == ((bob_ci, False, None), (None, True, "Dana Lee"))
+    text, saved, used = seen(people.dana)
+    assert "bob-ci" not in text
+    assert (saved, used) == ((None, True, "Bob Stone"), (dana_ci, False, None))
+    assert seen(people.robin)[1:] == ((bob_ci, False, None), (dana_ci, False, None))
+
+    # What a share and a forget answer with, Bob's, is as his listing.
+    r = caller(people.bob)("POST", "/api/signins/{}/shares/add".format(signin), {"user": people.carol})
+    assert r.status_code == 200 and by(r.get_json(), "lastUsedBy") == (None, True, "Dana Lee")
+    assert "dana-ci" not in r.get_data(as_text=True)
+    r = caller(people.bob)("POST", "/api/signins/{}/forget".format(signin))
+    assert r.status_code == 200 and by(r.get_json()["signin"], "lastUsedBy") == (None, True, "Dana Lee")
+    assert "dana-ci" not in r.get_data(as_text=True)
+
+    # Bob's check signing in: Dana sees whose check it is.
+    assert check(bobs, CHECKOUT, name="prod-admin").get_json()["status"] == "sign-in"
+    assert seen(people.dana, "leaseHolder") == (None, True, "Bob Stone")
+    assert seen(people.bob, "leaseHolder") == (bob_ci, False, None)
+    assert "bob-ci" not in seen(people.carol)[0]
+
+    # A name kept before ids that no token has now: nobody but whoever may see every token is told it.
+    run(people.path, "UPDATE savedSignins SET lastUsedBy = ?", ("client token 'renamed' (Bob Stone)",))
+    assert seen(people.bob, "lastUsedBy") == (None, True, None)
+    assert seen(people.robin, "lastUsedBy") == ("client token 'renamed' (Bob Stone)", False, None)

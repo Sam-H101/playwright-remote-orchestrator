@@ -189,7 +189,9 @@ def test_checks_get_codes_with_a_managed_client_token(mysql):
     assert r.get_json()["code"] == mfa.code(SEED, r.get_json()["step"])
     ((last_used,),) = sql("SELECT lastUsedAt FROM accessTokens WHERE id = %s", (token["id"],))
     assert abs((last_used - utcnow()).total_seconds()) < 10
-    assert sql("SELECT issuedTo, label FROM mfaIssues") == (("client token 'nightly checks'", "login"),)
+    kept = "\x1f{}.\x1fclient token 'nightly checks'".format(token["id"])  # with its id: store.by_token
+    assert sql("SELECT issuedTo, label FROM mfaIssues") == ((kept, "login"),)
+    assert [i["issuedTo"] for i in store.list_mfa()["issues"]] == ["client token 'nightly checks'"]
     store.revoke_token(token["id"])
     r = client.post("/api/mfa/code", json={"name": "intranet"}, headers={"Authorization": "Bearer " + token["token"]})
     assert r.status_code == 401
