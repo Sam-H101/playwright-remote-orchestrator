@@ -375,6 +375,8 @@ jobs:
             }))), [base, base + 1]);
             if (fromPage.includes('open')) throw new Error(`a page opened a run-server session: ${fromPage}`);
             console.log(`a page at http://127.0.0.1:${base}/ opening ws://127.0.0.1:{${base},${base + 1}}/: ${fromPage.join(', ')}`);
+            await Promise.all(browsers.map((b) => b.close()));
+            process.exit(0);
           })().catch(e => { console.error(e); process.exit(1); });
           '@
           Set-Content -Path "$env:RUNNER_TEMP\client.js" -Value $client
