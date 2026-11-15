@@ -480,6 +480,8 @@ func RemoveBrowserAccount(name string) (bool, error) {
 		return false, err
 	}
 	if sid != nil {
+		// Before setRights takes the batch logon right away: releasing a leaked profile signs the account in.
+		releaseErr := releaseLeakedProfile(name, sid.String())
 		if err := setRights(sid, false, nil); err != nil {
 			errs = append(errs, err)
 		}
@@ -495,6 +497,9 @@ func RemoveBrowserAccount(name string) (bool, error) {
 				}
 				if try == 10 {
 					err := fmt.Errorf("deleting the profile of %s: %w", name, e)
+					if releaseErr != nil {
+						err = fmt.Errorf("%w (releasing its loaded profile: %v)", err, releaseErr)
+					}
 					if unloadErr != nil {
 						err = fmt.Errorf("%w (unloading its registry hive: %v)", err, unloadErr)
 					}
@@ -522,6 +527,62 @@ func RemoveBrowserAccount(name string) (bool, error) {
 		k.Close()
 	}
 	return sid != nil, errors.Join(errs...)
+}
+
+// hiveLoaded reports whether HKEY_USERS\<sid> is loaded.
+func hiveLoaded(sid string) bool {
+	k, err := registry.OpenKey(registry.USERS, sid, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	k.Close()
+	return true
+}
+
+// releaseLeakedProfile drops the references the User Profile Service still counts on an account's profile.
+// The service process loads each browser account's profile and unloads it as it stops; a service that was
+// killed (or crashed) never unloaded it, and the profile service then keeps the hive loaded, with RegUnLoadKey
+// refused, until a reboot. Signed in as the account (with its stored password), each UnloadUserProfile drops
+// one reference, until the hive is unloaded. A hive that isn't loaded, or an account without a stored
+// password, is left as it is.
+func releaseLeakedProfile(name, sid string) error {
+	if !hiveLoaded(sid) {
+		return nil
+	}
+	if err := enablePrivileges("SeBackupPrivilege", "SeRestorePrivilege"); err != nil {
+		return err
+	}
+	pw, err := retrieveSecret(browserSecretKey(name))
+	if err != nil || pw == nil {
+		return err
+	}
+	defer clearUTF16(pw)
+	user, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return err
+	}
+	dot, _ := windows.UTF16PtrFromString(".")
+	var token windows.Token
+	if r, _, e := procLogonUserW.Call(uintptr(unsafe.Pointer(user)), uintptr(unsafe.Pointer(dot)),
+		uintptr(unsafe.Pointer(&pw[0])), logon32LogonBatch, logon32ProviderDefault, uintptr(unsafe.Pointer(&token))); r == 0 {
+		return fmt.Errorf("signing in %s: %w", name, e)
+	}
+	defer token.Close()
+	for try := 0; try < 32 && hiveLoaded(sid); try++ {
+		k, err := registry.OpenKey(registry.USERS, sid, registry.READ)
+		if err != nil {
+			break
+		}
+		// UnloadUserProfile closes the handle.
+		if r, _, e := procUnloadUserProfile.Call(uintptr(token), uintptr(k)); r == 0 {
+			return fmt.Errorf("UnloadUserProfile: %w", e)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if hiveLoaded(sid) {
+		return fmt.Errorf(`HKEY_USERS\%s is still loaded`, sid)
+	}
+	return nil
 }
 
 // unloadHive unloads an account's registry hives (HKEY_USERS\<sid>_Classes, then HKEY_USERS\<sid>) that a
