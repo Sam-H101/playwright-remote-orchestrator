@@ -333,10 +333,12 @@ jobs:
             const parents = [...new Set(found.map((f) => path.dirname(f)))];
             if (parents.length !== 2) throw new Error(`expected the two sessions' profiles in two folders, found them in ${parents.length}: ${parents.join(', ')}`);
             const temps = parents.map((p) => 'file:///' + (p + '\\').replace(/\\/g, '/'));
+            // A page per folder: after a refused file:// navigation Chromium commits an error page, which would
+            // interrupt the next goto on the same page.
             for (const [i, browser] of browsers.entries()) {
-              const p = await browser.newPage();
               const seen = [];
               for (const temp of temps) {
+                const p = await browser.newPage();
                 let outcome;
                 try {
                   await p.goto(temp);
@@ -346,10 +348,10 @@ jobs:
                   outcome = e.message.split('\n')[0];
                 }
                 seen.push(outcome);
+                await p.close();
               }
               console.log(`session ${i + 1}: ${temps.map((t, j) => `${t}: ${seen[j]}`).join('; ')}`);
               if (seen.filter((s) => s === 'lists a profile').length !== 1) throw new Error(`session ${i + 1} must see the profile in its own account's temp folder only`);
-              await p.close();
             }
             // run-server takes sessions at its secret path only. A client of the run-server port at "/" gets HTTP 400,
             // and so does a page with a localhost origin, which run-server's origin check lets through.
