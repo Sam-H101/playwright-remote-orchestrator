@@ -6,14 +6,16 @@ import re
 
 import pytest
 
-from ui import store
+from ui import permissions, store
 
 pytest.importorskip("playwright.sync_api")
 pytest.importorskip("cryptography")
 
 from ui.tests.test_browser import browser, grid, page, run  # noqa: E402,F401  (fixtures)
 from ui.tests.test_browser_tokens import _admin_context, admin_grid  # noqa: E402,F401  (fixtures)
-from ui.tests.test_browser_mfa import add_secret, mfa_grid, mfa_page, set_hidden  # noqa: E402,F401  (fixtures)
+from ui.tests.test_browser_mfa import SEED, add_secret, mfa_grid, mfa_page, set_hidden  # noqa: E402,F401  (fixtures)
+from ui.tests.test_browser_oidc import signed_in_context, sso_grid  # noqa: E402,F401  (fixtures)
+from ui.tests.test_accounts import add_client_token, add_item, make_user  # noqa: E402
 
 COOKIE = "estsauth-cookie-value-for-the-browser-tests"
 LOCAL = "local-storage-value-for-the-browser-tests"
@@ -467,5 +469,48 @@ def test_sign_ins_fit_a_phone(mfa_grid, browser):  # noqa: F811
         p.reload()
         p.wait_for_selector("#signin-state .signin-intro")
         assert p.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    finally:
+        ctx.close()
+
+
+def test_a_client_tokens_name_shows_only_to_whoever_may_see_it(sso_grid, browser, monkeypatch):  # noqa: F811
+    """Dana, whom Bob shared his MFA secret and his sign-in with, sees that a check of Bob's took the code and saved the
+    sign-in, never what Bob called its token: the page isn't sent it. Bob sees his token's name."""
+    url, path, _ = sso_grid
+    monkeypatch.setenv("GRID_SECRETS_KEY", "k" * 32)
+    bob = make_user(path, "Bob Stone", [permissions.TESTER])
+    dana = make_user(path, "Dana Lee", [permissions.TESTER])
+    token_id, _ = add_client_token(path, "bobs-nightly", owner=bob)
+    kept = store.by_token("client token 'bobs-nightly' (Bob Stone)", token_id, bob)
+    secret = store.create_mfa("intranet", SEED, owner_id=bob)["id"]
+    signin = add_item(path, "signin", "contoso", owner=bob)
+    for kind, item in (("mfa", secret), ("signin", signin)):
+        run(path, "INSERT INTO itemShares (itemKind, itemId, granteeKind, granteeId, sharedAt) "
+                  "VALUES (?, ?, 'user', ?, datetime('now'))", (kind, item, dana))
+    assert store.issue_mfa_code(kept, name="intranet", min_valid_s=0) is not None
+    sign_in("contoso", kept)
+
+    def page_of(user_id, scope="mine"):
+        ctx = signed_in_context(browser, url, path, user_id)
+        p = ctx.new_page()
+        p.goto(url + "#/mfa")
+        p.wait_for_selector('#mfa-scope [data-scope="{}"]'.format(scope))
+        p.click('#mfa-scope [data-scope="{}"]'.format(scope))  # a Tester's page starts with their own
+        p.wait_for_selector("#signin-rows tr")
+        p.wait_for_selector("#mfa-issue-rows tr")
+        return ctx, p
+
+    ctx, p = page_of(dana, "shared")
+    try:
+        assert squash(p.text_content("#mfa-issue-rows .cell-to")) == "a client token of Bob Stone"
+        assert "a client token of Bob Stone" in squash(p.text_content("#mfa-rows .cell-last"))
+        assert "by a client token of Bob Stone" in squash(cell(p, "contoso", "saved"))
+        assert "bobs-nightly" not in p.content()
+    finally:
+        ctx.close()
+    ctx, p = page_of(bob)
+    try:
+        assert squash(p.text_content("#mfa-issue-rows .cell-to")) == "client token 'bobs-nightly' (Bob Stone)"
+        assert "by client token 'bobs-nightly' (Bob Stone)" in squash(cell(p, "contoso", "saved"))
     finally:
         ctx.close()

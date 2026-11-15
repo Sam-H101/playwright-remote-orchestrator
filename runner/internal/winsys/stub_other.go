@@ -6,6 +6,7 @@ package winsys
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -48,6 +49,18 @@ func (j *Job) AssignCurrent() error        { return errWindowsOnly }
 func (j *Job) Assign(pid int) error        { return errWindowsOnly }
 func (j *Job) Terminate(exit uint32) error { return errWindowsOnly }
 func (j *Job) Close() error                { return nil }
+
+// The browser account is the Windows service's; Linux and macOS have --run-server-user instead.
+func EnsureBrowserAccount(name, comment string) (bool, error) { return false, errWindowsOnly }
+func BrowserAccountProblem(name string) (string, error)       { return "", nil }
+func RemoveBrowserAccount(name string) (bool, error)          { return false, nil }
+
+type BrowserLauncher struct{}
+
+func NewBrowserLauncher(account string, slot int) *BrowserLauncher { return &BrowserLauncher{} }
+func (l *BrowserLauncher) Open() error                             { return errWindowsOnly }
+func (l *BrowserLauncher) Prepare(cmd *exec.Cmd) error             { return errWindowsOnly }
+func (l *BrowserLauncher) Close()                                  {}
 
 type ProcInfo struct {
 	PID, ParentPID int

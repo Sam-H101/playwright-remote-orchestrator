@@ -5,12 +5,13 @@
 // outbound data socket, piped to the slot's run-server.
 
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 const WebSocket = require('ws');
-const { agentConfig } = require('./lib/config');
+const { agentConfig, sharedRunServerUser } = require('./lib/config');
 const { createLogger } = require('./lib/log');
 const { pipe } = require('./lib/pipe');
 const P = require('./lib/protocol');
@@ -51,19 +52,32 @@ function probe(port, timeoutMs = 2000) {
 
 // run-server's environment: the agent's, without the agent token, which a check's browser could otherwise read
 // from /proc. The watchdog preload lets run-server notice when the agent is gone; the original NODE_OPTIONS is
-// restored inside the child so browsers and other grandchildren don't inherit it. runAs (RUN_SERVER_USER) gets
-// its own HOME, USER and LOGNAME.
-function childEnv(env = process.env, runAs = null) {
+// restored inside the child so browsers and other grandchildren don't inherit it. runAs (the slot's
+// RUN_SERVER_USER) gets its own HOME, USER and LOGNAME. endpoint is run-server's secret path, which the watchdog
+// hands it as --path (see parent-watchdog.js).
+function childEnv(env = process.env, runAs = null, endpoint = null) {
   const watchdog = path.join(__dirname, 'lib', 'parent-watchdog.js');
   const original = env.NODE_OPTIONS || '';
   const out = {};
   for (const [key, value] of Object.entries(env)) {
-    if (key.toUpperCase() !== 'GATEWAY_AGENT_TOKEN') out[key] = value; // Windows names are case-insensitive
+    const upper = key.toUpperCase(); // Windows names are case-insensitive
+    if (upper !== 'GATEWAY_AGENT_TOKEN' && upper !== 'GATEWAY_AGENT_RUN_SERVER_PATH') out[key] = value;
   }
   out.NODE_OPTIONS = `${original} --require ${JSON.stringify(watchdog)}`.trim();
   out.GATEWAY_AGENT_NODE_OPTIONS = original;
+  if (endpoint) out.GATEWAY_AGENT_RUN_SERVER_PATH = endpoint;
   if (runAs) Object.assign(out, { HOME: runAs.home, USER: runAs.name, LOGNAME: runAs.name });
   return out;
+}
+
+// A new secret path for a run-server: a browser that reaches its port on 127.0.0.1 (another slot's, which may run
+// as another user) can't open a session there without it.
+function newEndpoint() {
+  return `/${crypto.randomBytes(32).toString('hex')}`;
+}
+
+function maskEndpoint(text, endpoint) {
+  return endpoint ? String(text).split(endpoint).join('/<endpoint>') : String(text);
 }
 
 function killTree(child) {
@@ -102,35 +116,49 @@ class Slot {
   start() {
     const { config, log, t } = this.agent;
     if (this.agent.stopping) return;
-    let fd = null;
+    // The slot log is the agent's own (mode 600): the browsers' users have no business in it.
+    let file = null;
     if (config.logDir) {
-      const file = path.join(config.logDir, `slot-${this.index}.log`);
+      const name = path.join(config.logDir, `slot-${this.index}.log`);
       try {
         fs.mkdirSync(config.logDir, { recursive: true });
-        if (fs.existsSync(file)) fs.renameSync(file, `${file}.prev`);
-        fd = fs.openSync(file, 'w');
+        if (fs.existsSync(name)) fs.renameSync(name, `${name}.prev`);
+        file = fs.createWriteStream(null, { fd: fs.openSync(name, 'w', 0o600) });
       } catch (err) {
-        log.warn(`slot ${this.index}: can't write ${file} (${err.message}); logging to stdout`);
+        log.warn(`slot ${this.index}: can't write ${name} (${err.message}); logging to stdout`);
       }
     }
+    const runAs = config.runAs ? config.runAs[this.index - 1] : null;
+    const endpoint = newEndpoint();
     const child = spawn(process.execPath, [config.cli, 'run-server', '--port', String(this.port), '--host', '127.0.0.1'], {
-      env: childEnv(process.env, config.runAs),
-      stdio: ['ignore', fd ?? 'pipe', fd ?? 'pipe'],
+      env: childEnv(process.env, runAs, endpoint),
+      stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       // As root, libuv also drops the supplementary groups before switching user.
-      ...(config.runAs ? { uid: config.runAs.uid, gid: config.runAs.gid } : {}),
+      ...(runAs ? { uid: runAs.uid, gid: runAs.gid } : {}),
     });
-    if (fd !== null) fs.closeSync(fd);
-    else {
-      for (const stream of [child.stdout, child.stderr]) {
-        let rest = '';
-        stream.setEncoding('utf8');
-        stream.on('data', (chunk) => {
-          const lines = (rest + chunk).split(/\r?\n/);
-          rest = lines.pop();
-          for (const line of lines) if (line) log.info(`[slot ${this.index}] ${line}`);
-        });
-      }
+    this.endpoint = endpoint;
+    // run-server prints its address, secret path included ("Listening on ws://127.0.0.1:3100/<path>"): it never
+    // reaches a log, where it could reach another slot's browsers.
+    let open = 2;
+    for (const stream of [child.stdout, child.stderr]) {
+      let rest = '';
+      const emit = (line) => {
+        if (!line) return;
+        const masked = maskEndpoint(line, endpoint);
+        if (file) file.write(`${masked}\n`);
+        else log.info(`[slot ${this.index}] ${masked}`);
+      };
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => {
+        const lines = (rest + chunk).split(/\r?\n/);
+        rest = lines.pop();
+        lines.forEach(emit);
+      });
+      stream.on('end', () => {
+        emit(rest);
+        if (--open === 0 && file) file.end();
+      });
     }
     this.child = child;
     const startedAt = Date.now();
@@ -360,7 +388,9 @@ class Agent extends EventEmitter {
     };
     const slot = this.slots[msg.slot - 1];
     if (!slot) return failed(`no slot ${msg.slot}`);
-    const reqPath = typeof msg.path === 'string' && msg.path.startsWith('/') ? msg.path : '/';
+    // run-server only answers at its secret path; "/" is the path clients ask for.
+    const asked = typeof msg.path === 'string' && msg.path.startsWith('/') ? msg.path : '/';
+    const reqPath = asked === '/' && slot.endpoint ? slot.endpoint : asked;
     const query = typeof msg.query === 'string' && msg.query ? `?${msg.query}` : '';
     const headers = {};
     for (const [key, value] of Object.entries(P.forwardHeaders(msg.headers && typeof msg.headers === 'object' ? msg.headers : {}))) {
@@ -378,7 +408,7 @@ class Agent extends EventEmitter {
       res.on('data', (chunk) => { if (body.length < 2000) body += chunk; });
       res.on('end', () => {
         settled = true;
-        failed(`run-server on port ${slot.port} answered HTTP ${res.statusCode}${body.trim() ? `: ${body.trim()}` : ''}`, res.statusCode);
+        failed(maskEndpoint(`run-server on port ${slot.port} answered HTTP ${res.statusCode}${body.trim() ? `: ${body.trim()}` : ''}`, slot.endpoint), res.statusCode);
         upstream.terminate();
       });
       res.on('error', () => {});
@@ -386,7 +416,7 @@ class Agent extends EventEmitter {
     upstream.on('error', (err) => {
       if (settled) return;
       settled = true;
-      failed(`run-server on port ${slot.port}: ${err.message}`);
+      failed(maskEndpoint(`run-server on port ${slot.port}: ${err.message}`, slot.endpoint));
     });
     upstream.once('open', () => {
       settled = true;
@@ -475,7 +505,13 @@ function main() {
     process.exit(0);
   }
   if (config.runAs) {
-    log.info(`run-servers run as ${config.runAs.name} (uid ${config.runAs.uid}), not as the agent's user`);
+    const who = config.runAs.map((u, i) => `slot ${i + 1} as ${u.name} (uid ${u.uid})`).join(', ');
+    log.info(`run-servers run as other users than the agent's: ${who}`);
+    if (sharedRunServerUser(config.runAs)) {
+      const name = config.runAs[0].name;
+      log.warn(`slots 1-${config.runAs.length} all run as ${name}: a check can read the browser profiles (cookies, storage) `
+        + `of checks running at the same time in the other slots; give each slot its own user with RUN_SERVER_USER=${name}{slot} (see the README)`);
+    }
   } else if (process.platform !== 'win32') {
     log.warn('run-servers run as the agent\'s own user, so a check\'s browser can read the agent token from /proc: '
       + 'start the agent as root with RUN_SERVER_USER set to another user (see the README)');

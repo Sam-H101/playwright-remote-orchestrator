@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -59,6 +61,7 @@ func TestRegisterForwardAndPipe(t *testing.T) {
 	defer c.CloseNow()
 	var info struct {
 		URL        string            `json:"url"`
+		SecretPath bool              `json:"secretPath"`
 		Headers    map[string]string `json:"headers"`
 		RawHeaders []string          `json:"rawHeaders"`
 	}
@@ -72,8 +75,21 @@ func TestRegisterForwardAndPipe(t *testing.T) {
 	if strings.Join(uas, "|") != "Playwright/0.0.0 (it)" {
 		t.Fatalf("user-agents reaching run-server: %q", uas)
 	}
-	if info.URL != "/?x=a%20b" || info.Headers["x-playwright-browser"] != "chromium" || info.Headers["x-gateway-token"] != "" || info.Headers["authorization"] != "" {
+	// The client asked for "/": the agent dialled the slot's secret endpoint path instead (the fake run-server
+	// takes upgrades at its --path only, and shows that path as "/"), and the path shows up nowhere else.
+	if info.URL != "/?x=a%20b" || !info.SecretPath || info.Headers["x-playwright-browser"] != "chromium" || info.Headers["x-gateway-token"] != "" || info.Headers["authorization"] != "" {
 		t.Fatalf("%+v", info)
+	}
+	runtimeJSON, _ := os.ReadFile(a.StatusFile)
+	texts := map[string]string{"agent log": a.Log(), "hub log": hub.Log(), "runtime.json": string(runtimeJSON)}
+	for i := 1; i <= 2; i++ {
+		b, _ := os.ReadFile(filepath.Join(filepath.Dir(a.StatusFile), "logs", fmt.Sprintf("slot-%d.log", i)))
+		texts[fmt.Sprintf("slot-%d.log", i)] = string(b)
+	}
+	for where, text := range texts {
+		if m := regexp.MustCompile(`[0-9a-f]{64}`).FindString(text); m != "" {
+			t.Fatalf("an endpoint path is in the %s: %s", where, m)
+		}
 	}
 	if info.Headers["host"] != fmt.Sprintf("127.0.0.1:%d", a.BasePort) && info.Headers["host"] != fmt.Sprintf("127.0.0.1:%d", a.BasePort+1) {
 		t.Fatalf("host %q", info.Headers["host"])

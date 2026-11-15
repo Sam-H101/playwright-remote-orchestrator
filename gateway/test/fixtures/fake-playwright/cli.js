@@ -17,10 +17,17 @@ if (args[0] !== 'run-server') {
   process.exit(1);
 }
 
+// Like run-server, upgrades are only taken at exactly --path ("/" without it), which the agent's watchdog adds.
+const endpoint = args.includes('--path') ? opt('--path') : '/';
+
 let lastClose = null;
 const server = http.createServer((req, res) => res.writeHead(404).end());
 const wss = new WebSocket.WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
+  if (new URL(`http://localhost${req.url}`).pathname !== endpoint) {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
   if (req.headers['x-fake-reject']) {
     const status = /^[1-5]\d\d$/.test(req.headers['x-fake-reject']) ? Number(req.headers['x-fake-reject']) : 428;
     const body = status === 428 ? 'Playwright version mismatch:\n  - server version: v0.0\n  - client version: v1.50\n' : 'refused';
@@ -30,7 +37,11 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.on('message', (data, isBinary) => {
       const text = isBinary ? null : data.toString();
-      if (text === 'info') return ws.send(JSON.stringify({ url: req.url, headers: req.headers, rawHeaders: req.rawHeaders }));
+      // url shows the secret path as "/", the path clients ask for; secretPath says whether there was one.
+      if (text === 'info') {
+        const url = endpoint === '/' ? req.url : `/${req.url.slice(endpoint.length)}`;
+        return ws.send(JSON.stringify({ url, secretPath: /^\/[0-9a-f]{64}$/.test(endpoint), port: Number(opt('--port')), headers: req.headers, rawHeaders: req.rawHeaders }));
+      }
       if (text === 'lastclose') return ws.send(JSON.stringify(lastClose));
       if (text && text.startsWith('close:')) {
         const [, code, reason] = text.split(':');
@@ -41,4 +52,4 @@ server.on('upgrade', (req, socket, head) => {
     ws.on('close', (code, reason) => { lastClose = { code, reason: reason.toString() }; });
   });
 });
-server.listen(Number(opt('--port')), opt('--host'), () => console.log(`Listening on ws://${opt('--host')}:${opt('--port')}/`));
+server.listen(Number(opt('--port')), opt('--host'), () => console.log(`Listening on ws://${opt('--host')}:${opt('--port')}${endpoint}`));

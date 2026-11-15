@@ -312,7 +312,8 @@ export function createUsers(el, ctx) {
     const o = d.owns, revoke = auth.can("users.manage") && d.canManage;
     const moving = auth.can("users.manage") && auth.can("mfa.all") && auth.can("signins.all") && (d.canManage || mine) && (o.mfa.length || o.signins.length);
     const part = (title, items, href, extra) => html`<section class="user-owns"><h3 class="section-label">${title}<span class="count">${items.length}</span></h3>
-      ${items.length ? html`<ul class="plain-list">${items.map((x) => html`<li><a href="${href}">${x.name}</a>${extra ? extra(x) : ""}</li>`)}</ul>`
+      ${items.length ? html`<ul class="plain-list">${items.map((x) => html`<li>${x.hidden
+        ? html`<span class="dim">One you may not see</span>` : html`<a href="${href}">${x.name}</a>`}${extra ? extra(x) : ""}</li>`)}</ul>`
         : html`<p class="hint">None.</p>`}</section>`;
     const client = activeTokens(d, "client").length, agent = activeTokens(d, "agent").length;
     return html`${part("MFA secrets", o.mfa, "#/mfa")}${part("Saved sign-ins", o.signins, "#/mfa")}

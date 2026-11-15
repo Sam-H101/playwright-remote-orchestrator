@@ -63,6 +63,10 @@ func UnderDir(path, dir string) bool {
 // KillByImagePrefix terminates every process whose image is under prefix (never this process) and
 // waits up to wait for them to exit. Nothing outside prefix is touched.
 func KillByImagePrefix(prefix string, wait time.Duration) ([]int, error) {
+	// Run-servers and browsers run as the browser account, whose processes only it and SYSTEM may open; an
+	// elevated installer needs SeDebugPrivilege to see their image paths and end them. Best effort: without
+	// it (not elevated) they are skipped as before.
+	enablePrivileges("SeDebugPrivilege")
 	procs, err := ListProcesses()
 	if err != nil {
 		return nil, err

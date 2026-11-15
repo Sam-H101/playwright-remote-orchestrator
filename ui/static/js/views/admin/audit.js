@@ -18,6 +18,8 @@ const METHOD = { oidc: "single sign-on", token: "admin token", "client-token": "
 const TARGET = /^(user|role|group|token|mfa|signin|slot|node):[0-9]{1,10}$/;
 const TARGET_WORD = { user: "person", role: "role", group: "group mapping", token: "token", mfa: "MFA secret", signin: "saved sign-in",
   slot: "slot", node: "node" };
+// An item whose name the server left out (targetHidden: the viewer may not see it), as a change names it.
+const HIDDEN_ITEM = { token: "a token", mfa: "an MFA secret", signin: "a saved sign-in" };
 
 const quoted = (s) => "“" + s + "”";
 // Groups the identity provider named, as a sign-in's row lists them: ‘qa’, ‘staff’.
@@ -32,6 +34,9 @@ export function sentence(e) {
   const role = d.role ? d.role.name || "role " + d.role.id : "a role";
   const grantee = d.grantee ? d.grantee.name || d.grantee.kind + " " + d.grantee.id : "someone";
   const everyone = d.group === "*";
+  // An MFA secret, saved sign-in or token named, or one the viewer may not see said as such.
+  const hidden = e.targetHidden ? (HIDDEN_ITEM[e.targetKind] || "something") + " you may not see" : null;
+  const it = hidden || quoted(name), the = (word) => hidden || "the " + word + " " + quoted(name);
   switch (e.action) {
     case "auth.signin": return "signed in";
     case "auth.signin_refused":
@@ -71,22 +76,22 @@ export function sentence(e) {
     case "group.mapped": return everyone ? "gave everyone who signs in the role " + role : "mapped the group ‘" + (d.group || name) + "’ to the role " + role;
     case "group.unmapped":
       return everyone ? "stopped giving everyone who signs in the role " + role : "stopped mapping the group ‘" + (d.group || name) + "’ to the role " + role;
-    case "token.created": return "made the " + (d.kind ? d.kind + " " : "") + "token " + quoted(name)
-      + (Array.isArray(d.scope) ? ", which " + scopeLimit(d.scope) : "");
-    case "token.revoked": return "revoked the token " + quoted(name);
-    case "token.deleted": return "deleted the token " + quoted(name);
-    case "token.owner_set": return "gave the token " + quoted(name) + " to " + toWhom(d.to);
-    case "mfa.created": return "added the MFA secret " + quoted(name);
-    case "mfa.deleted": return "deleted the MFA secret " + quoted(name);
-    case "mfa.code_viewed": return "looked at a code of " + quoted(name);
-    case "mfa.code_used": return "took a code of " + quoted(name);
-    case "signin.created": return "started the saved sign-in " + quoted(name);
-    case "signin.forgotten": return "forgot what was saved for " + quoted(name);
-    case "signin.deleted": return "deleted the saved sign-in " + quoted(name);
-    case "mfa.shared": case "signin.shared": return "shared " + quoted(name) + " with " + grantee;
-    case "mfa.unshared": case "signin.unshared": return "stopped sharing " + quoted(name) + " with " + grantee;
-    case "mfa.owner_changed": return "gave the MFA secret " + quoted(name) + " to " + toWhom(d.to);
-    case "signin.owner_changed": return "gave the saved sign-in " + quoted(name) + " to " + toWhom(d.to);
+    case "token.created": return "made " + (hidden ? (d.kind ? "a " + d.kind + " token you may not see" : hidden)
+      : "the " + (d.kind ? d.kind + " " : "") + "token " + quoted(name)) + (Array.isArray(d.scope) ? ", which " + scopeLimit(d.scope) : "");
+    case "token.revoked": return "revoked " + the("token");
+    case "token.deleted": return "deleted " + the("token");
+    case "token.owner_set": return "gave " + the("token") + " to " + toWhom(d.to);
+    case "mfa.created": return "added " + the("MFA secret");
+    case "mfa.deleted": return "deleted " + the("MFA secret");
+    case "mfa.code_viewed": return "looked at a code of " + it;
+    case "mfa.code_used": return "took a code of " + it;
+    case "signin.created": return "started " + the("saved sign-in");
+    case "signin.forgotten": return "forgot what was saved for " + it;
+    case "signin.deleted": return "deleted " + the("saved sign-in");
+    case "mfa.shared": case "signin.shared": return "shared " + it + " with " + grantee;
+    case "mfa.unshared": case "signin.unshared": return "stopped sharing " + it + " with " + grantee;
+    case "mfa.owner_changed": return "gave " + the("MFA secret") + " to " + toWhom(d.to);
+    case "signin.owner_changed": return "gave " + the("saved sign-in") + " to " + toWhom(d.to);
     case "grid.slot_released": return "released the slot " + name;
     case "grid.slot_reset": return "reset the failures of the slot " + name;
     case "grid.node_reset": return "reset the failures of " + name;

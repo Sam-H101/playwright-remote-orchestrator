@@ -88,12 +88,32 @@ test('pipes text and binary frames, forwards x-playwright-* headers and the quer
   assert.equal(info.headers.authorization, undefined);
   assert.equal(info.headers['x-gateway-token'], undefined);
   assert.ok(agent.slots.some((s) => info.headers.host === `127.0.0.1:${s.port}`), info.headers.host);
+  // run-server only answers at a secret path the agent dials, so a browser of another slot that reaches its port
+  // on 127.0.0.1 can't open a session there.
+  assert.equal(info.secretPath, true, 'run-server was given a secret --path');
+  await assert.rejects(h.connect(`ws://127.0.0.1:${info.port}/`), { status: 400 });
+  await assert.rejects(h.connect(`ws://127.0.0.1:${info.port}/?browser=chromium`), { status: 400 });
 
   const ws2 = await h.connect(`${url}/connect/`, { 'x-gateway-token': 's3cret' });
   ws2.send('info');
   const info2 = JSON.parse((await h.nextMessage(ws2)).data);
   assert.equal(info2.url, '/');
   assert.equal(info2.headers['x-gateway-token'], undefined);
+});
+
+test('run-server\'s secret path never reaches a slot log, which only the agent may read', async () => {
+  const { url } = await h.startHub({ clientToken: 's3cret' });
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-slotlog-'));
+  const agent = await h.startAgent(url, { name: 'logs', slots: 1, logDir });
+  await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
+  const file = path.join(logDir, 'slot-1.log');
+  const text = await h.waitFor(() => {
+    const t = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    return t.includes('Listening on') && t;
+  }, { what: 'the Listening line' });
+  assert.match(text, /Listening on ws:\/\/127\.0\.0\.1:\d+\/<endpoint>\n/);
+  assert.doesNotMatch(text, /[0-9a-f]{64}/);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });
 
 test('answers 400, 401, 404, 428, 502 and 504 with plain HTTP', async () => {

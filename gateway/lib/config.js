@@ -95,7 +95,9 @@ const AGENT_USAGE = `Usage: node agent.js --hub ws://hub:4500 [options]
   --run-server-user <u>   RUN_SERVER_USER      run run-server, and so the browsers, as this user (Linux and
                                                macOS; the agent must start as root). Checks can read any
                                                file and process of the browsers' user, so keep the agent
-                                               token out of its reach
+                                               token out of its reach. {slot} in the name gives each slot
+                                               its own user (pwuser{slot}: pwuser1, pwuser2, ...), so checks
+                                               running at the same time can't read each other's profiles
 `;
 
 function parseArgs(argv) {
@@ -159,6 +161,34 @@ function runServerUser(name, system = {}) {
   return { name, uid, gid, home: fields[5] || '/' };
 }
 
+// The user of each slot, slot 1 first, or null. A name with {slot} gives each slot its own user (pwuser{slot}:
+// pwuser1, pwuser2, ...), so a check's browser can't read the profiles of checks running at the same time in other
+// slots; a plain name is one user for every slot.
+function runServerUsers(name, slots, system = {}) {
+  if (!name) return null;
+  if (!name.includes('{slot}')) {
+    const user = runServerUser(name, system);
+    return Array.from({ length: slots }, () => user);
+  }
+  const users = [];
+  const byUid = new Map();
+  for (let i = 1; i <= slots; i++) {
+    const user = runServerUser(name.replaceAll('{slot}', String(i)), system);
+    const other = byUid.get(user.uid);
+    if (other) {
+      throw new Error(`--run-server-user / RUN_SERVER_USER: "${other.name}" and "${user.name}" are the same user (uid ${user.uid}); each slot needs its own`);
+    }
+    byUid.set(user.uid, user);
+    users.push(user);
+  }
+  return users;
+}
+
+// Whether two slots run their browsers as one user, where a check can read the browser profiles of the other slots'.
+function sharedRunServerUser(runAs) {
+  return !!runAs && runAs.length > 1 && new Set(runAs.map((u) => u.uid)).size < runAs.length;
+}
+
 function agentConfig(argv = process.argv.slice(2), env = process.env, cwd = process.cwd(), system = {}) {
   const args = parseArgs(argv);
   if (args.help) return { help: true, usage: AGENT_USAGE };
@@ -175,8 +205,8 @@ function agentConfig(argv = process.argv.slice(2), env = process.env, cwd = proc
   const statusFile = get('status-file') ? path.resolve(cwd, get('status-file')) : null;
   const logDir = get('log-dir') ? path.resolve(cwd, get('log-dir')) : null;
   const ephemeral = bool(get('ephemeral'), '--ephemeral / EPHEMERAL');
-  const runAs = runServerUser(get('run-server-user'), system);
+  const runAs = runServerUsers(get('run-server-user'), slots, system);
   return { hub, token: get('token') || null, name, slots, basePort, cli, browsers, statusFile, logDir, ephemeral, runAs };
 }
 
-module.exports = { hubConfig, agentConfig, parseArgs, resolveCli, runServerUser, AGENT_USAGE };
+module.exports = { hubConfig, agentConfig, parseArgs, resolveCli, runServerUser, runServerUsers, sharedRunServerUser, AGENT_USAGE };

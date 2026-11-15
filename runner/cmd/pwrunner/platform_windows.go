@@ -47,6 +47,9 @@ func platformChecks(ctx context.Context, dir string, quick bool) []check {
 	}
 	st, _ := service.Query(name)
 	out = append(out, check{name: "service", ok: st == service.Running, warn: st == service.Stopped, info: fmt.Sprintf("'%s' is %s", name, st)})
+	if st != service.NotInstalled {
+		out = append(out, browserAccountChecks(b)...)
+	}
 	for i := 0; i < b.Slots; i++ {
 		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(b.BasePort+i))
 		if st == service.Running {
@@ -74,6 +77,36 @@ func platformChecks(ctx context.Context, dir string, quick bool) []check {
 	}
 	if !quick {
 		out = append(out, hubCheck(ctx, b.HubURL))
+	}
+	return out
+}
+
+// browserAccountChecks checks each slot's browser account: the service starts a slot's run-server as that
+// slot's account only, so a slot without a working one serves nothing.
+func browserAccountChecks(b config.Backend) []check {
+	var out []check
+	seen := map[string]int{}
+	for i := 1; i <= b.Slots; i++ {
+		name := fmt.Sprintf("slot %d browser account", i)
+		account := b.SlotAccount(i)
+		if account == "" {
+			out = append(out, check{name: name, info: "none, so the service does not start this slot's run-server: re-run pwrunner install"})
+			continue
+		}
+		if other, ok := seen[strings.ToLower(account)]; ok {
+			out = append(out, check{name: name, info: fmt.Sprintf("%s is slot %d's account too, so their checks could read each other's browser profiles: re-run pwrunner install", account, other)})
+			continue
+		}
+		seen[strings.ToLower(account)] = i
+		switch problem, err := winsys.BrowserAccountProblem(account); {
+		case err != nil || problem != "":
+			out = append(out, check{name: name, info: fmt.Sprintf("%s %s %s: re-run pwrunner install", account, problem, errOrEmpty(err))})
+		default:
+			out = append(out, check{name: name, ok: true, info: fmt.Sprintf("run-server and browsers run as %s, not as LocalSystem", account)})
+		}
+	}
+	if b.BrowserAccount != "" && len(b.BrowserAccounts) == 0 {
+		out = append(out, check{name: "browser account", info: fmt.Sprintf("backend.json names only %s, the one account every slot ran as before each slot had its own: re-run pwrunner install", b.BrowserAccount)})
 	}
 	return out
 }

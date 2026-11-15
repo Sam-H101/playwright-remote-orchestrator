@@ -55,7 +55,7 @@ func Uninstall(ctx context.Context, dir string, o UninstallOptions) error {
 		if !o.Interactive {
 			return &cli.ExitError{Code: 2, Msg: "pass --yes to uninstall without a prompt"}
 		}
-		what := fmt.Sprintf("Remove the %s service", svcName)
+		what := fmt.Sprintf("Remove the %s service and its browser accounts", svcName)
 		if o.RemoveFiles {
 			what += " and delete " + dir
 		}
@@ -85,6 +85,14 @@ func Uninstall(ctx context.Context, dir string, o UninstallOptions) error {
 	stopNoService(dir)
 	if killed, _ := winsys.KillByImagePrefix(dir, 15*time.Second); len(killed) > 0 {
 		log.Infof("Stopped %d backend process(es)", len(killed))
+	}
+	// After the processes are gone, so their profiles are no longer in use: every slot's account, any slot
+	// count's, and the single account of an install from before each slot had its own. An install from
+	// before browser accounts has none, and the derived names find nothing.
+	if elevated {
+		removeBrowserAccounts(winsys.StaleBrowserAccounts(svcName, 0, append([]string{b.BrowserAccount}, b.BrowserAccounts...)...), log)
+	} else if b.BrowserAccount != "" || len(b.BrowserAccounts) > 0 {
+		log.Warnf("The browser accounts of '%s' may still exist; remove them from an elevated prompt (pwrunner uninstall).", svcName)
 	}
 	for _, n := range uniq(svcName, task) {
 		rule := "Playwright Backend (" + n + ")"

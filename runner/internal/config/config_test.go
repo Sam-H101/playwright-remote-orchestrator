@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -155,4 +156,99 @@ func TestBackendRoundTrip(t *testing.T) {
 	if _, exists, err := ReadBackend(filepath.Join(t.TempDir(), "none.json")); exists || err != nil {
 		t.Fatal("missing file")
 	}
+}
+
+func TestBackendBrowserAccounts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backend.json")
+	// An install from before each slot had its own account: browserAccount is read, used by no slot, and
+	// dropped when the file is written again.
+	os.WriteFile(path, []byte(`{"hubUrl":"ws://h","slots":2,"browserAccount":"pwbrowser-1a2b3c4d"}`), 0o644)
+	old, _, err := ReadBackend(path)
+	if err != nil || old.BrowserAccount != "pwbrowser-1a2b3c4d" || old.SlotAccount(1) != "" || old.SlotAccount(2) != "" {
+		t.Fatalf("legacy file: %+v %v", old, err)
+	}
+	old.BrowserAccounts = []string{"pwb-1a2b3c4d-1", "pwb-1a2b3c4d-2"}
+	if err := WriteBackend(path, old); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), `"browserAccount"`) || !strings.Contains(string(raw), `"browserAccounts": [`) {
+		t.Fatalf("file:\n%s", raw)
+	}
+	got, _, _ := ReadBackend(path)
+	if got.SlotAccount(1) != "pwb-1a2b3c4d-1" || got.SlotAccount(2) != "pwb-1a2b3c4d-2" || got.SlotAccount(3) != "" || got.SlotAccount(0) != "" {
+		t.Fatalf("%+v", got.BrowserAccounts)
+	}
+}
+
+func TestRunServerUser(t *testing.T) {
+	users := map[string]*user.User{
+		"pwuser": {Username: "pwuser", Uid: "1001", Gid: "1002", HomeDir: "/home/pwuser"},
+		"root":   {Username: "root", Uid: "0", Gid: "0", HomeDir: "/root"},
+		"odd":    {Username: "odd", Uid: "x", Gid: "1", HomeDir: "/"},
+		"pw1":    {Username: "pw1", Uid: "2001", Gid: "2001", HomeDir: "/home/pw1"},
+		"pw2":    {Username: "pw2", Uid: "2002", Gid: "2002", HomeDir: ""},
+		"pw3":    {Username: "pw3", Uid: "2003", Gid: "2003", HomeDir: "/home/pw3"},
+		"alias2": {Username: "alias2", Uid: "2001", Gid: "2001", HomeDir: "/home/pw1"},
+		"x-1-a":  {Username: "x-1-a", Uid: "3001", Gid: "3001", HomeDir: "/"},
+		"x-2-a":  {Username: "x-2-a", Uid: "0", Gid: "0", HomeDir: "/"},
+	}
+	asRoot := func(env map[string]string) Context {
+		c := ctx(t, env)
+		c.GOOS, c.Geteuid = "linux", func() int { return 0 }
+		c.LookupUser = func(name string) (*user.User, error) {
+			if u, ok := users[name]; ok {
+				return u, nil
+			}
+			return nil, user.UnknownUserError(name)
+		}
+		return c
+	}
+	s, _, err := FromArgs([]string{"--hub", "ws://h"}, asRoot(nil))
+	if err != nil || s.RunAs != nil {
+		t.Fatalf("unset: %+v %v", s.RunAs, err)
+	}
+	// Without {slot}: one user for every slot.
+	s, _, err = FromArgs([]string{"--hub", "ws://h", "--slots", "3", "--run-server-user", "pwuser"}, asRoot(nil))
+	pwuser := RunAs{Name: "pwuser", UID: 1001, GID: 1002, Home: "/home/pwuser"}
+	if err != nil || len(s.RunAs) != 3 || s.RunAs[0] != pwuser || s.RunAs[2] != pwuser {
+		t.Fatalf("flag: %+v %v", s.RunAs, err)
+	}
+	s, _, err = FromArgs([]string{"--hub", "ws://h"}, asRoot(map[string]string{"RUN_SERVER_USER": "pwuser"}))
+	if err != nil || len(s.RunAs) != 4 || s.RunAs[3].UID != 1001 {
+		t.Fatalf("env: %+v %v", s.RunAs, err)
+	}
+	// {slot}: slot i runs as the name with every {slot} replaced by i.
+	s, _, err = FromArgs([]string{"--hub", "ws://h", "--slots", "3", "--run-server-user", "pw{slot}"}, asRoot(nil))
+	want := []RunAs{{"pw1", 2001, 2001, "/home/pw1"}, {"pw2", 2002, 2002, "/"}, {"pw3", 2003, 2003, "/home/pw3"}}
+	if err != nil || len(s.RunAs) != 3 || s.RunAs[0] != want[0] || s.RunAs[1] != want[1] || s.RunAs[2] != want[2] {
+		t.Fatalf("{slot}: %+v %v", s.RunAs, err)
+	}
+	s, _, err = FromArgs([]string{"--hub", "ws://h", "--slots", "1"}, asRoot(map[string]string{"RUN_SERVER_USER": "x-{slot}-a"}))
+	if err != nil || len(s.RunAs) != 1 || s.RunAs[0].Name != "x-1-a" {
+		t.Fatalf("{slot} mid-name: %+v %v", s.RunAs, err)
+	}
+	// Errors name the expanded user.
+	mustFail(t, []string{"--hub", "ws://h", "--slots", "4", "--run-server-user", "pw{slot}"}, asRoot(nil), `--run-server-user / RUN_SERVER_USER: there is no user "pw4"`)
+	mustFail(t, []string{"--hub", "ws://h", "--slots", "2", "--run-server-user", "x-{slot}-a"}, asRoot(nil), `"x-2-a" is root`)
+	// Two slots that resolve to the same uid would share their profiles.
+	users["pw2"] = users["alias2"]
+	mustFail(t, []string{"--hub", "ws://h", "--slots", "2", "--run-server-user", "pw{slot}"}, asRoot(nil),
+		`--run-server-user / RUN_SERVER_USER: "pw1" and "alias2" are the same user (uid 2001); each slot needs its own`)
+	slotNotRoot := asRoot(nil)
+	slotNotRoot.Geteuid = func() int { return 1000 }
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "pw{slot}"}, slotNotRoot, "so that it can start run-server as pw1")
+	slotOnWindows := asRoot(nil)
+	slotOnWindows.GOOS = "windows"
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "pw{slot}"}, slotOnWindows, "not supported on Windows")
+	notRoot := asRoot(nil)
+	notRoot.Geteuid = func() int { return 1000 }
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "pwuser"}, notRoot, "start as root")
+	onWindows := asRoot(nil)
+	onWindows.GOOS = "windows"
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "pwuser"}, onWindows, "not supported on Windows")
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "nobody-here"}, asRoot(nil), `no user "nobody-here"`)
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "root"}, asRoot(nil), "is root")
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "odd"}, asRoot(nil), "no usable uid")
+	mustFail(t, []string{"--hub", "ws://h", "--run-server-user", "pw"}, asRoot(nil), `no user "pw"`)
 }

@@ -54,6 +54,7 @@ const (
 	NodePackages StepName = "install node packages"
 	InstallAgent StepName = "install agent"
 	Browsers     StepName = "install browsers"
+	Account      StepName = "browser account"
 	WriteConfig  StepName = "write config"
 	Firewall     StepName = "remove legacy firewall rule"
 	StartBackend StepName = "start backend"
@@ -91,6 +92,7 @@ type run struct {
 	cfg       *config.Backend
 	prev      previous
 	keptToken string
+	accounts  []string // each slot's browser account, slot 1 first; none without a service
 	laidDown  bool
 	steps     *report.Steps
 	health    report.Health
@@ -247,6 +249,7 @@ func (r *run) runSteps(ctx context.Context) error {
 		{NodePackages, func() error { return r.nodePackages(ctx) }},
 		{InstallAgent, func() error { return r.installAgent(ctx) }},
 		{Browsers, func() error { return r.browsers(ctx) }},
+		{Account, func() error { return r.browserAccount() }},
 		{WriteConfig, func() error { return r.writeConfig() }},
 		{Firewall, func() error { r.firewall(); return nil }},
 		{StartBackend, func() error { return r.start() }},

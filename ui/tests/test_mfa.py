@@ -683,7 +683,9 @@ def test_managed_client_tokens(client, db, monkeypatch):
     assert run(db, "SELECT name FROM accessTokens WHERE lastUsedAt IS NOT NULL") == [("nightly checks",)]
     (last_used,) = run(db, "SELECT lastUsedAt FROM accessTokens WHERE id = ?", (active["id"],))[0]
     assert abs((store._parse_time(last_used) - utcnow()).total_seconds()) < 10
-    assert run(db, "SELECT issuedTo FROM mfaIssues") == [("client token 'nightly checks'",)]
+    # Kept with the token's id (and no owner: an admin made it), so pages can tell whose token it was.
+    assert run(db, "SELECT issuedTo FROM mfaIssues") == [("\x1f{}.\x1fclient token 'nightly checks'".format(active["id"]),)]
+    assert [i["issuedTo"] for i in store.list_mfa()["issues"]] == ["client token 'nightly checks'"]
 
 
 def test_the_check_route_needs_a_bearer_token(client):
@@ -776,3 +778,15 @@ def test_no_answer_and_no_log_record_holds_a_seed_or_a_token(client, monkeypatch
         repr(record.args) + record.getMessage() for record in caplog.records)
     for secret in (SEED, SEED.lower(), spaced, OTHER_SEED, RAW_SEED.decode(), KEY, BOOTSTRAP, managed):
         assert secret not in text
+
+
+def test_a_client_token_is_kept_with_its_id_within_the_columns_size():
+    """store.by_token: a mark with the token's id and its owner's, then as much of the name as fits in 255."""
+    assert store.by_token("Dana Lee") == store.by_name("Dana Lee") == "Dana Lee"
+    assert store.by_token("client token 'ci'", 7) == "\x1f7.\x1fclient token 'ci'"
+    assert store._by_parts("\x1f7.\x1fclient token 'ci'") == (7, None, "client token 'ci'")
+    long = "client token '{}' ({})".format("n" * 128, "p" * 200)[:255]
+    kept = store.by_token(long, 1234, 56)
+    assert len(kept) == 255 and kept.startswith("\x1f1234.56\x1f")
+    assert store._by_parts(kept) == (1234, 56, long[:255 - len("\x1f1234.56\x1f")])
+    assert store.by_name(None) is None and store._by_parts("x\x1f1.\x1fy") == (None, None, "x\x1f1.\x1fy")

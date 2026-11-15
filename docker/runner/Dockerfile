@@ -20,27 +20,31 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
-    && apt-get update && apt-get install -y --no-install-recommends ca-certificates libatomic1 tzdata \
+    && apt-get update && apt-get install -y --no-install-recommends ca-certificates iptables libatomic1 tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --shell /bin/bash pwuser
+    && useradd --create-home --shell /bin/bash pwuser \
+    && for i in $(seq 1 64); do useradd --create-home --shell /usr/sbin/nologin "pwuser$i"; done
 WORKDIR /app/playwright
 COPY runner/playwright/package.json runner/playwright/package-lock.json ./
-# install-deps runs apt-get itself. The browser folders are open to every user, as in Playwright's image.
+# install-deps runs apt-get itself. Every user may read and run the browsers, but none of the slots' users may
+# change them: one slot's check could otherwise swap the browser that another slot's next check starts.
 RUN npm ci --no-audit --no-fund \
     && node node_modules/playwright-core/cli.js install-deps chromium firefox webkit \
     && node node_modules/playwright-core/cli.js install chromium firefox webkit \
     && rm -rf /var/lib/apt/lists/* \
     && npm cache clean --force \
-    && chmod -R 777 /ms-playwright
+    && chmod -R u=rwX,go=rX /ms-playwright
 WORKDIR /app/gateway
 COPY gateway/package.json gateway/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY gateway/hub.js gateway/agent.js ./
 COPY gateway/lib ./lib
-RUN mkdir -p /tmp/gateway-agent
-# The agent starts as root and runs run-server, and so the browsers, as pwuser (RUN_SERVER_USER): a check's
-# browser can read every file and /proc entry of its own user, so it must not share one with the agent and its
-# token. Leaving root drops every capability; compose also keeps only the ones the agent needs.
+COPY docker/runner/entrypoint.sh /usr/local/bin/runner-entrypoint
+RUN chmod 755 /usr/local/bin/runner-entrypoint && mkdir -p /tmp/gateway-agent
+# The agent starts as root and runs each slot's run-server, and so its browsers, as a user of its own (pwuser1,
+# pwuser2, ...; RUN_SERVER_USER=pwuser{slot}): a check's browser can read every file and /proc entry of its own
+# user, so it must share one neither with the agent and its token nor with checks in other slots and their
+# browser profiles. Leaving root drops every capability; compose also keeps only the ones the agent needs.
 ENV HUB_URL=ws://hub:4500 \
     SLOTS=4 \
     BASE_PORT=3100 \
@@ -48,8 +52,11 @@ ENV HUB_URL=ws://hub:4500 \
     PLAYWRIGHT_CLI=/app/playwright/node_modules/playwright-core/cli.js \
     STATUS_FILE=/tmp/gateway-agent/status.json \
     EPHEMERAL=1 \
-    RUN_SERVER_USER=pwuser
+    RUN_SERVER_USER=pwuser{slot} \
+    RUNNER_BLOCKED_NETWORKS=
 USER root
+# Closes RUNNER_BLOCKED_NETWORKS to the browsers, then drops the capability that did it (entrypoint.sh).
+ENTRYPOINT ["/usr/local/bin/runner-entrypoint"]
 # Healthy while registered with the hub and the status file is fresh.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["node", "-e", "const s=JSON.parse(require('fs').readFileSync(process.env.STATUS_FILE,'utf8'));process.exit(s.registered&&Date.now()-Date.parse(s.updated)<30000?0:1)"]

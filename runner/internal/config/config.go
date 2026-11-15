@@ -4,11 +4,15 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 
@@ -66,10 +70,33 @@ type Settings struct {
 	LogDir        string // "" = slot output to the agent's log, prefixed "[slot i]"
 	Watchdog      string // parent-watchdog.js; "" = the caller writes the embedded copy
 	Ephemeral     bool
-	BrowsersPath  string // PLAYWRIGHT_BROWSERS_PATH for the run-servers; "" = the process's own value
-	DownloadHost  string // PLAYWRIGHT_DOWNLOAD_HOST for browser installs; "" = the process's own value
+	BrowsersPath  string     // PLAYWRIGHT_BROWSERS_PATH for the run-servers; "" = the process's own value
+	DownloadHost  string     // PLAYWRIGHT_DOWNLOAD_HOST for browser installs; "" = the process's own value
+	RunAs         []RunAs    // --run-server-user (Linux, macOS): slot i's run-server starts as RunAs[i-1]; nil = the agent's user
+	Launchers     []Launcher // the Windows service: slot i's run-server starts as Launchers[i-1]'s browser account
 	Timings       Timings
 }
+
+// RunAs is the user a slot's run-server starts as when the agent runs as root (--run-server-user), so that
+// a check's browser can't read the agent token from /proc.
+type RunAs struct {
+	Name     string
+	UID, GID uint32
+	Home     string
+}
+
+// Launcher starts a slot's run-server as another account than the agent's: the Windows service uses it to
+// run each slot's browsers as an account of their own instead of LocalSystem. Prepare sets the account's
+// token and environment on the command, or fails, and then run-server is not started at all. Account is
+// "" when the slot has none (Prepare then always fails).
+type Launcher struct {
+	Account string
+	Prepare func(cmd *exec.Cmd) error
+}
+
+// SlotPlaceholder in --run-server-user / RUN_SERVER_USER stands for the slot number, giving each slot its
+// own user.
+const SlotPlaceholder = "{slot}"
 
 // RunFlags are the flags of `pwrunner run`; Env names the variable each one falls back to.
 var RunFlags = []cli.FlagSpec{
@@ -85,6 +112,7 @@ var RunFlags = []cli.FlagSpec{
 	{Name: "log-dir", Arg: "<dir>", Env: "LOG_DIR", Usage: "run-server output goes to <dir>/slot-<i>.log"},
 	{Name: "watchdog", Arg: "<path>", Env: "PWRUNNER_WATCHDOG", Usage: "parent-watchdog.js preloaded into run-server (default: the built-in copy)"},
 	{Name: "ephemeral", Bool: true, Env: "EPHEMERAL=1", Usage: "the hub removes this node once it has been gone for EPHEMERAL_GRACE_S"},
+	{Name: "run-server-user", Arg: "<user>", Env: "RUN_SERVER_USER", Usage: "start run-server and its browsers as this user, so they can't read the agent token (Linux/macOS; the agent must run as root); {slot} in the name gives each slot its own user (pwuser{slot}: pwuser1, pwuser2, ...), so concurrent checks can't read each other's profiles"},
 	{Name: "config", Arg: "<backend.json>", Usage: "read defaults from an install's backend.json"},
 	{Name: "log-level", Arg: "info|debug", Usage: "log verbosity"},
 	{Name: "timings", Hidden: true},
@@ -93,7 +121,7 @@ var RunFlags = []cli.FlagSpec{
 var envOf = map[string]string{
 	"hub": "HUB_URL", "token": "GATEWAY_AGENT_TOKEN", "name": "NODE_NAME", "slots": "SLOTS", "base-port": "BASE_PORT",
 	"playwright-cli": "PLAYWRIGHT_CLI", "node": "PWRUNNER_NODE", "browsers": "BROWSERS", "status-file": "STATUS_FILE",
-	"log-dir": "LOG_DIR", "watchdog": "PWRUNNER_WATCHDOG", "ephemeral": "EPHEMERAL",
+	"log-dir": "LOG_DIR", "watchdog": "PWRUNNER_WATCHDOG", "ephemeral": "EPHEMERAL", "run-server-user": "RUN_SERVER_USER",
 }
 
 // Context is what FromArgs reads besides the arguments.
@@ -102,6 +130,10 @@ type Context struct {
 	Hostname string
 	Cwd      string
 	ExeDir   string // default locations of cli.js and node.exe
+	// For --run-server-user; nil or "" means the real process and os/user.
+	GOOS       string
+	Geteuid    func() int
+	LookupUser func(name string) (*user.User, error)
 }
 
 // DefaultContext reads the real process.
@@ -112,7 +144,87 @@ func DefaultContext() Context {
 	if exe, err := os.Executable(); err == nil {
 		exeDir = filepath.Dir(exe)
 	}
-	return Context{Env: os.Getenv, Hostname: host, Cwd: cwd, ExeDir: exeDir}
+	return Context{Env: os.Getenv, Hostname: host, Cwd: cwd, ExeDir: exeDir, GOOS: goruntime.GOOS, Geteuid: os.Geteuid, LookupUser: user.Lookup}
+}
+
+// runServerUser resolves --run-server-user / RUN_SERVER_USER (config.js runServerUser): only when the
+// agent runs as root, which it needs to start run-server as another user, and never as root itself.
+func runServerUser(name string, c Context) (*RunAs, error) {
+	if name == "" {
+		return nil, nil
+	}
+	goos, geteuid, lookup := c.GOOS, c.Geteuid, c.LookupUser
+	if goos == "" {
+		goos = goruntime.GOOS
+	}
+	if geteuid == nil {
+		geteuid = os.Geteuid
+	}
+	if lookup == nil {
+		lookup = user.Lookup
+	}
+	const setting = "--run-server-user / RUN_SERVER_USER"
+	if goos == "windows" {
+		return nil, cli.Usagef("%s is not supported on Windows; the Windows service (pwrunner install) runs the browsers as an account of their own", setting)
+	}
+	if geteuid() != 0 {
+		return nil, cli.Usagef("%s needs the agent to start as root, so that it can start run-server as %s", setting, name)
+	}
+	u, err := lookup(name)
+	if err != nil {
+		var unknown user.UnknownUserError
+		if errors.As(err, &unknown) {
+			return nil, cli.Usagef(`%s: there is no user "%s"`, setting, name)
+		}
+		return nil, cli.Usagef(`%s: can't look up "%s": %v`, setting, name, err)
+	}
+	uid, uerr := strconv.ParseUint(u.Uid, 10, 32)
+	gid, gerr := strconv.ParseUint(u.Gid, 10, 32)
+	if uerr != nil || gerr != nil {
+		return nil, cli.Usagef(`%s: no usable uid and gid for "%s"`, setting, name)
+	}
+	if uid == 0 {
+		return nil, cli.Usagef(`%s: "%s" is root; run-server must run as another user than the agent`, setting, name)
+	}
+	home := u.HomeDir
+	if home == "" {
+		home = "/"
+	}
+	return &RunAs{Name: u.Username, UID: uint32(uid), GID: uint32(gid), Home: home}, nil
+}
+
+// runServerUsers is the user of each slot, slot 1 first, or nil (config.js runServerUsers). A name with
+// {slot} gives each slot its own user (pwuser{slot}: pwuser1, pwuser2, ...), so a check's browser can't read
+// the profiles of checks running at the same time in other slots; a plain name is one user for every slot.
+func runServerUsers(name string, slots int, c Context) ([]RunAs, error) {
+	if name == "" {
+		return nil, nil
+	}
+	if !strings.Contains(name, SlotPlaceholder) {
+		u, err := runServerUser(name, c)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]RunAs, slots)
+		for i := range out {
+			out[i] = *u
+		}
+		return out, nil
+	}
+	out := make([]RunAs, 0, slots)
+	byUID := map[uint32]string{}
+	for i := 1; i <= slots; i++ {
+		u, err := runServerUser(strings.ReplaceAll(name, SlotPlaceholder, strconv.Itoa(i)), c)
+		if err != nil {
+			return nil, err
+		}
+		if other, ok := byUID[u.UID]; ok {
+			return nil, cli.Usagef(`--run-server-user / RUN_SERVER_USER: "%s" and "%s" are the same user (uid %d); each slot needs its own`, other, u.Name, u.UID)
+		}
+		byUID[u.UID] = u.Name
+		out = append(out, *u)
+	}
+	return out, nil
 }
 
 var hubRE = regexp.MustCompile(`(?i)^wss?://[^/]+`)
@@ -206,6 +318,9 @@ func build(get func(string) string, c Context) (Settings, error) {
 		s.Watchdog = abs(c.Cwd, v)
 	}
 	if s.Ephemeral, err = boolValue(get("ephemeral"), "--ephemeral / EPHEMERAL"); err != nil {
+		return s, err
+	}
+	if s.RunAs, err = runServerUsers(get("run-server-user"), s.Slots, c); err != nil {
 		return s, err
 	}
 	return s, nil

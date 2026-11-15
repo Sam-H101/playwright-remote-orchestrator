@@ -29,6 +29,8 @@ type Backend struct {
 	TaskName          string   `json:"taskName,omitempty"` // legacy scheduled task name: read, never written
 	ServiceName       string   `json:"serviceName"`
 	ServiceAccount    string   `json:"serviceAccount"`
+	BrowserAccount    string   `json:"browserAccount,omitempty"`  // legacy single browser account: read, never written
+	BrowserAccounts   []string `json:"browserAccounts,omitempty"` // the local account slot i's browsers run as is [i-1]
 	ReportURL         *string  `json:"reportUrl"`
 	InstallDir        string   `json:"installDir"`
 	DownloadHost      *string  `json:"downloadHost"`
@@ -67,6 +69,7 @@ func ReadBackend(path string) (b Backend, exists bool, err error) {
 func WriteBackend(path string, b Backend) error {
 	b.TaskName = ""
 	b.LegacyPortCount = nil
+	b.BrowserAccount = ""
 	if b.LogMaxBytes == 0 {
 		b.LogMaxBytes = DefaultLogMaxBytes
 	}
@@ -120,6 +123,17 @@ func WriteFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return nil
+}
+
+// SlotAccount is the browser account of slot i (1-based), or "" when the install has none for it: an
+// install from before per-slot accounts (only the legacy browserAccount, which no slot uses: one account
+// for every slot would let a check read the profiles of the others), or a slot count raised in
+// backend.json without re-running install.
+func (b Backend) SlotAccount(i int) string {
+	if i < 1 || i > len(b.BrowserAccounts) {
+		return ""
+	}
+	return b.BrowserAccounts[i-1]
 }
 
 // value is a backend.json setting as a `run` flag value.

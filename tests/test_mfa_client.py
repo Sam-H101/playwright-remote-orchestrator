@@ -154,7 +154,7 @@ def test_busy_gives_up_after_max_wait_s(grid_ui, clock):
 @pytest.mark.parametrize("status, answer, says", [
     (400, {"error": 'Send {"name": "<secret name>"} as JSON.'}, "Send"),
     (401, {"error": "The client token is wrong, revoked or expired.", "client_token_required": True}, "client token"),
-    (404, {"error": "There is no MFA secret called 'intranet'."}, "no MFA secret"),
+    (404, {"error": "There is no MFA secret called 'intranet' that this client token's owner may use."}, "no MFA secret"),
     (409, {"error": "The seed of 'intranet' doesn't decrypt", "cannot_decrypt": True}, "decrypt"),
     (503, {"error": "Set GRID_SECRETS_KEY to store MFA secrets.", "secrets_key_unset": True}, "GRID_SECRETS_KEY"),
     (502, "<html>Bad gateway</html>", "Bad Gateway"),  # not the Grid UI's answer: the HTTP reason

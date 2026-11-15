@@ -158,9 +158,10 @@ class SigninsUnavailable(Exception):
 
 
 class NotShared(Exception):
-    """A check asked by name for an MFA secret or a saved sign-in that belongs to someone else and isn't shared
-    with its token's owner; the message says so. Names are shared by everyone on the grid, so this tells nothing
-    that "the name is taken" doesn't."""
+    """A check that may start saved sign-ins under new names checked out one that belongs to someone else and
+    isn't shared with its token's owner; the message says so. Only there: that check would have started a
+    missing name, so it learns the name is taken whatever it is told. Everywhere else a check can't make the
+    item it asks for, and one it may not use is answered as if it weren't there (None, or "missing")."""
 
 
 class NotPermitted(Exception):
@@ -957,7 +958,10 @@ def _listed_item(cur, kind, item_id, access):
         cur.execute(_sql("SELECT {}, {} FROM savedSignins WHERE id = ?".format(_now_sql(), _SIGNIN_COLUMNS)), (item_id,))
         row = cur.fetchone()
         item = None if row is None else _signin(row[1:], _parse_time(row[0]))
-    return None if item is None else _ownership(cur, kind, [item], access)[0]
+    if item is None:
+        return None
+    _hide_token_names(cur, _by_fields(kind, [item]), access)
+    return _ownership(cur, kind, [item], access)[0]
 
 
 # ---- audit log ------------------------------------------------------------------
@@ -1438,6 +1442,117 @@ def _optional_text(value, what, limit):
     return value.strip() or None
 
 
+# Who took an MFA code or used a saved sign-in (mfaSecrets.lastIssuedTo, mfaIssues.issuedTo, savedSignins.savedBy,
+# lastUsedBy and leaseHolder) is the name of whoever asked: a person's, "Admin", GATEWAY_CLIENT_TOKEN, or a managed
+# client token's ("client token 'nightly' (Dana Lee)"). A client token's name is its owner's choice and private
+# to them and to whoever may see every token (tokens.all), as on the Access page; anyone else an item is shared
+# with learns only whose token it was. So that a page can tell which token it was, a client token's name is kept
+# after a mark with its id and its owner's users.id (empty: the admins'): "\x1f12.3\x1fclient token 'nightly'
+# (Dana Lee)". No name holds a control character (tokens' names are refused with one, and sign-in strips them
+# from people's), so a mark is never part of a name. What was kept before marks says only "client token '...'":
+# _hide_token_names matches those against the tokens there are.
+_BY_MARK = re.compile(r"\x1f([0-9]{1,10})\.([0-9]{0,10})\x1f")
+_UNMARKED_TOKEN = "client token '"
+_BY_LIMIT = 255  # the columns' size
+
+
+def by_token(name, token_id=None, owner_id=None):
+    """What to keep as who took a code or used a sign-in: name, after a mark for a managed client token
+    (token_id, its accessTokens.id; owner_id, the users.id checks using it act as), at most _BY_LIMIT characters."""
+    if token_id is None:
+        return name[:_BY_LIMIT]
+    mark = "\x1f{}.{}\x1f".format(int(token_id), "" if owner_id is None else int(owner_id))
+    return mark + name[:_BY_LIMIT - len(mark)]
+
+
+def _by_parts(value):
+    """(token id, owner id, name) of what by_token kept: (None, None, value) for anything without a mark."""
+    found = _BY_MARK.match(value) if isinstance(value, str) else None
+    if found is None:
+        return None, None, value
+    return int(found.group(1)), int(found.group(2)) if found.group(2) else None, value[found.end():]
+
+
+def by_name(value):
+    """The name in what by_token kept, without its mark: for the log."""
+    return _by_parts(value)[2]
+
+
+def _token_name(name, owner_name):
+    # A client token's name as auth names a check using it (auth._token_principal), for unmarked rows.
+    text = "client token '{}'".format(name)
+    return text if owner_name is None else "{} ({})".format(text, owner_name)[:_BY_LIMIT]
+
+
+def _hide_token_names(cur, fields, access):
+    """Take the marks off each (row, key) of fields: row[key] is what by_token kept. With access (who asks), the
+    name of a client token the viewer may not see is taken off too: row[key] None, and row[key + "Hidden"] True;
+    row[key + "Owner"] is then the name of the person whose token it is, or None when that can't be told or the
+    admins' it is. The viewer sees a token's name when they own it or may see every token (tokens.all), as the
+    Access page shows it; seeing an item that token used doesn't make it anyone else's. An unmarked
+    "client token '...'" (kept before marks) shows only when every token named so now is the viewer's."""
+    found = []
+    for row, key in fields:
+        token_id, owner_id, name = _by_parts(row[key])
+        row[key] = name
+        if access is None:
+            continue
+        row[key + "Hidden"], row[key + "Owner"] = False, None
+        if token_id is not None or (isinstance(name, str) and name.startswith(_UNMARKED_TOKEN)):
+            found.append((row, key, token_id, owner_id, name))
+    if not found or "tokens.all" in access.permissions:
+        return
+    tables = _tables(cur)
+    has_tokens, has_owners = "accesstokens" in tables, "itemowners" in tables
+    owners = {}  # accessTokens.id -> its owner's users.id (None: the admins'), for the tokens there are
+    named = {}  # an unmarked name -> the owners of the tokens named so now
+    if has_tokens:
+        unmarked = any(token_id is None for _, _, token_id, _, _ in found)
+        ids = sorted({token_id for _, _, token_id, _, _ in found if token_id is not None})
+        if unmarked:
+            cur.execute("SELECT id, name FROM accessTokens WHERE kind = 'client'")
+        else:
+            cur.execute("SELECT id, name FROM accessTokens WHERE id IN ({})".format(", ".join(str(i) for i in ids)))
+        tokens = cur.fetchall()
+        owners = {token_id: None for token_id, _ in tokens}
+        if owners and has_owners:
+            cur.execute("SELECT itemId, userId FROM itemOwners WHERE itemKind = 'token' AND itemId IN ({})".format(
+                ", ".join(str(int(i)) for i in owners)))
+            owners.update(cur.fetchall())
+        if unmarked:
+            people = _user_names(cur, tables, {o for o in owners.values() if o is not None})
+            for token_id, name in tokens:
+                owner = owners[token_id]
+                named.setdefault(_token_name(name, None if owner is None else people.get(owner, "user {}".format(owner))),
+                                 set()).add(owner)
+    hidden = []
+    for row, key, token_id, owner_id, name in found:
+        whose = {owners.get(token_id, owner_id)} if token_id is not None else named.get(name, set())
+        if whose and all(o is not None and o == access.user_id for o in whose):
+            continue
+        row[key], row[key + "Hidden"] = None, True
+        hidden.append((row, key, whose.pop() if len(whose) == 1 else None))
+    people = _user_names(cur, tables, {owner for _, _, owner in hidden if owner is not None})
+    for row, key, owner in hidden:
+        row[key + "Owner"] = people.get(owner)
+
+
+# What says who used an item, by its kind: _hide_token_names takes the token names off these.
+_BY_KEYS = {"mfa": ("lastIssuedTo",), "signin": ("savedBy", "lastUsedBy", "leaseHolder")}
+
+
+def _by_fields(kind, rows):
+    return [(row, key) for row in rows for key in _BY_KEYS[kind]]
+
+
+def _user_names(cur, tables, user_ids):
+    """{users.id: the name the pages show} of those of user_ids there are."""
+    if not user_ids or "users" not in tables:
+        return {}
+    cur.execute("SELECT id, name FROM users WHERE id IN ({})".format(", ".join(str(int(i)) for i in sorted(user_ids))))
+    return {user_id: name or "user {}".format(user_id) for user_id, name in cur.fetchall()}
+
+
 def _mfa(row):
     secret_id, name, issuer, account, algorithm, digits, period = row[:7]
     created, last_step, last_issued, last_to, count = row[7:]
@@ -1489,6 +1604,7 @@ def list_mfa(access=None):
             """.format(_days_ago_sql(MFA_LOG_DAYS), visible, MFA_LOG_LIMIT)), params)
             issues = [{"id": i, "secretId": sid, "name": name, "step": step, "issuedAt": _iso(_parse_time(at)),
                        "issuedTo": to, "label": label} for i, sid, name, step, at, to, label in cur.fetchall()]
+            _hide_token_names(cur, _by_fields("mfa", secrets_) + [(i, "issuedTo") for i in issues], access)
             if access is not None:
                 _ownership(cur, "mfa", secrets_, access)
     except _MissingTables:
@@ -1511,8 +1627,8 @@ def create_mfa(name, secret, issuer=None, account=None, algorithm=None, digits=N
                actor=None, access=None):
     """Store a secret, owned by owner_id (a users.id; None: the admins'). `secret` is a base32 seed or an
     otpauth://totp/ URI (whose issuer, account and settings are used unless given here). Returns the secret as
-    list_mfa shows it without access, never the seed. access (who asks) decides how a taken name is refused;
-    actor is who added it, for the audit log.
+    list_mfa shows it to access (who asks; without its ownership: store.ownership adds that), never the seed.
+    access also decides how a taken name is refused; actor is who added it, for the audit log.
 
     Raises mfa.InvalidSecret, mfa.SecretsKeyMissing or MfaUnavailable (also for a secret someone owns, on a
     database without itemOwners)."""
@@ -1558,7 +1674,9 @@ def create_mfa(name, secret, issuer=None, account=None, algorithm=None, digits=N
                 _add_owner(cur, "mfa", secret_id, owner_id)
             _audit(cur, actor, "mfa.created", "mfa", secret_id, name)
             cur.execute(_sql("SELECT " + _MFA_COLUMNS + " FROM mfaSecrets WHERE id = ?"), (secret_id,))
-            return _mfa(cur.fetchone())
+            secret = _mfa(cur.fetchone())
+            _hide_token_names(cur, _by_fields("mfa", [secret]), access)  # with access, the listing's keys
+            return secret
     except _MissingTables as e:
         raise MfaUnavailable(_NO_MFA_TABLE) from e
 
@@ -1590,11 +1708,6 @@ def _window(t, step, period):
     return round(max(0.0, step * period - t), 3), round((step + 1) * period - t, 3)
 
 
-def _not_shared(what, name):
-    return NotShared("The {} {!r} belongs to someone else and isn't shared with this client token's owner."
-                     .format(what, name))
-
-
 def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s=None, now=None, access=None,
                    actor=None):
     """Hand out the code of a time step nobody has had yet, for the secret called `name` (or with id
@@ -1603,9 +1716,10 @@ def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s
     wait before typing it, validForS how long until it stops working (both from now, by this server's
     clock, which must be in sync with the site's).
 
-    With access (who asks), a secret it may not see is answered before its seed is even decrypted, as if it
-    weren't there when asked by id (the page), and with NotShared when asked by name (a check). actor is who
-    took a code on the page, for the audit log (checks' hand-outs are in mfaIssues already).
+    With access (who asks), a secret it may not see is answered as if it weren't there, by id (the page) and by
+    name (a check), before its seed is even decrypted. A check can't add a secret, so telling it a name is taken
+    would tell it what someone else keeps that it may not see. actor is who took a code on the page, for the
+    audit log (checks' hand-outs are in mfaIssues already).
 
     Returns {"id", "name", "code", "step", "waitS", "validForS", "period", "digits"}, or None for an
     unknown secret. Raises MfaBusy when MFA_MAX_AHEAD_STEPS steps ahead are taken, mfa.CannotDecrypt
@@ -1623,9 +1737,7 @@ def issue_mfa_code(issued_to, name=None, secret_id=None, label=None, min_valid_s
             if row is None:
                 return None
             if access is not None and not _item_access(cur, "mfa", row[0], access)[1]:
-                if secret_id is not None:
-                    return None
-                raise _not_shared("MFA secret", name)
+                return None
             sid, name, algorithm, digits, period, cipher, last_step = row
             seed = mfa.decrypt(cipher, name)
             t = time.time() if now is None else now
@@ -1838,6 +1950,7 @@ def list_signins(access=None):
             cur.execute(_sql("SELECT " + _SIGNIN_COLUMNS + " FROM savedSignins s WHERE 1 = 1" + visible + " ORDER BY name"),
                         params)
             signins = [_signin(row, now) for row in cur.fetchall()]
+            _hide_token_names(cur, _by_fields("signin", signins), access)
             if access is not None:
                 _ownership(cur, "signin", signins, access)
     except _MissingTables:
@@ -1849,6 +1962,12 @@ def _may_add_signins(access, may_add=True):
     # A name's first checkout adds it, for checks whose token's owner may add sign-ins (and the store's own callers),
     # unless the token's scope leaves adding out (may_add).
     return may_add and (access is None or "signins.add" in access.permissions)
+
+
+def _not_shared(name):
+    # Only for a check that may add names (NotShared says why).
+    return NotShared("The saved sign-in {!r} belongs to someone else and isn't shared with this client token's "
+                     "owner.".format(name))
 
 
 def _add_signin(name, access=None, actor=None, may_add=True):
@@ -1908,11 +2027,14 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
     the id it was checked out with: while that is still the saved one, it is dropped, else the newer one is
     answered. A name no check used yet is added.
 
-    With access (who the check acts as), a sign-in it may not use raises NotShared, and two more answers can
-    come: {"status": "missing"} for a name nobody added when it may not add names, and {"status":
-    "owner-signs-in", "name"} when nothing usable is saved and it isn't a steward, so it may not sign in for
-    it. actor is the check, for the audit log. may_add is False when the asking client token's scope leaves out
-    signins.add: a name nobody added then stays missing, whatever access holds.
+    With access (who the check acts as), two more answers can come: {"status": "missing"} for a name nobody
+    added, or one it may not use, when it may not add names; and {"status": "owner-signs-in", "name"} when
+    nothing usable is saved and it isn't a steward, so it may not sign in for it. A check that may add names
+    and asks for one it may not use gets NotShared: it would have started a missing one, so that the name is
+    taken is plain to it whatever it is told, and the message says why. A check that may not add names learns
+    nothing from the answer: the two read alike. actor is the check, for the audit log. may_add is False when
+    the asking client token's scope leaves out signins.add: a name nobody added then stays missing, whatever
+    access holds.
     Raises InvalidSignin, SigninsFull, mfa.SecretsKeyMissing (before anything is written) and SigninsUnavailable."""
     name = _signin_name(name)
     rejected_version = _version(rejected_version, "rejectedVersion")
@@ -1939,7 +2061,9 @@ def checkout_signin(used_by, name, rejected_version=None, lease_s=None, signin_i
                         # again: a row someone else owns is there, it just isn't this check's.
                         _, _, _, steward, usable = _item_access(cur, "signin", row[0], access)
                         if not usable:
-                            raise _not_shared("saved sign-in", name)
+                            if not _may_add_signins(access, may_add):
+                                return {"status": "missing"}
+                            raise _not_shared(name)
                     return _checkout(cur, now, row, used_by, rejected_version, signin_id, lease_s, steward)
                 if not _may_add_signins(access, may_add):
                     return {"status": "missing"}
@@ -1957,7 +2081,8 @@ def _checkout(cur, now, row, used_by, rejected_version, rejected_id, lease_s, ma
         cur.execute(_sql("UPDATE savedSignins SET stateCipher = NULL, rejectedCount = rejectedCount + 1, lastRejectedAt = ? "
                          "WHERE id = ?"), (_db_time(now), signin_id))
         cipher = None
-        log.info("saved sign-in %r: the site asked %s to sign in again with version %d", name, used_by, version)
+        log.info("saved sign-in %r: the site asked %s to sign in again with version %d", name, by_name(used_by),
+                 version)
     state = None
     if cipher is not None and version > 0 and (expires is None or expires > now):
         try:
@@ -1983,6 +2108,10 @@ def _checkout(cur, now, row, used_by, rejected_version, rejected_id, lease_s, ma
             "leaseForS": lease_s}
 
 
+# save_signin's mark for a lease ended because its check may no longer use the sign-in: answered as unknown.
+_GONE = object()
+
+
 def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_age_s=None, signin_id=None,
                 access=None):
     """Keep the state a check is signed in with, for max_age_s seconds (SIGNIN_MAX_AGE_S by default):
@@ -1993,15 +2122,16 @@ def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_
     one and nobody is signing in. The id tells a state from one of the same version an admin deleted:
     a name added again starts over at version 0.
 
-    With access (who the check acts as), a sign-in it may not use raises NotShared, and only a steward's
-    check saves a newer state: anyone else's is answered with the reason "shared", and the owner's state
-    stays as it was. A check that held a lease as a steward and is no longer one (its token's owner lost
-    “Every saved sign-in”, say) saves nothing either: its lease ends, and it gets LeaseLost, or NotShared when it
-    may no longer use the sign-in at all.
+    With access (who the check acts as), a sign-in it may not use is answered as if it weren't there (saving
+    never adds a name, so telling it the name is taken would tell it what it may not see), and only a
+    steward's check saves a newer state: anyone else's is answered with the reason "shared", and the owner's
+    state stays as it was. A check that held a lease as a steward and is no longer one (its token's owner lost
+    “Every saved sign-in”, say) saves nothing either: its lease ends, and it gets LeaseLost, or the answer for
+    an unknown name when it may no longer use the sign-in at all.
 
     Returns {"saved": True, "version"}, {"saved": False, "reason": "newer", "signing-in" or "shared",
-    "version"}, or None for an unknown name. Raises InvalidSignin (SigninTooLarge), LeaseLost,
-    mfa.SecretsKeyMissing and SigninsUnavailable."""
+    "version"}, or None for an unknown name (or one it may not use). Raises InvalidSignin (SigninTooLarge),
+    LeaseLost, mfa.SecretsKeyMissing and SigninsUnavailable."""
     name = _signin_name(name)
     if lease_token is not None and (not isinstance(lease_token, str) or not lease_token):
         raise InvalidSignin("leaseToken is the token the checkout answered.")
@@ -2018,7 +2148,9 @@ def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_
         raise InvalidSignin("maxAgeS is a number of seconds from {} to {} ({} days).".format(low, high, high // 86400))
     packed, domains, cookies, origins = _pack_state(state)
     _need_signin_key()
-    ended = None  # what a check that held the lease and may no longer save with it is told, once its lease ends
+    # What a check that held the lease and may no longer save with it is told, once its lease ends: LeaseLost, or
+    # _GONE when it may no longer use the sign-in at all.
+    ended = None
     try:
         with _session() as cur:
             lock = _lock(cur)
@@ -2029,25 +2161,24 @@ def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_
             row = cur.fetchone()
             if row is None:
                 return None
-            steward, refused = True, None  # refused: why a check that may not use it at all is turned away
+            steward, usable = True, True
             if access is not None:
                 _, _, _, steward, usable = _item_access(cur, "signin", row[0], access)
-                if not usable:
-                    refused = _not_shared("saved sign-in", name)
             row_id, name, version, lease_hash, lease_until = row
             leased = _lease_live(lease_hash, _parse_time(lease_until), now)
             held = lease_token is not None and leased and _holds(lease_hash, lease_token)
-            if held and (refused is not None or not steward):
+            if held and (not usable or not steward):
                 # Only a steward's check is given a lease, and only a steward's saves with it: one that has stopped
                 # being a steward since (it lost “Every saved sign-in”, say, and maybe the share that reached it
                 # too) ends it here, so that the next steward's check signs in at once rather than wait for it.
-                # Committed, then raised.
+                # Committed, then answered.
                 cur.execute(_sql("UPDATE savedSignins SET leaseHash = NULL, leaseUntil = NULL, leaseHolder = NULL "
                                  "WHERE id = ?"), (row_id,))
-                ended = refused or LeaseLost("Checks using this client token may no longer sign in fresh for {!r}, so "
-                                             "its lease ended. Nothing was saved.".format(name))
-            elif refused is not None:
-                raise refused
+                ended = _GONE if not usable else LeaseLost(
+                    "Checks using this client token may no longer sign in fresh for {!r}, so its lease ended. Nothing "
+                    "was saved.".format(name))
+            elif not usable:
+                return None
             elif lease_token is not None:
                 if not held:
                     raise LeaseLost("The lease for {!r} isn't yours any more: it ran out, or an admin forgot the sign-in. "
@@ -2072,18 +2203,20 @@ def save_signin(saved_by, name, state, lease_token=None, base_version=None, max_
                                                _db_time(now), saved_by, _db_time(expires), row_id))
     except _MissingTables as e:
         raise SigninsUnavailable(_NO_SIGNIN_TABLE) from e
+    if ended is _GONE:
+        return None
     if ended is not None:
         raise ended
     if lease_token is not None:
-        log.info("saved sign-in %r: signed in by %s (version %d)", name, saved_by, version + 1)
+        log.info("saved sign-in %r: signed in by %s (version %d)", name, by_name(saved_by), version + 1)
     return {"saved": True, "version": version + 1}
 
 
 def release_signin(name, lease_token, access=None):
     """End a lease without saving (the sign-in failed), so the next check signs in at once. Returns whether the
     lease was the token's, or None for an unknown name. With access (who the check acts as), a sign-in it may
-    not use raises NotShared, unless the token holds its lease: a check that may no longer use it still ends
-    the lease it was given, and ending it is all that token can do."""
+    not use is answered as unknown (releasing never adds a name), unless the token holds its lease: a check
+    that may no longer use it still ends the lease it was given, and ending it is all that token can do."""
     name = _signin_name(name)
     if not isinstance(lease_token, str) or not lease_token:
         raise InvalidSignin("leaseToken is the token the checkout answered.")
@@ -2096,7 +2229,7 @@ def release_signin(name, lease_token, access=None):
                 return None
             if not _holds(row[1], lease_token):
                 if access is not None and not _item_access(cur, "signin", row[0], access)[4]:
-                    raise _not_shared("saved sign-in", name)
+                    return None
                 return False
             cur.execute(_sql("UPDATE savedSignins SET leaseHash = NULL, leaseUntil = NULL, leaseHolder = NULL WHERE id = ?"),
                         (row[0],))
@@ -2128,6 +2261,7 @@ def forget_signin(signin_id, access=None, actor=None):
                         (signin_id,))
             row = cur.fetchone()
             signin = _signin(row[1:], _parse_time(row[0]))
+            _hide_token_names(cur, _by_fields("signin", [signin]), access)
             if access is not None:
                 _ownership(cur, "signin", [signin], access)
             return signin

@@ -129,6 +129,15 @@ jobs:
           icacls $env:INSTALL_DIR /setowner '*S-1-5-32-545' /T /C /Q
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Plant the single browser account of an install from before each slot had its own
+        run: |
+          # pwbrowser-<first 4 bytes of sha256(lower-case service name), hex>: install must remove it.
+          $sha = [Security.Cryptography.SHA256]::Create()
+          $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes('playwrightbackend'))[0..3] | ForEach-Object { $_.ToString('x2') })
+          $legacy = "pwbrowser-$hash"
+          New-LocalUser -Name $legacy -NoPassword -Description 'legacy browser account (CI)' | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "LEGACY_ACCOUNT=$legacy", "ACCOUNT_HASH=$hash" -Encoding ASCII
+
       - name: Migrate to pwrunner
         run: |
           if (-not (Invoke-RestMethod "$env:HUB_HTTP/healthz").ok) { throw 'The hub is not running' }
@@ -152,13 +161,56 @@ jobs:
           Write-Host "Node $($status.node) migrated: 2 healthy slots, service running"
           Add-Content -Path $env:GITHUB_ENV -Value "CI_NODE=$($status.node)" -Encoding ASCII
 
+      - name: Each slot's run-server runs as its own browser account, not as SYSTEM
+        run: |
+          $cfg = Get-Content "$env:INSTALL_DIR\backend.json" -Raw | ConvertFrom-Json
+          if ($cfg.PSObject.Properties.Name -contains 'browserAccount') { throw "backend.json still has the legacy browserAccount: $($cfg.browserAccount)" }
+          $accounts = @($cfg.browserAccounts)
+          if ($accounts.Count -ne 2 -or @($accounts | Select-Object -Unique).Count -ne 2) { throw "backend.json must list two distinct browser accounts: '$($accounts -join ', ')'" }
+          if (Get-LocalUser -Name $env:LEGACY_ACCOUNT -ErrorAction SilentlyContinue) { throw "The legacy single account $env:LEGACY_ACCOUNT survived the install" }
+          secedit /export /areas USER_RIGHTS /cfg "$env:RUNNER_TEMP\rights.inf" | Out-Null
+          $rights = Get-Content "$env:RUNNER_TEMP\rights.inf"
+          $sids = @()
+          for ($i = 0; $i -lt $accounts.Count; $i++) {
+            $account = $accounts[$i]
+            if ($account -ne "pwb-$env:ACCOUNT_HASH-$($i + 1)") { throw "slot $($i + 1): account '$account', want pwb-$env:ACCOUNT_HASH-$($i + 1)" }
+            $user = Get-LocalUser -Name $account
+            if (-not $user.Enabled -or $user.PasswordExpires -or $user.UserMayChangePassword) { throw "$account is not a locked-down service account: $($user | Format-List * | Out-String)" }
+            $sid = $user.SID.Value
+            if (Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object { $_.SID.Value -eq $sid }) { throw "$account is an administrator" }
+            $hidden = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' -Name $account -ErrorAction SilentlyContinue
+            if (-not $hidden -or $hidden.$account -ne 0) { throw "$account is not hidden from the sign-in screen" }
+            foreach ($r in 'SeBatchLogonRight', 'SeDenyInteractiveLogonRight', 'SeDenyRemoteInteractiveLogonRight', 'SeDenyNetworkLogonRight') {
+              $line = @($rights | Where-Object { $_ -like "$r *" })
+              if (-not ($line -match [regex]::Escape($sid)) -and -not ($line -match "\b$account\b")) { throw "$account lacks $r ($line)" }
+            }
+            $sids += $sid
+          }
+          # runtime.json names the run-servers; GetOwner says whose token each one runs with: slot i's account.
+          $slots = (Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json).slots
+          if ($slots.Count -ne 2) { throw "runtime.json lists $($slots.Count) slots" }
+          foreach ($slot in $slots) {
+            $want = $accounts[$slot.index - 1]
+            $p = Get-CimInstance Win32_Process -Filter "ProcessId = $($slot.pid)"
+            if (-not $p -or $p.Name -ne 'node.exe') { throw "slot $($slot.index): no run-server with pid $($slot.pid)" }
+            $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner
+            if ($owner.User -ne $want) { throw "slot $($slot.index): run-server $($p.ProcessId) runs as $($owner.Domain)\$($owner.User), not $want" }
+            Write-Host "slot $($slot.index): run-server $($p.ProcessId) runs as $want"
+          }
+          $line = "run-servers run as $($accounts[0]) in slot 1, $($accounts[1]) in slot 2"
+          if (-not (Select-String -Path "$env:INSTALL_DIR\logs\agent.log" -Pattern $line -SimpleMatch -Quiet)) { throw "agent.log does not say '$line'" }
+          # Where each account's browsers keep their profiles: under its own profile folder, which the other can't open.
+          $profiles = $sids | ForEach-Object { (Get-CimInstance Win32_UserProfile -Filter "SID = '$_'").LocalPath }
+          Add-Content -Path $env:GITHUB_ENV -Value "BROWSER_ACCOUNTS=$($accounts -join ',')", "BROWSER_SIDS=$($sids -join ',')", "BROWSER_PROFILES=$($profiles -join ',')" -Encoding ASCII
+
       - name: Token is not exposed and the install is not writable by users
         run: |
           $acl = Get-Acl "$env:INSTALL_DIR\agent.token"
           $sids = $acl.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
           $extra = @($sids | Where-Object { $_ -ne 'S-1-5-18' -and $_ -ne 'S-1-5-32-544' })
           if (-not $acl.AreAccessRulesProtected -or $extra.Count) { throw "agent.token is readable by more than SYSTEM and Administrators: $($acl.AccessToString)" }
-          # The service runs these as SYSTEM, so only SYSTEM and Administrators may change them, owning included.
+          # The service runs these (pwrunner.exe as SYSTEM, run-server as the browser account), so only SYSTEM and
+          # Administrators may change them, owning included.
           $runs = "$env:INSTALL_DIR\pwrunner.exe", "$env:INSTALL_DIR\app\node_modules\playwright-core\cli.js", "$env:INSTALL_DIR\runtime\node\node.exe"
           foreach ($f in @($env:INSTALL_DIR, "$env:INSTALL_DIR\agent.token") + $runs) {
             $owner = (Get-Acl $f).GetOwner([Security.Principal.SecurityIdentifier]).Value
@@ -176,6 +228,12 @@ jobs:
           foreach ($f in Get-ChildItem "$env:INSTALL_DIR\logs", "$env:INSTALL_DIR\*.json" -File) {
             if (Select-String -Path $f.FullName -Pattern 'ci-token' -SimpleMatch -Quiet) { throw "Token written to $($f.FullName)" }
           }
+          # Nor run-server's secret endpoint path ("/" and 64 hex digits), which every slot's account could read there:
+          # run-server prints it, and the agent masks it as /<endpoint>.
+          foreach ($f in Get-ChildItem "$env:INSTALL_DIR\logs\slot-*.log*", "$env:INSTALL_DIR\logs\agent.log*", "$env:INSTALL_DIR\logs\service.log*", "$env:INSTALL_DIR\runtime.json" -File) {
+            if (Select-String -Path $f.FullName -Pattern '/[0-9a-f]{64}' -CaseSensitive -Quiet) { throw "A run-server endpoint path is written to $($f.FullName)" }
+          }
+          if (-not (Select-String -Path "$env:INSTALL_DIR\logs\slot-1.log" -Pattern 'Listening on ws://127.0.0.1:\d+/<endpoint>' -Quiet)) { throw "slot-1.log lacks run-server's masked 'Listening on' line" }
 
       - name: Re-run the installed copy (keeps every setting, skips the runtime)
         run: |
@@ -184,6 +242,30 @@ jobs:
           if (-not (Select-String -Path "$env:INSTALL_DIR\logs\install.log" -Pattern 'already installed, skipping npm' -Quiet)) { throw 'The re-run did not skip the runtime' }
           $cfg = Get-Content "$env:INSTALL_DIR\backend.json" -Raw | ConvertFrom-Json
           if ($cfg.nodeName -ne $env:CI_NODE -or $cfg.slots -ne 2) { throw "The re-run changed the settings: $($cfg | ConvertTo-Json)" }
+          if (($cfg.browserAccounts -join ',') -ne $env:BROWSER_ACCOUNTS) { throw "The re-run changed the browser accounts: $($cfg.browserAccounts -join ',')" }
+
+      - name: Fewer slots remove the extra browser account, more slots add it back
+        run: |
+          $accounts = $env:BROWSER_ACCOUNTS -split ','
+          & "$env:INSTALL_DIR\pwrunner.exe" install --slots 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cfg = Get-Content "$env:INSTALL_DIR\backend.json" -Raw | ConvertFrom-Json
+          if ($cfg.slots -ne 1 -or ($cfg.browserAccounts -join ',') -ne $accounts[0]) { throw "1 slot: $($cfg | ConvertTo-Json)" }
+          if (Get-LocalUser -Name $accounts[1] -ErrorAction SilentlyContinue) { throw "$($accounts[1]) survived lowering the slots to 1" }
+          if (-not (Get-LocalUser -Name $accounts[0] -ErrorAction SilentlyContinue)) { throw "$($accounts[0]) went too" }
+          & "$env:INSTALL_DIR\pwrunner.exe" install --slots 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cfg = Get-Content "$env:INSTALL_DIR\backend.json" -Raw | ConvertFrom-Json
+          if ($cfg.slots -ne 2 -or ($cfg.browserAccounts -join ',') -ne $env:BROWSER_ACCOUNTS) { throw "2 slots again: $($cfg | ConvertTo-Json)" }
+          # Slot 2's account is a new one, with a new SID and profile.
+          $sids = $accounts | ForEach-Object { (Get-LocalUser -Name $_).SID.Value }
+          $slots = (Get-Content "$env:INSTALL_DIR\runtime.json" -Raw | ConvertFrom-Json).slots
+          foreach ($slot in $slots) {
+            $owner = Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter "ProcessId = $($slot.pid)") -MethodName GetOwner
+            if ($owner.User -ne $accounts[$slot.index - 1]) { throw "slot $($slot.index) runs as $($owner.User)" }
+          }
+          $profiles = $sids | ForEach-Object { (Get-CimInstance Win32_UserProfile -Filter "SID = '$_'").LocalPath }
+          Add-Content -Path $env:GITHUB_ENV -Value "BROWSER_SIDS=$($sids -join ',')", "BROWSER_PROFILES=$($profiles -join ',')" -Encoding ASCII
 
       - name: A failed upgrade restarts the previous install
         run: |
@@ -213,10 +295,69 @@ jobs:
               if (text !== 'ok') throw new Error(`session ${i + 1}: got ${text}`);
               console.log(`session ${i + 1} through ${url}: ok`);
             }
-            await Promise.all(browsers.map((b) => b.close()));
+            // A check controls its browser, and file:// reads whatever the browser's account can. A file Users
+            // can read must load (or the next check proves nothing); agent.token must not.
+            const page = await browsers[0].newPage();
+            const fileUrl = (name) => 'file:///' + (process.env.INSTALL_DIR + '\\' + name).replace(/\\/g, '/');
+            await page.goto(fileUrl('backend.json'));
+            if (!(await page.content()).includes(process.env.BROWSER_ACCOUNTS.split(',')[0])) throw new Error('file:// did not load backend.json');
+            let refused = '';
+            try {
+              await page.goto(fileUrl('agent.token'));
+            } catch (e) {
+              refused = e.message.split('\n')[0];
+            }
+            if ((await page.content().catch(() => '')).includes('ci-token')) throw new Error('a session read agent.token through file://');
+            // Access denied, not "not found" or a download: the browser tried the file and its account may not read it.
+            if (!refused.includes('ERR_ACCESS_DENIED')) throw new Error(`file:// agent.token: expected ERR_ACCESS_DENIED, got '${refused}'`);
+            console.log(`file:// backend.json loads; file:// agent.token: ${refused}`);
+            // Each slot's browsers run as its own account and keep their profiles in its temp folder: a browser
+            // can list its own account's temp folder and not the other slot's, where the other session's profile is.
+            const temps = process.env.BROWSER_PROFILES.split(',').map((p) => 'file:///' + (p + '\\AppData\\Local\\Temp\\').replace(/\\/g, '/'));
+            for (const [i, browser] of browsers.entries()) {
+              const p = await browser.newPage();
+              const seen = [];
+              for (const temp of temps) {
+                let outcome;
+                try {
+                  await p.goto(temp);
+                  const html = await p.content();
+                  outcome = /playwright[_-]/i.test(html) ? 'lists a profile' : 'no profile listed';
+                } catch (e) {
+                  outcome = e.message.split('\n')[0];
+                }
+                seen.push(outcome);
+              }
+              console.log(`session ${i + 1}: ${temps.map((t, j) => `${t}: ${seen[j]}`).join('; ')}`);
+              if (seen.filter((s) => s === 'lists a profile').length !== 1) throw new Error(`session ${i + 1} must see the profile in its own account's temp folder only`);
+              await p.close();
+            }
+            // run-server takes sessions at its secret path only. A client of the run-server port at "/" gets HTTP 400,
+            // and so does a page with a localhost origin, which run-server's origin check lets through.
+            const WebSocket = require(process.env.GITHUB_WORKSPACE + '\\gateway\\node_modules\\ws');
+            const base = Number(process.env.BASE_PORT);
+            for (const port of [base, base + 1]) {
+              const status = await new Promise((done) => {
+                const ws = new WebSocket(`ws://127.0.0.1:${port}/`, { headers: { 'x-playwright-browser': 'chromium' } });
+                ws.on('unexpected-response', (req, res) => done(res.statusCode));
+                ws.on('open', () => { ws.close(); done('open'); });
+                ws.on('error', (e) => done(e.message));
+              });
+              if (status !== 400) throw new Error(`ws://127.0.0.1:${port}/: expected HTTP 400, got ${status}`);
+              console.log(`ws://127.0.0.1:${port}/ refused with HTTP 400`);
+            }
+            await page.goto(`http://127.0.0.1:${base}/`).catch(() => {});
+            const fromPage = await page.evaluate(async (ports) => Promise.all(ports.map((port) => new Promise((done) => {
+              const ws = new window.WebSocket(`ws://127.0.0.1:${port}/`);
+              ws.onopen = () => { ws.close(); done('open'); };
+              ws.onerror = () => done('refused');
+            }))), [base, base + 1]);
+            if (fromPage.includes('open')) throw new Error(`a page opened a run-server session: ${fromPage}`);
+            console.log(`a page at http://127.0.0.1:${base}/ opening ws://127.0.0.1:{${base},${base + 1}}/: ${fromPage.join(', ')}`);
           })().catch(e => { console.error(e); process.exit(1); });
           '@
           Set-Content -Path "$env:RUNNER_TEMP\client.js" -Value $client
+          $env:BASE_PORT = (Get-Content "$env:INSTALL_DIR\backend.json" -Raw | ConvertFrom-Json).basePort
           node "$env:RUNNER_TEMP\client.js"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:PWRUNNER status --install-dir $env:INSTALL_DIR
@@ -249,6 +390,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Test-Path $env:INSTALL_DIR) { throw 'Install dir still exists' }
           if (Get-Service PlaywrightBackend -ErrorAction SilentlyContinue) { throw 'Service still registered' }
+          secedit /export /areas USER_RIGHTS /cfg "$env:RUNNER_TEMP\rights-after.inf" | Out-Null
+          $accounts = $env:BROWSER_ACCOUNTS -split ','
+          $sids = $env:BROWSER_SIDS -split ','
+          for ($i = 0; $i -lt $accounts.Count; $i++) {
+            $account, $sid = $accounts[$i], $sids[$i]
+            if (Get-LocalUser -Name $account -ErrorAction SilentlyContinue) { throw "The browser account $account still exists" }
+            if (Get-CimInstance Win32_UserProfile -Filter "SID = '$sid'") { throw "The profile of $account still exists" }
+            if (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' -Name $account -ErrorAction SilentlyContinue) { throw "The sign-in screen entry of $account is still there" }
+            if (Select-String -Path "$env:RUNNER_TEMP\rights-after.inf" -Pattern $sid -SimpleMatch -Quiet) { throw "User rights still name $sid ($account)" }
+          }
+          if (Get-LocalUser -Name 'pwb-*' -ErrorAction SilentlyContinue) { throw "Browser accounts left: $((Get-LocalUser -Name 'pwb-*').Name -join ', ')" }
 
       - name: Upload logs
         if: failure()

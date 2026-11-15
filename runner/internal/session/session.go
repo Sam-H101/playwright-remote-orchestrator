@@ -23,12 +23,14 @@ import (
 )
 
 type Options struct {
-	HubURL   string
-	Token    config.Secret
-	SlotPort func(index int) (port int, ok bool) // run-server port of slot 1..N
-	Report   func(protocol.OpenFailed)
-	Timings  config.Timings
-	Logger   *logging.Logger
+	HubURL string
+	Token  config.Secret
+	// Slot is the run-server of slot 1..N: its port and its current secret endpoint path ("" while it is
+	// not running).
+	Slot    func(index int) (port int, endpoint string, ok bool)
+	Report  func(protocol.OpenFailed)
+	Timings config.Timings
+	Logger  *logging.Logger
 }
 
 type session struct {
@@ -76,9 +78,9 @@ func (m *Manager) HandleOpen(ctx context.Context, f protocol.Open) {
 		m.o.Report(protocol.OpenFailed{Type: "open-failed", ID: f.ID, Message: message, Status: status})
 	}
 	index, ok := slotIndex(f.Slot)
-	port := 0
+	port, endpoint := 0, ""
 	if ok {
-		port, ok = m.o.SlotPort(index)
+		port, endpoint, ok = m.o.Slot(index)
 	}
 	if !ok {
 		failed("no slot "+rawText(f.Slot), nil)
@@ -88,6 +90,23 @@ func (m *Manager) HandleOpen(ctx context.Context, f protocol.Open) {
 	var p string
 	if json.Unmarshal(f.Path, &p) == nil && strings.HasPrefix(p, "/") {
 		path = p
+	}
+	if path == "/" {
+		// run-server serves its secret endpoint path only, where "/" was before. Any other path is passed on
+		// as it is, and run-server refuses it as it always did.
+		if endpoint == "" {
+			failed(fmt.Sprintf("run-server on port %d: not running", port), nil)
+			return
+		}
+		path = endpoint
+	}
+	// The endpoint path is a secret: an error that quotes the URL (the dial's do) must not carry it to the
+	// hub or the log.
+	hide := func(s string) string {
+		if endpoint == "" {
+			return s
+		}
+		return strings.ReplaceAll(s, endpoint, "/<endpoint>")
 	}
 	query := ""
 	var q string
@@ -115,10 +134,10 @@ func (m *Manager) HandleOpen(ctx context.Context, f protocol.Open) {
 			if body := readBody(resp); body != "" {
 				msg += ": " + body
 			}
-			failed(msg, &status)
+			failed(hide(msg), &status)
 			return
 		}
-		failed(fmt.Sprintf("run-server on port %d: %v", port, err), nil)
+		failed(hide(fmt.Sprintf("run-server on port %d: %v", port, err)), nil)
 		return
 	}
 	upstream.SetReadLimit(protocol.MaxPayload)

@@ -38,3 +38,22 @@ func TestChildEnvCaseOnWindows(t *testing.T) {
 		t.Fatal("lookup")
 	}
 }
+
+func TestForUserTakesOnlyPerUserVariables(t *testing.T) {
+	env := []string{"PATH=/bin", "HOME=/root", "USER=root", "XDG_RUNTIME_DIR=/run/user/0", "NODE_OPTIONS=--require w.js"}
+	user := []string{"HOME=/home/pw", "USER=pw", "LOGNAME=pw", "PATH=/evil", "GATEWAY_AGENT_TOKEN=s3cret"}
+	got := strings.Join(ForUser(env, user), "\n")
+	for _, want := range []string{"PATH=/bin", "HOME=/home/pw", "USER=pw", "LOGNAME=pw", "NODE_OPTIONS=--require w.js"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("%q missing:\n%s", want, got)
+		}
+	}
+	for _, banned := range []string{"/root", "USER=root", "XDG_RUNTIME_DIR", "/evil", "s3cret"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("%q is in the child env:\n%s", banned, got)
+		}
+	}
+	if strings.Count(got, "HOME=") != 1 {
+		t.Fatalf("HOME twice:\n%s", got)
+	}
+}
