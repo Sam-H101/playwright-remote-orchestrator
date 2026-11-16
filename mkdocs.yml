@@ -1,0 +1,117 @@
+# The documentation site: docs/ built with Material for MkDocs (version pinned in docs/requirements.txt).
+#   GitHub Pages: .github/workflows/docs.yml    GitLab Pages: .gitlab-ci.yml (pages job)
+# Build it locally in a container, without installing anything:
+#   docker run --rm -v "$PWD:/docs" squidfunk/mkdocs-material:9.8.0 build --strict
+site_name: playwright-remote-orchestrator
+site_description: A Playwright grid. Checks connect to one hub, which hands each one a free browser slot on any number of runner hosts that dial out to it.
+# Each pipeline sets SITE_URL to where it publishes; the default is the GitHub Pages address.
+site_url: !ENV [SITE_URL, "https://sam-h101.github.io/playwright-remote-orchestrator/"]
+repo_url: https://github.com/Sam-H101/playwright-remote-orchestrator
+repo_name: Sam-H101/playwright-remote-orchestrator
+edit_uri: edit/master/docs/
+copyright: MIT No Attribution (MIT-0)
+
+# mkdocs build --strict fails on any of these.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+
+plugins:
+  - search
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Concepts:
+      - Hub, nodes and slots: concepts/hub-and-nodes.md
+      - Routing and version matching: concepts/routing.md
+      - Slot failures: concepts/slot-failures.md
+      - Access tokens and scopes: concepts/access-tokens.md
+  - Deployment:
+      - Docker compose: deployment/docker-compose.md
+      - Linux host with docker: deployment/linux-docker.md
+      - Linux or macOS host without docker: deployment/linux-macos.md
+      - Windows host (pwrunner): deployment/windows.md
+      - Kubernetes and AKS: deployment/kubernetes.md
+  - Grid UI:
+      - Overview: grid-ui/index.md
+      - Signing in: grid-ui/signing-in.md
+      - Users and roles: grid-ui/users-and-roles.md
+      - MFA secrets: grid-ui/mfa-secrets.md
+      - Saved sign-ins: grid-ui/saved-sign-ins.md
+      - HTTP API: grid-ui/api.md
+  - Single sign-on:
+      - OpenID Connect setup: sso/index.md
+      - Without a client secret: sso/secretless.md
+      - Troubleshooting: sso/troubleshooting.md
+  - Writing checks: writing-checks.md
+  - Security: security.md
+  - Reference:
+      - Configuration: reference/configuration.md
+      - Command line: reference/cli.md
+      - Hub responses and close codes: reference/responses.md
+  - Operations:
+      - Troubleshooting: operations/troubleshooting.md
+      - Upgrading Playwright: operations/upgrading-playwright.md
+      - Migrating from the per-port setup: operations/migrating.md
+  - Development:
+      - Repository and tests: development/index.md
+      - Releases and images: development/releases.md

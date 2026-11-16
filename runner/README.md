@@ -2,8 +2,8 @@
 
 `pwrunner.exe` is the Playwright runner host for Windows: the gateway agent (a drop-in for
 `gateway/agent.js` against the unchanged hub), its installer, Windows service, status tool and
-uninstaller in one Go executable. Operator documentation is under "Adding a Windows host" in the
-[README](../README.md); the design and delivery phases are in [docs/plans/go-agent.md](../docs/plans/go-agent.md).
+uninstaller in one Go executable. Operator documentation is the documentation site's
+[Windows host (pwrunner)](../docs/deployment/windows.md) page; the design and delivery phases are in [docs/plans/go-agent.md](../docs/plans/go-agent.md).
 
 ## Layout
 

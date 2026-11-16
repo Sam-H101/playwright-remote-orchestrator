@@ -1,0 +1,14 @@
+# Migrating from the per-port setup
+
+Earlier releases listed every runner host and its run-server ports in `src/database.yaml`, and each check claimed a slot itself and connected to it directly (or to `/connect/<node>/<slot>`). Now runner hosts register with the hub, and every check connects to `/connect` and lets the hub pick the slot.
+
+- **Windows hosts**: delete the host from `hosts:` in `src/database.yaml`, then run `pwrunner install --hub-url ... --token-stdin` (see [Windows host](../deployment/windows.md)). It stops the old run-servers, removes the old scheduled task and the `Playwright Backend (<TaskName>)` inbound firewall rule, and moves the PowerShell scripts to `legacy\`.
+- `main.py` removes idle static slots that are no longer listed under `hosts:` when it starts. If the node registers under the old entry's name it takes over those rows instead (see [Node names](../concepts/hub-and-nodes.md#node-names)).
+- **Static hosts** still work: list them under `hosts:` in `src/database.yaml` (`server`, `port_start`, `port_end`; `port_end` is exclusive) and run `npx playwright run-server --port <port> --host 0.0.0.0` on each port. `/connect` clients reach them through the hub, which dials `ws://<server>:<port>` itself (with the client's headers, minus the gateway token), so those ports must be open to the hub. A static host lists no browsers or version, so it takes any client, but nodes come first; the hub can't tell whether it is up until a connect fails. Prefer the agent.
+- `full/example/example.py` reads `PW_WS_ENDPOINT`. Older checks that build `ws://$host:$port` or `/connect/<node>/<slot>` themselves must be changed to use it, and a `GATEWAY_URL` that holds a slot address must go back to the hub's address (`main.py` refuses to run with one).
+- **Upgrade every `main.py` with the hub.** A `main.py` of the previous release still claims slots itself, connects to `/connect/<node>/<slot>` and counts its own connect failures. Against the new hub its checks get no browser, and they hold slots while they try. The hub answers that route with 503, which those checks take for the hub's refusal rather than a slot failure, but stop or upgrade every orchestrator that shares the database before or together with the hub (in compose, `docker compose up -d --build` does both). If one ran for a while anyway, **Reset** the slots it left failing in the Grid UI.
+- A hub from before routing by browser answers a bare `/connect` with 404 `not found`; the new `main.py` says so in its log. Upgrade the hub.
+
+## From the PowerShell installer
+
+An install made by the older PowerShell installer (`installer/windows/install-backend.ps1`, deprecated: see `installer/windows/DEPRECATED.md`) is migrated in place by `pwrunner install`: its scheduled task and supervisor are removed and its scripts are moved to `C:\PlaywrightBackend\legacy\`. To go back, run `pwrunner uninstall`, then `installer\windows\install-backend.ps1` from a checkout as before.
