@@ -12,13 +12,17 @@
 # replaced by a later one, so a later one counts the labels of every merge it ships. release:skip
 # (docs, CI) makes no release only while every merge waiting to go out is a skip.
 #
+# A merge or direct push that changes only documentation (docs_file below: docs/, *.md, mkdocs.yml,
+# .gitlab-ci.yml and the docs workflow) is a skip whatever its labels, with or without a pull request:
+# nothing in the images or the runner changes, and the site is published by docs.yml on its own.
+#
 # A commit that a release already contains is never released again, whatever re-runs or arrives late.
 # On a re-run (GITHUB_RUN_ATTEMPT > 1), a commit carrying its own vX.Y.Z tag gives that version back,
 # so that re-running all of a release whose images failed publishes them again.
 #
 # Env: EVENT (push or pull_request); SHA (the commit to release: master's tip; for a pull request,
-# its base's head); PR_LABELS (pull request only: its labels, space-separated); GITHUB_REPOSITORY;
-# GH_TOKEN; GITHUB_RUN_ATTEMPT.
+# its base's head); PR_LABELS and PR_HEAD (pull request only: its labels, space-separated, and its head
+# commit); GITHUB_REPOSITORY; GH_TOKEN; GITHUB_RUN_ATTEMPT.
 set -euo pipefail
 shopt -s inherit_errexit # a failure inside $(...) counts too
 
@@ -36,6 +40,27 @@ labels_of() {
   fi
   echo "$found"
 }
+
+docs_file() {
+  case $1 in
+    docs/* | *.md | mkdocs.yml | .gitlab-ci.yml | .github/workflows/docs.yml) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Whether the file names on stdin (one per line) are all documentation. No files at all is not.
+docs_only() {
+  local f any=
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    docs_file "$f" || return 1
+    any=1
+  done
+  [ -n "$any" ]
+}
+
+# What a commit on master changed against its first parent (nothing for the first commit).
+changed_files() { git diff --name-only "$1^1" "$1" 2>/dev/null || true; }
 
 rank() { # 0 skip, 1 patch, 2 minor, 3 major
   case " $1 " in
@@ -75,17 +100,23 @@ if [ "$EVENT" = push ]; then
   bump=0 # the merge itself is in the range below
 else
   bump=$(rank "${PR_LABELS:-}")
-  note "- this pull request: ${names[$bump]}${PR_LABELS:+ ($PR_LABELS)}"
+  docs=
+  if [ -n "${PR_HEAD:-}" ] && { git diff --name-only "$SHA...$PR_HEAD" || true; } | docs_only; then
+    bump=0 docs=" (documentation only)"
+  fi
+  note "- this pull request: ${names[$bump]}${docs}${PR_LABELS:+ ($PR_LABELS)}"
 fi
 
 # Merges since the last release that haven't gone out (the last 200 at most).
 for commit in $(git rev-list --first-parent --max-count=200 "${previous:+$previous..}$SHA"); do
   found=$(labels_of "$commit") # on its own, so a failed lookup stops the script (set -e)
   r=$(rank "${found#* }")
-  note "- \`${commit:0:7}\` ${found%% *}${found:+: }${names[$r]}$(git log -1 --format=' — %s' "$commit")"
+  docs=
+  if changed_files "$commit" | docs_only; then r=0 docs=" (documentation only)"; fi
+  note "- \`${commit:0:7}\` ${found%% *}${found:+: }${names[$r]}${docs}$(git log -1 --format=' — %s' "$commit")"
   if [ "$r" -gt "$bump" ]; then bump=$r; fi
 done
-[ "$bump" != 0 ] || none "release:skip, and nothing else is waiting to go out"
+[ "$bump" != 0 ] || none "release:skip or documentation only, and nothing else is waiting to go out"
 
 case $bump in
   3) next="$((major + 1)).0.0" ;;
