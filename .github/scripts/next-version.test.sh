@@ -67,5 +67,35 @@ repo; commit a; git tag v1.2.0; commit "Grid UI: thing (#7)" release:minor
 MERGES="$STUB/m.md" EVENT=push SHA=$(git rev-parse HEAD) bash "$SCRIPT" > /dev/null
 n=$((n+1)); # shellcheck disable=SC2016 # backticks are Markdown here
 if grep -qE '^- `[0-9a-f]{7}` #[0-9]+: minor — Grid UI: thing \(#7\)$' "$STUB/m.md"; then echo "ok    the summary lists each merge counted"; else echo "FAIL  summary: $(cat "$STUB/m.md")"; fails=$((fails+1)); fi
+# Documentation only: files() commits changes to the named files, as a pushed commit (no PR) or, with
+# PR_OF set, as a merged pull request with those labels.
+files() {
+  local msg=$1 f; shift
+  for f in "$@"; do mkdir -p "$(dirname "$f")"; echo x >> "$f"; done
+  git add -A; git commit -q -m "$msg"
+  if [ -n "${PR_OF+x}" ]; then pr=$((pr+1)); echo "#$pr $PR_OF" > "$STUB/labels/$(git rev-parse HEAD)"; fi
+}
+repo; files a src/a.py; git tag v1.2.0; files "Update CNAME" docs/CNAME
+check "a direct push to docs/ only: no release" "" "documentation only"
+repo; files a src/a.py; git tag v1.2.0; PR_OF="" files "Docs" README.md mkdocs.yml docs/index.md runner/README.md .gitlab-ci.yml .github/workflows/docs.yml
+check "an unlabelled merge of docs only: no release" "" "nothing else is waiting"
+repo; files a src/a.py; git tag v1.2.0; PR_OF="release:minor" files "Docs" docs/index.md
+check "docs only wins over release:minor" ""
+repo; files a src/a.py; git tag v1.2.0; files "docs and code" docs/index.md ui/app.py
+check "docs and code together: a patch" 1.2.1
+repo; files a src/a.py; git tag v1.2.0; files "release workflow" .github/workflows/release.yml README.md
+check "another workflow isn't documentation" 1.2.1
+repo; files a src/a.py; git tag v1.2.0; PR_OF="" files "code" ui/app.py; files "Update CNAME" docs/CNAME
+check "docs only behind a waiting patch: the patch ships" 1.2.1
+repo; files a src/a.py; git tag v1.2.0; base=$(git rev-parse HEAD)
+git switch -q -c pr; files "docs" docs/index.md README.md; head=$(git rev-parse HEAD); git switch -q master
+EVENT=pull_request SHA=$base PR_HEAD=$head PR_LABELS="" check "PR of docs only: no release" "" "nothing else is waiting"
+EVENT=pull_request SHA=$base PR_HEAD=$head PR_LABELS="release:major" check "PR of docs only, labelled major: no release" ""
+git switch -q pr; files "and code" gateway/hub.js; head=$(git rev-parse HEAD); git switch -q master
+EVENT=pull_request SHA=$base PR_HEAD=$head PR_LABELS="" check "PR of docs and code: a patch" 1.2.1
+repo; files a src/a.py; git tag v1.2.0; base=$(git rev-parse HEAD); files "Update CNAME" docs/CNAME
+git switch -q -c pr2 "$base"; files "code" ui/app.py; head=$(git rev-parse HEAD); git switch -q master
+EVENT=pull_request SHA=$(git rev-parse master) PR_HEAD=$head PR_LABELS="" check "PR of code after a docs push: a patch" 1.2.1
+
 echo "$n checks, $fails failed"
 [ "$fails" = 0 ]

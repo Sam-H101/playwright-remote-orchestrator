@@ -6,8 +6,9 @@ name: Release
 #
 # A pull request's label sets the version: release:minor or release:major, and otherwise a patch.
 # release:skip (docs, CI) makes no release while nothing else is waiting to go out; what it changed
-# goes out with the next one. On each pull request into master the "next version" check's summary
-# says what merging it would release, as of its last push or label change.
+# goes out with the next one. A change to documentation only (docs/, *.md, mkdocs.yml, .gitlab-ci.yml,
+# docs.yml) is a skip without the label, pushed straight to master too. On each pull request into master
+# the "next version" check's summary says what merging it would release, as of its last push or label change.
 #
 # A run releases master as it is when the run starts, not only the merge that started it: runs wait
 # their turn and can start out of order, and whatever is on master and unreleased goes out together.
@@ -66,6 +67,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
           MERGES: ${{ runner.temp }}/merges.md
         run: |
           if [ "$EVENT" = push ]; then SHA=$(git rev-parse "origin/$GITHUB_REF_NAME"); else SHA=$BASE; fi
