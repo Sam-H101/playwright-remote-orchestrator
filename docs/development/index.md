@@ -53,4 +53,4 @@ The site is Material for MkDocs, version pinned in `docs/requirements.txt`. Buil
 docker run --rm -v "$PWD:/docs" squidfunk/mkdocs-material:9.8.0 build --strict
 ```
 
-`serve --dev-addr 0.0.0.0:8000` with `-p 8000:8000` serves it with live reload. The same build publishes to GitHub Pages (`.github/workflows/docs.yml`) and GitLab Pages (`.gitlab-ci.yml`, the `pages` job).
+`serve --dev-addr 0.0.0.0:8000` with `-p 8000:8000` serves it with live reload. The same build publishes to GitHub Pages at <https://playwright-remote-orchestration.sdevwork.com> (`.github/workflows/docs.yml`; the custom domain is set in Settings → Pages) and GitLab Pages (`.gitlab-ci.yml`, the `pages` job).
