@@ -1,0 +1,4 @@
+# The documentation site's build (mkdocs.yml). Kept to one exact pin: Material brings MkDocs and the
+# Markdown extensions mkdocs.yml uses. Match the squidfunk/mkdocs-material image tag in mkdocs.yml and
+# docs/development/index.md when changing it.
+mkdocs-material==9.8.0

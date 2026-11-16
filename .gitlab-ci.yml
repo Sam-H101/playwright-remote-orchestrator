@@ -1,0 +1,42 @@
+# GitLab CI for a mirror of this repository on GitLab: builds the documentation site (mkdocs.yml, docs/) the way
+# .github/workflows/docs.yml does, and publishes it to GitLab Pages from the default branch. Merge requests that
+# touch the site only build it, so a broken link or a page left out of the nav fails them.
+
+stages:
+  - docs
+
+.mkdocs:
+  stage: docs
+  image: python:3.13-slim
+  variables:
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  cache:
+    key:
+      files: [docs/requirements.txt]
+    paths: [.cache/pip]
+  before_script:
+    - python -m pip install -r docs/requirements.txt
+
+docs-check:
+  extends: .mkdocs
+  script:
+    - mkdocs build --strict --site-dir site
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [docs/**/*, mkdocs.yml, .gitlab-ci.yml]
+
+pages:
+  extends: .mkdocs
+  variables:
+    # Where GitLab Pages serves the site (mkdocs.yml reads SITE_URL).
+    SITE_URL: "$CI_PAGES_URL/"
+  script:
+    - mkdocs build --strict --site-dir public
+  artifacts:
+    paths: [public]
+  rules:
+    # A pipeline run by hand (Build, Pipelines, Run pipeline) on the default branch always publishes.
+    - if: $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [docs/**/*, mkdocs.yml, .gitlab-ci.yml]

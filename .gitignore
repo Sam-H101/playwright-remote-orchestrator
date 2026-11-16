@@ -17,3 +17,7 @@ runner/internal/runtime/files/*
 !runner/internal/runtime/files/.gitignore
 runner/dist/
 dist/
+
+# The documentation site's build output (mkdocs build: site/; the GitLab Pages job: public/)
+site/
+public/
