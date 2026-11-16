@@ -146,6 +146,7 @@ _SHOWN_CLAIMS = ("iss", "sub", "aud", "exp")
 
 _cache_lock = threading.Lock()
 _discovered = None
+_rejected_discovery = None  # (issuer, sentence): why the last discovery document fetched didn't fit
 _identity_memo = None
 _key_set = None
 _keys_refetched = None  # time.monotonic() of the last refetch an unknown key id asked for
@@ -816,17 +817,24 @@ def provider_problem():
     """With the platform's token: what in the provider's discovery document keeps the Grid UI from authenticating,
     as a sentence for the Admin page, or None. None too while the settings have a problem of their own (problem()
     says that one) and while the document can't be had (a sign-in says so). Uses discovery()'s cache, so it
-    fetches only when a sign-in would, and never asks the managed identity endpoint."""
+    fetches only when a sign-in would, and never asks the managed identity endpoint.
+    The sentence comes from the checks themselves, never from an exception's text."""
     if client_method() != "federated" or problem():
         return None
+    s = settings()
     try:
-        _check_provider(settings())
-    except Misconfigured as e:
-        text = str(e)
-        return text[:1].upper() + text[1:] + "."
+        document = discovery()
+    except Misconfigured:
+        with _cache_lock:
+            rejected = _rejected_discovery
+        text = rejected[1] if rejected and rejected[0] == s.issuer else None
     except (Unavailable, HttpRefused):
         return None
-    return None
+    else:
+        text = _client_auth_choice(document, s)[1]
+    if not text:
+        return None
+    return text[:1].upper() + text[1:] + "."
 
 
 # ---- the back channel ---------------------------------------------------------------
@@ -928,19 +936,27 @@ def _algorithms(document):
     return [alg for alg in ALLOWED_ALGS if alg in listed]
 
 
-def _check_discovery(document, s):
+def _discovery_problem(document, s):
+    """What in the discovery document doesn't fit the settings, as a sentence, or None."""
     if document.get("issuer") != s.issuer:
-        raise Misconfigured("the discovery document's issuer is {!r}, but GRID_OIDC_ISSUER is {!r}: they must be "
-                            "equal, trailing / and all".format(document.get("issuer"), s.issuer))
+        return ("the discovery document's issuer is {!r}, but GRID_OIDC_ISSUER is {!r}: they must be "
+                "equal, trailing / and all".format(document.get("issuer"), s.issuer))
     for field in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
         if not _allowed_url(document.get(field), s.allow_http):
-            raise Misconfigured("the discovery document's {} isn't an https URL".format(field))
+            return "the discovery document's {} isn't an https URL".format(field)
     if "code" not in _listed(document, "response_types_supported", ["code"]):
-        raise Misconfigured("the identity provider doesn't offer the authorization code flow (response type code)")
+        return "the identity provider doesn't offer the authorization code flow (response type code)"
     if "S256" not in _listed(document, "code_challenge_methods_supported", ["S256"]):
-        raise Misconfigured("the identity provider doesn't take S256 PKCE challenges")
+        return "the identity provider doesn't take S256 PKCE challenges"
     if not _algorithms(document):
-        raise Misconfigured("the identity provider signs ID tokens with none of {}".format(", ".join(ALLOWED_ALGS)))
+        return "the identity provider signs ID tokens with none of {}".format(", ".join(ALLOWED_ALGS))
+    return None
+
+
+def _check_discovery(document, s):
+    wrong = _discovery_problem(document, s)
+    if wrong:
+        raise Misconfigured(wrong)
 
 
 def _cached_or_fetch(cached, source, refresh, fetch, what):
@@ -972,8 +988,13 @@ def discovery(refresh=False):
 
     def fetch():
         # A trailing / on the issuer is dropped before the path is added (§4), as Auth0's issuers need.
+        global _rejected_discovery
         document = _fetch(s.issuer.rstrip("/") + DISCOVERY_PATH)
-        _check_discovery(document, s)
+        wrong = _discovery_problem(document, s)
+        with _cache_lock:
+            _rejected_discovery = (s.issuer, wrong) if wrong else None
+        if wrong:
+            raise Misconfigured(wrong)
         return document
 
     document, keep = _cached_or_fetch(cached, s.issuer, refresh, fetch, "the identity provider's discovery document")
@@ -1012,9 +1033,9 @@ def _keys(refresh=False):
 def reset_caches():
     """Forget the discovery document, the keys, the refetch clock and what the managed identity endpoint last
     answered: one test's provider must not answer for another's."""
-    global _discovered, _key_set, _keys_refetched, _identity_memo
+    global _discovered, _rejected_discovery, _key_set, _keys_refetched, _identity_memo
     with _cache_lock:
-        _discovered = _key_set = _keys_refetched = _identity_memo = None
+        _discovered = _rejected_discovery = _key_set = _keys_refetched = _identity_memo = None
 
 
 # ---- signing in ---------------------------------------------------------------------
@@ -1051,23 +1072,32 @@ def authorize_url(login):
 
 
 def _client_auth_method(document, s):
-    """basic, post or federated: how the token request authenticates. With a client secret and auto: basic when
+    """_client_auth_choice's method, or Misconfigured with its sentence."""
+    method, wrong = _client_auth_choice(document, s)
+    if wrong:
+        raise Misconfigured(wrong)
+    return method
+
+
+def _client_auth_choice(document, s):
+    """(method, None), or (None, why not) as a sentence. The method is basic, post or federated: how the token
+    request authenticates. With a client secret and auto: basic when
     discovery lists client_secret_basic or lists nothing (its default), else post; discovery lists what the
     provider supports, not what the client is registered for, hence the setting. The platform's token travels as
     a client assertion, which discovery calls private_key_jwt: a provider that lists methods and not that one is
     not sent one, nor one over plain http to a host that isn't loopback, unless GRID_OIDC_ALLOW_HTTP=1; and a
-    managed identity's token goes only to the issuer's own host over https. Raises Misconfigured, with problem()'s
-    sentence when the settings don't say."""
+    managed identity's token goes only to the issuer's own host over https. Why not is problem()'s sentence when
+    the settings don't say."""
     method, wrong = _client_method(s)
     if wrong:
-        raise Misconfigured(wrong)
+        return None, wrong
     if method in ("basic", "post"):
-        return method
+        return method, None
     listed = document.get("token_endpoint_auth_methods_supported")
     if method == "secret":
         if not isinstance(listed, list) or not listed or "client_secret_basic" in listed:
-            return "basic"
-        return "post"
+            return "basic", None
+        return "post", None
     endpoint = document.get("token_endpoint")
     if s.managed_identity:
         issuer, sent_to = _split(s.issuer), _split(endpoint) if isinstance(endpoint, str) else None
@@ -1076,15 +1106,15 @@ def _client_auth_method(document, s):
         except ValueError:
             same = False
         if not same or not _allowed_url(endpoint, False):
-            raise Misconfigured("the discovery document's token_endpoint isn't https on {}, GRID_OIDC_ISSUER's host, "
-                                "and a managed identity's token is sent nowhere else".format(issuer.hostname))
+            return None, ("the discovery document's token_endpoint isn't https on {}, GRID_OIDC_ISSUER's host, "
+                          "and a managed identity's token is sent nowhere else".format(issuer.hostname))
     elif not _allowed_url(endpoint, s.allow_http):
-        raise Misconfigured("the identity provider's token_endpoint is plain http on a host that isn't loopback, and "
-                            "the platform's token goes there only with GRID_OIDC_ALLOW_HTTP=1")
+        return None, ("the identity provider's token_endpoint is plain http on a host that isn't loopback, and "
+                      "the platform's token goes there only with GRID_OIDC_ALLOW_HTTP=1")
     if isinstance(listed, list) and listed and "private_key_jwt" not in listed:
-        raise Misconfigured("the identity provider doesn't take client assertions: private_key_jwt isn't among the "
-                            "token_endpoint_auth_methods_supported its discovery document lists")
-    return method
+        return None, ("the identity provider doesn't take client assertions: private_key_jwt isn't among the "
+                      "token_endpoint_auth_methods_supported its discovery document lists")
+    return method, None
 
 
 def _check_provider(s):
