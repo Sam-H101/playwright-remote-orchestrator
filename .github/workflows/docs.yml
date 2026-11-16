@@ -50,12 +50,8 @@ jobs:
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - name: build
-        env:
-          # Where Pages serves the site; mkdocs.yml's default when this isn't a deployment.
-          SITE_URL: ${{ steps.pages.outputs.base_url && format('{0}/', steps.pages.outputs.base_url) || '' }}
-        run: |
-          if [ -z "$SITE_URL" ]; then unset SITE_URL; fi
-          mkdocs build --strict --site-dir site
+        # site_url is mkdocs.yml's: the site's custom domain, set in Settings → Pages.
+        run: mkdocs build --strict --site-dir site
 
       - name: upload the site
         if: env.DEPLOY == 'true'

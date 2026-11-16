@@ -4,7 +4,7 @@ A Playwright grid. Checks connect to one hub, which hands each one a free browse
 
 Runner hosts register themselves with the hub and dial **out** to it, so the only port you open is the hub's, on the orchestrator host. Runner hosts open no inbound ports.
 
-**Documentation: <https://sam-h101.github.io/playwright-remote-orchestrator/>** (source in [`docs/`](docs/index.md)).
+**Documentation: <https://playwright-remote-orchestration.sdevwork.com>** (source in [`docs/`](docs/index.md)).
 
 ## Architecture
 

@@ -4,8 +4,8 @@
 #   docker run --rm -v "$PWD:/docs" squidfunk/mkdocs-material:9.8.0 build --strict
 site_name: playwright-remote-orchestrator
 site_description: A Playwright grid. Checks connect to one hub, which hands each one a free browser slot on any number of runner hosts that dial out to it.
-# Each pipeline sets SITE_URL to where it publishes; the default is the GitHub Pages address.
-site_url: !ENV [SITE_URL, "https://sam-h101.github.io/playwright-remote-orchestrator/"]
+# The site's address (GitHub Pages, custom domain). GitLab's pages job sets SITE_URL to its own.
+site_url: !ENV [SITE_URL, "https://playwright-remote-orchestration.sdevwork.com/"]
 repo_url: https://github.com/Sam-H101/playwright-remote-orchestrator
 repo_name: Sam-H101/playwright-remote-orchestrator
 edit_uri: edit/master/docs/
