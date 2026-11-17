@@ -25,6 +25,8 @@ const CLAIM_SYNC_MS = 30000;
 const HUB_LEASE_MS = 90000;
 const SLOT_ROUTE_GONE = 'the /connect/<node>/<slot> endpoints were removed: connect to /connect and the hub picks a free slot '
   + 'for the browser you launch (add ?node=<name> to stay on one node)';
+const QUERY_TOKEN_REFUSED = 'gateway token in the URL (?gateway_token=) refused: send it in the x-gateway-token header '
+  + '(connect(url, headers={"x-gateway-token": token})), and treat the token as exposed';
 
 // run-server answers a client of another Playwright major.minor with 428 and a boxed message naming both
 // versions; the hub passes that on in the words of its own version check.
@@ -120,7 +122,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
       if (pathname === '/api/nodes') return json(200, { nodes: [...nodes.values()].map(describe) });
       json(404, { error: 'not found' });
     } catch (err) {
-      log.error(`request ${req.method} ${req.url} failed: ${err.stack || err.message}`);
+      log.error(`request ${req.method} ${P.redactUrl(req.url)} failed: ${err.stack || err.message}`);
       json(500, { error: 'internal error' });
     }
   }
@@ -427,7 +429,15 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
     if ((req.headers.upgrade || '').toLowerCase() !== 'websocket' || !req.headers['sec-websocket-key']) {
       return reject(socket, 400, 'expected a WebSocket upgrade');
     }
-    const token = req.headers['x-gateway-token'] ?? P.queryParam(url.search, 'gateway_token');
+    // The token comes in a header: x-gateway-token, or Authorization: Bearer. One in the URL has been
+    // seen by every log and proxy on the way, so it is refused unless GATEWAY_ALLOW_QUERY_TOKEN is set.
+    const inQuery = P.queryParam(url.search, 'gateway_token');
+    if (inQuery !== null && !config.allowQueryToken) {
+      log.warn(`client ${remote} rejected: its gateway token is in the URL (?gateway_token=); it must be sent in the x-gateway-token header`);
+      return reject(socket, 401, QUERY_TOKEN_REFUSED);
+    }
+    if (inQuery !== null) log.warn(`client ${remote} sent its gateway token in the URL (?gateway_token=), let in by GATEWAY_ALLOW_QUERY_TOKEN; move it to the x-gateway-token header`);
+    const token = req.headers['x-gateway-token'] ?? P.bearer(req.headers.authorization) ?? inQuery;
     tokens.check('client', token).then((verdict) => {
       if (stopping) return reject(socket, 503, 'hub is shutting down');
       if (socket.destroyed) return;
@@ -1002,7 +1012,7 @@ function createHub(config, { log = createLogger('hub'), registry = createRegistr
       try {
         onUpgrade(req, socket, head);
       } catch (err) {
-        log.error(`upgrade ${req.url} failed: ${err.stack || err.message}`);
+        log.error(`upgrade ${P.redactUrl(req.url)} failed: ${err.stack || err.message}`);
         socket.destroy();
       }
     });

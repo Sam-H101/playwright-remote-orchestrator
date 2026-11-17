@@ -106,32 +106,32 @@ def test_gateway_settings_from_the_config_file(tmp_path, monkeypatch, no_gateway
     assert cfg.get_gateway_config()["node"] == "other"
 
 
-@pytest.mark.parametrize("url, token, node, endpoint", [
-    ("ws://hub:4500", None, None, "ws://hub:4500/connect"),
-    ("ws://hub:4500/", "t", None, "ws://hub:4500/connect?gateway_token=t"),
-    ("wss://gw.example.com", "s3cr&t=/?", None, "wss://gw.example.com/connect?gateway_token=s3cr%26t%3D%2F%3F"),
-    ("ws://192.168.112.184:4500", "pwgc_x", "Runner-7",
-     "ws://192.168.112.184:4500/connect?gateway_token=pwgc_x&node=Runner-7"),
-    ("ws://hub:4500", None, "a.b_c-d", "ws://hub:4500/connect?node=a.b_c-d"),
+@pytest.mark.parametrize("url, node, endpoint", [
+    ("ws://hub:4500", None, "ws://hub:4500/connect"),
+    ("ws://hub:4500/", None, "ws://hub:4500/connect"),
+    ("wss://gw.example.com", None, "wss://gw.example.com/connect"),
+    ("ws://192.168.112.184:4500", "Runner-7", "ws://192.168.112.184:4500/connect?node=Runner-7"),
+    ("ws://hub:4500", "a.b_c-d", "ws://hub:4500/connect?node=a.b_c-d"),
     # a GATEWAY_URL copied from a client snippet
-    ("ws://hub:4500/connect", "t", None, "ws://hub:4500/connect?gateway_token=t"),
-    ("ws://hub:4500/connect/", None, None, "ws://hub:4500/connect"),
+    ("ws://hub:4500/connect", None, "ws://hub:4500/connect"),
+    ("ws://hub:4500/connect/", None, "ws://hub:4500/connect"),
 ])
-def test_client_endpoint_is_the_hubs_single_connect_url(url, token, node, endpoint):
-    assert config.client_endpoint(url, token, node) == endpoint
+def test_client_endpoint_is_the_hubs_single_connect_url_without_the_token(url, node, endpoint):
+    # The token goes in the check's x-gateway-token header; the hub refuses it in the URL.
+    assert config.client_endpoint(url, node) == endpoint
 
 
-@pytest.mark.parametrize("node", ["runner a", "a/3", "x" * 129, "n\u00f6de"])
+@pytest.mark.parametrize("node", ["runner a", "a/3", "x" * 129, "nöde"])
 def test_client_endpoint_refuses_a_bad_node_name(node):
     with pytest.raises(ValueError, match="GATEWAY_NODE must be a node name"):
-        config.client_endpoint("ws://hub:4500", "t", node)
+        config.client_endpoint("ws://hub:4500", node)
 
 
 @pytest.mark.parametrize("url", ["ws://hub:4500/connect/runner-7f3a9c/3",
                                  "ws://hub:4500/connect/runner-7f3a9c/3?gateway_token=s3cret"])
 def test_client_endpoint_refuses_a_slot_endpoint(url):
     with pytest.raises(ValueError, match="not a /connect/<node>/<slot> endpoint") as error:
-        config.client_endpoint(url, "t")
+        config.client_endpoint(url)
     assert "s3cret" not in str(error.value)
 
 

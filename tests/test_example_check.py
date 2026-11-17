@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(ROOT, "full", "example"))
 import example  # noqa: E402
 import main  # noqa: E402
 
-HUB = "ws://hub:4500/connect?gateway_token=t"
+HUB = "ws://hub:4500/connect"
 STATIC = "ws://runner01:3000"
 
 
@@ -66,3 +66,11 @@ def test_output_names_only_one_marker(endpoint, marker):
     assert proc.returncode == 1
     other = {"hub_Failure": "connect_Failure", "connect_Failure": "hub_Failure"}[marker]
     assert marker in output and other not in output
+
+
+def test_the_client_token_goes_in_a_header(monkeypatch):
+    # The hub refuses a token in the URL (?gateway_token=).
+    monkeypatch.setenv("GATEWAY_CLIENT_TOKEN", "s3cret")
+    assert example.hub_headers() == {"x-gateway-token": "s3cret"}
+    monkeypatch.delenv("GATEWAY_CLIENT_TOKEN")
+    assert example.hub_headers() == {}

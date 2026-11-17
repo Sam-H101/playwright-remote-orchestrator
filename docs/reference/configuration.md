@@ -47,10 +47,11 @@ Read by `gateway/hub.js` (`gateway/lib/config.js`). Integer settings outside the
 | --- | --- | --- |
 | `HUB_PORT`, `HUB_HOST` | `4500`, `0.0.0.0` | Listen address |
 | `GATEWAY_AGENT_TOKEN` | unset | Bootstrap agent token. Agents must send it or a managed agent token. With neither, any agent is accepted (logged as a warning) |
-| `GATEWAY_CLIENT_TOKEN` | unset | Bootstrap client token (`?gateway_token=` or `x-gateway-token`). With neither it nor a managed client token, clients aren't checked |
+| `GATEWAY_CLIENT_TOKEN` | unset | Bootstrap client token, sent by clients in the `x-gateway-token` header (or `Authorization: Bearer`). With neither it nor a managed client token, clients aren't checked |
 | `TOKEN_CACHE_S` | `10` | How long a managed token lookup is cached (an unknown token: 2 s). A revoked token can still open new connections this long |
 | `TOKEN_RECHECK_S` | `15` | How often the tokens of connected agents are checked again; revoked or expired ones are closed |
 | `GATEWAY_ALLOW_OPEN_AGENTS`, `GATEWAY_ALLOW_OPEN_CLIENTS` | off | `1`: let tokenless agents / clients in again once every managed token of the kind is revoked (see [Access tokens](../concepts/access-tokens.md#when-the-hub-requires-a-token)) |
+| `GATEWAY_ALLOW_QUERY_TOKEN` | off | `1`: accept a client token in the URL (`/connect?gateway_token=`), with a warning in the log for each client, while old checks are moved to the header. Off, the hub refuses it with 401: a token in a URL ends up in logs, proxies and shell history |
 | `HUB_DB` | `mysql` | `mysql` or `memory` |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `mysql`, `3306`, `orchestrator` x3 | MySQL connection. The hub waits up to about 2 minutes for MySQL at startup |
 | `SCHEMA_PATH` | `src/schema.sql` | Schema run at startup |
@@ -112,7 +113,7 @@ Its run-servers get an allow-listed environment (system paths, `TEMP`, proxy var
 | --- | --- | --- |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `mysql:` section of `src/database.yaml` | MySQL connection, only to create the tables, sync `hosts:` and free stale claims. Each run tries it once (5 s connect timeout); if MySQL is down the check runs anyway |
 | `GATEWAY_URL` | `ws://hub:4500` | The hub. The check gets `<GATEWAY_URL>/connect` as `PW_WS_ENDPOINT`; a `/connect/<node>/<slot>` address is refused |
-| `GATEWAY_CLIENT_TOKEN` | unset | Client token (bootstrap or managed), appended as `?gateway_token=` |
+| `GATEWAY_CLIENT_TOKEN` | unset | Client token (bootstrap or managed), passed to the check in its environment; the check sends it in the `x-gateway-token` header, never in `PW_WS_ENDPOINT` |
 | `GATEWAY_NODE` | unset | Keep the check on this node or static host, appended as `?node=`. The hub still picks the slot |
 | `GRID_UI_URL` | `http://grid_ui:4444` | The Grid UI, as the check reaches it, for [MFA codes](../grid-ui/mfa-secrets.md) (`src/mfa.py`) and [saved sign-ins](../grid-ui/saved-sign-ins.md) (`src/signin.py`) |
 | `GRID_MFA_TOKEN` | `GATEWAY_CLIENT_TOKEN` | Client token `src/mfa.py` asks for MFA codes with, and `src/signin.py` checks out and saves sign-ins with |

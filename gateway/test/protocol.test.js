@@ -28,6 +28,14 @@ test('stripQueryParam removes only gateway_token and keeps the rest verbatim', (
   assert.equal(P.stripQueryParam('launch-options=%7B%7D', 'gateway_token'), 'launch-options=%7B%7D');
 });
 
+test('redactUrl hides gateway_token in a logged URL and keeps the rest', () => {
+  assert.equal(P.redactUrl('/connect?node=a&gateway_token=s3cret&x=a%20b'), '/connect?node=a&gateway_token=<redacted>&x=a%20b');
+  assert.equal(P.redactUrl('/connect?gateway%5Ftoken=s3cret'), '/connect?gateway%5Ftoken=<redacted>');
+  assert.equal(P.redactUrl('/connect?gateway_token'), '/connect?gateway_token=<redacted>');
+  assert.equal(P.redactUrl('/connect'), '/connect');
+  assert.equal(P.redactUrl('/healthz?bad=%zz'), '/healthz?bad=%zz');
+});
+
 test('sendableCloseCode passes valid codes and maps reserved ones', () => {
   for (const code of [1000, 1001, 1011, 1014, 3000, 4409, 4999]) assert.equal(P.sendableCloseCode(code), code);
   assert.equal(P.sendableCloseCode(1005), 1000);
@@ -170,6 +178,7 @@ test('hub config defaults', () => {
   const open = hubConfig({ GATEWAY_ALLOW_OPEN_AGENTS: '1', GATEWAY_ALLOW_OPEN_CLIENTS: 'true' });
   assert.deepEqual([open.allowOpenAgents, open.allowOpenClients], [true, true]);
   assert.throws(() => hubConfig({ GATEWAY_ALLOW_OPEN_AGENTS: 'maybe' }), /GATEWAY_ALLOW_OPEN_AGENTS/);
+  assert.deepEqual([c.allowQueryToken, hubConfig({ GATEWAY_ALLOW_QUERY_TOKEN: '1' }).allowQueryToken], [false, true]);
   assert.equal(hubConfig({ EPHEMERAL_GRACE_S: '30' }).ephemeralGraceMs, 30000);
   assert.throws(() => hubConfig({ EPHEMERAL_GRACE_S: '-1' }), /EPHEMERAL_GRACE_S/);
   assert.ok(fs.existsSync(c.schemaPath));

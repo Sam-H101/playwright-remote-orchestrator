@@ -115,8 +115,7 @@ UNIT = r"""async ([liveUrl, formatUrl]) => {
     slotQuery: [F.parseSlotQuery("b81e04/3"), F.parseSlotQuery("b81e04 3"), F.parseSlotQuery("pw-static:3001"), F.parseSlotQuery("nothing")],
     hub: [F.publicHub({ gateway_url: "ws://hub:4500" }, "grid.lab"), F.publicHub({ gateway_url: "wss://hub" }, "::1"),
       F.publicHub({ gateway_url: "ws://hub:4500", public_gateway_url: "wss://grid.example.com/" }, "x")],
-    connect: [F.connectUrl("ws://grid.lab:4500/"), F.connectUrl("ws://grid.lab:4500", "Runner B"),
-      F.connectUrlForToken("ws://grid.lab:4500", "runner-7f3a9c"), F.connectUrlForToken("ws://grid.lab:4500/connect")],
+    connect: [F.connectUrl("ws://grid.lab:4500/"), F.connectUrl("ws://grid.lab:4500", "Runner B"), F.connectUrl("ws://grid.lab:4500/connect")],
     // Whatever is pasted as the hub address, every address built on it ends in exactly one /connect.
     hubBase: ["ws://10.0.0.5:4500/connect", "ws://10.0.0.5:4500/connect/", "ws://10.0.0.5:4500/connect?gateway_token=x&node=a",
       "ws://10.0.0.5:4500/connect/runner-7f3a9c/3", " ws://10.0.0.5:4500/ ", "wss://grid.example.com/pw/connect", "ws://h:4500/connector"].map(F.hubBase),
@@ -177,28 +176,29 @@ def test_diff_and_formatters_are_pure_and_right(grid, page):
     assert f["slotQuery"] == [{"node": "b81e04", "slot": "3"}, {"node": "b81e04", "slot": "3"}, {"node": "pw-static", "slot": "3001"}, None]
     assert f["hub"] == ["ws://grid.lab:4500", "wss://[::1]", "wss://grid.example.com"]
     # One address for every check (the owner's form); ?node= at most, never a slot.
-    assert f["connect"] == ["ws://grid.lab:4500/connect", "ws://grid.lab:4500/connect?node=Runner%20B",
-                            "ws://grid.lab:4500/connect?node=runner-7f3a9c&gateway_token=", "ws://grid.lab:4500/connect?gateway_token="]
+    assert f["connect"] == ["ws://grid.lab:4500/connect", "ws://grid.lab:4500/connect?node=Runner%20B", "ws://grid.lab:4500/connect"]
     assert f["hubBase"] == ["ws://10.0.0.5:4500"] * 5 + ["wss://grid.example.com/pw", "ws://h:4500/connector"]
     assert "const HUB = 'ws://10.0.0.5:4500';" in f["pasted"]["js"] and "/connect/connect" not in "".join(f["pasted"].values())
     r = f["snippets"]
     assert "const HUB = 'ws://grid.lab:4500';" in r["js"]
-    assert "const browser = await chromium.connect(`${HUB}/connect?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`);" in r["js"]
+    assert ("const browser = await chromium.connect(`${HUB}/connect`, { headers: { 'x-gateway-token': process.env.GATEWAY_CLIENT_TOKEN } });"
+            in r["js"])
     assert "import { chromium } from 'playwright';" in r["js"] and "require(" not in r["js"]
     assert r["js"].startswith("// connect.mjs") and r["js"].endswith("await browser.close();")
-    assert "p.chromium.connect(f\"{HUB}/connect?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}\")" in r["python"]
+    assert "p.chromium.connect(f\"{HUB}/connect\", headers={\"x-gateway-token\": os.environ[\"GATEWAY_CLIENT_TOKEN\"]})" in r["python"]
     assert r["python"].endswith("browser.close()")
-    # The shell ones only set PW_WS_ENDPOINT, and say what reads it.
-    assert r["powershell"].splitlines()[-1] == "$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN"
-    assert r["bash"].splitlines()[-1] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"'
+    # The shell ones only set PW_WS_ENDPOINT, and say what reads it and sends the token as a header.
+    assert r["powershell"].splitlines()[-1] == "$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect'"
+    assert r["bash"].splitlines()[-1] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect"'
     for shell in ("powershell", "bash"):
-        note = r[shell].splitlines()[:-1]
-        assert note and all(line.startswith("# ") for line in note) and "full/example/example.py" in " ".join(note)
+        note = " ".join(r[shell].splitlines()[:-1])
+        assert note and all(line.startswith("# ") for line in r[shell].splitlines()[:-1]) and "full/example/example.py" in note
+        assert "GATEWAY_CLIENT_TOKEN" in note and "x-gateway-token" in note
     p = f["pinned"]
-    assert "chromium.connect(`${HUB}/connect?node=runner-b81e04&gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`)" in p["js"]
-    assert p["bash"].splitlines()[-1] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"'
-    for snippets in (r, p):  # the token is read from the environment, never embedded; no slot in any address
-        assert all("pwgc_" not in s and not re.search(r"/connect/[^?\s`'\"]", s) for s in snippets.values())
+    assert "chromium.connect(`${HUB}/connect?node=runner-b81e04`, { headers: { 'x-gateway-token': process.env.GATEWAY_CLIENT_TOKEN } })" in p["js"]
+    assert p["bash"].splitlines()[-1] == 'export PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04"'
+    for snippets in (r, p):  # the token is read from the environment and sent as a header, never in an address; no slot
+        assert all("pwgc_" not in s and "gateway_token" not in s and not re.search(r"/connect/[^?\s`'\"]", s) for s in snippets.values())
     assert f["claim"] == ["Hub", "Another client", "–"]
     alive, gone, other = f["busy"]
     assert "frees the slot the moment the session ends" in alive and "may have died" not in alive
@@ -347,7 +347,7 @@ def test_connect_snippets_follow_the_hub_address_and_can_stay_on_the_node(grid, 
     page.wait_for_selector("#repro-code")
     assert page.text_content("#repro-title") == "Connect to the grid"
     code = page.text_content("#repro-code")
-    assert "chromium.connect(`${HUB}/connect?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`)" in code
+    assert "chromium.connect(`${HUB}/connect`, { headers: { 'x-gateway-token': process.env.GATEWAY_CLIENT_TOKEN } })" in code
     assert "const HUB = 'ws://127.0.0.1:4500';" in code
     page.fill("#inspector [data-hub-input]", "ws://grid.lab:4500")
     page.wait_for_function("() => document.getElementById('repro-code').textContent.includes('ws://grid.lab:4500')")
@@ -355,13 +355,13 @@ def test_connect_snippets_follow_the_hub_address_and_can_stay_on_the_node(grid, 
     page.keyboard.press("ArrowRight")
     page.keyboard.press("ArrowRight")
     assert page.get_attribute("#repro-tab-powershell", "aria-selected") == "true"
-    assert page.text_content("#repro-code").endswith("\n$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect?gateway_token=' + $env:GATEWAY_CLIENT_TOKEN")
+    assert page.text_content("#repro-code").endswith("\n$env:PW_WS_ENDPOINT = 'ws://grid.lab:4500/connect'")
     page.keyboard.press("ArrowRight")
-    assert page.text_content("#repro-code").endswith('\nexport PW_WS_ENDPOINT="ws://grid.lab:4500/connect?gateway_token=$GATEWAY_CLIENT_TOKEN"')
+    assert page.text_content("#repro-code").endswith('\nexport PW_WS_ENDPOINT="ws://grid.lab:4500/connect"')
     # Kept on the slot's node with ?node=; still no way to name the slot. The copy button follows.
     page.check("#repro-pin")
-    page.wait_for_function("() => document.getElementById('repro-code').textContent.includes('node=runner-b81e04&')")
-    assert page.text_content("#repro-code").endswith('\nexport PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04&gateway_token=$GATEWAY_CLIENT_TOKEN"')
+    page.wait_for_function("() => document.getElementById('repro-code').textContent.includes('node=runner-b81e04')")
+    assert page.text_content("#repro-code").endswith('\nexport PW_WS_ENDPOINT="ws://grid.lab:4500/connect?node=runner-b81e04"')
     assert page.get_attribute("#repro-copy", "data-copy") == page.text_content("#repro-code")
     assert "/connect/" not in page.text_content("#inspector")
     # The panel's own /connect address pasted into the Hub address field: cut back to the hub's base.

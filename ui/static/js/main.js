@@ -7,7 +7,7 @@ import * as keys from "./keys.js";
 import { createLive } from "./live.js";
 import { localStore } from "./storage.js";
 import { html, icon, setHTML, setText } from "./html.js";
-import { age, ago, clock, connectUrlForToken, duration, inTime, parseTime, plural, slotName, slotState, stateWord } from "./format.js";
+import { age, ago, clock, connectUrl, duration, inTime, parseTime, plural, slotName, slotState, stateWord } from "./format.js";
 import { bindActions, forgetNode, resetNode } from "./actions.js";
 import { createInspector } from "./ui/inspector.js";
 import { createPalette } from "./ui/palette.js";
@@ -372,8 +372,8 @@ rowMenu.addEventListener("click", async (e) => {
     case "inspect": app.inspect("node", host, owner); break;
     case "activity": router.go(router.build("activity", { node: host })); break;
     case "copy":
-      // Ends in gateway_token=, so the client token goes straight on the end.
-      copy(connectUrlForToken(app.hub(), host), "the connect URL for " + host + ": add your client token at the end");
+      // The token goes in an x-gateway-token header, never in the address.
+      copy(connectUrl(app.hub(), host), "the connect URL for " + host + ": send your client token in an x-gateway-token header");
       if (owner) owner.focus();
       break;
     case "reset": await resetNode(host); refocus(owner); break;

@@ -64,6 +64,22 @@ function stripQueryParam(query, param) {
   }).join('&');
 }
 
+// A request URL fit for a log line: gateway_token's value replaced, the rest kept as it came.
+function redactUrl(url) {
+  const raw = String(url || '');
+  const at = raw.indexOf('?');
+  if (at < 0) return raw;
+  const pairs = raw.slice(at + 1).split('&').map((pair) => {
+    const key = pair.split('=')[0];
+    let name = key;
+    try {
+      name = decodeURIComponent(key.replace(/\+/g, ' '));
+    } catch { /* not decodable: compared as it is */ }
+    return name === 'gateway_token' ? `${key}=<redacted>` : pair;
+  });
+  return `${raw.slice(0, at)}?${pairs.join('&')}`;
+}
+
 function queryParam(query, param) {
   return new URLSearchParams(query || '').get(param);
 }
@@ -151,7 +167,7 @@ function normalizeSlots(slots) {
 
 module.exports = {
   AGENT_VERSION, MAX_SLOTS, MAX_PAYLOAD, CLOSE,
-  isValidName, canonicalName, sanitizeName, forwardHeaders, stripQueryParam, queryParam,
+  isValidName, canonicalName, sanitizeName, forwardHeaders, stripQueryParam, queryParam, redactUrl,
   sendableCloseCode, closeReason, safeClose, safeSend, parseMessage, tokenMatches, bearer, hashToken, isManagedToken, tokenLabel,
   SCOPED_HASH_PREFIX, scopedHash, normalizeSlots,
 };

@@ -39,7 +39,10 @@ def connect(playwright: Playwright, browser_name="chromium"):
     if not ws:
         return browser_type.launch()
     try:
-        return browser_type.connect(ws, timeout=CONNECT_TIMEOUT_MS)
+        # The client token goes in a header: the hub refuses one in the URL.
+        token = os.environ.get("GATEWAY_CLIENT_TOKEN")
+        headers = {"x-gateway-token": token} if token else {}
+        return browser_type.connect(ws, timeout=CONNECT_TIMEOUT_MS, headers=headers)
     except Exception as ex:
         hub = urlsplit(ws).path.rstrip("/") == "/connect" and HUB_ERRORS.search(str(ex)) is not None
         # main.py logs why the check got no browser; the markers are constants (see example.py).

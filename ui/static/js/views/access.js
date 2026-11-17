@@ -316,8 +316,8 @@ export function createAccess(section) {
     }
     return [
       ["Check containers: their environment (example_playwright in docker-compose.yaml)", "GATEWAY_CLIENT_TOKEN=" + r.token],
-      ["Other Playwright clients: on the hub's one connect address (or as an x-gateway-token header); the hub picks the slot",
-        connectUrl(hub) + "?gateway_token=" + r.token],
+      ["Other Playwright clients: the hub's one connect address; the hub picks the slot", connectUrl(hub)],
+      ["Their header on that connect: the hub turns away a token in the address", "x-gateway-token: " + r.token],
     ];
   }
 

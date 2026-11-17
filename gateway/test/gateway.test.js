@@ -579,10 +579,11 @@ test('a scoped token with sessions.open opens a session', async () => {
   const agent = await h.startAgent(url, { name: 'scoped-2', slots: 3 });
   await h.waitFor(() => h.allHealthy(agent), { what: 'agent ready' });
 
-  const viaQuery = await h.connect(`${url}/connect?a=1&gateway_token=${token}`);
-  viaQuery.send('info');
-  let info = JSON.parse((await h.nextMessage(viaQuery)).data);
-  assert.equal(info.url, '/?a=1', 'the token is stripped from what run-server sees');
+  const viaBearer = await h.connect(`${url}/connect?a=1`, { authorization: `Bearer ${token}` });
+  viaBearer.send('info');
+  let info = JSON.parse((await h.nextMessage(viaBearer)).data);
+  assert.equal(info.url, '/?a=1');
+  assert.equal(info.headers.authorization, undefined, 'the token is not passed on to run-server');
   const viaHeader = await h.connect(`${url}/connect?node=scoped-2`, { 'x-gateway-token': token });
   viaHeader.send('info');
   info = JSON.parse((await h.nextMessage(viaHeader)).data);

@@ -47,6 +47,9 @@ services:
       GATEWAY_CLIENT_TOKEN: ${GATEWAY_CLIENT_TOKEN:?set GATEWAY_CLIENT_TOKEN in .env (see .env.example)}
       TOKEN_CACHE_S: ${TOKEN_CACHE_S:-10}
       TOKEN_RECHECK_S: ${TOKEN_RECHECK_S:-15}
+      # 1 lets clients that send their token in the URL (?gateway_token=) in, with a warning, while they are moved
+      # to the x-gateway-token header.
+      GATEWAY_ALLOW_QUERY_TOKEN: ${GATEWAY_ALLOW_QUERY_TOKEN:-0}
     # Polls faster than the image's own check so runners start soon after the hub; start_period
     # covers the hub waiting for MySQL on first boot.
     healthcheck:

@@ -57,7 +57,8 @@ import os
 from playwright.sync_api import sync_playwright
 
 with sync_playwright() as p:
-    browser = p.chromium.connect(f"ws://<orchestrator-host>:4500/connect?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}")
+    browser = p.chromium.connect("ws://<orchestrator-host>:4500/connect",
+                                 headers={"x-gateway-token": os.environ["GATEWAY_CLIENT_TOKEN"]})
 ```
 
 ## Documentation

@@ -184,7 +184,8 @@ def test_client_token_usage_and_the_first_token_notice(admin_grid, admin_page):
     assert re.fullmatch(r"pwgc_[A-Za-z0-9_-]{43}", token)
     usage = p.text_content(".usage")
     assert "GATEWAY_CLIENT_TOKEN=" + token in usage
-    assert "ws://grid-hub.example:4500/connect?gateway_token=" + token in usage and "/connect/" not in usage
+    assert "ws://grid-hub.example:4500/connect" in usage and "x-gateway-token: " + token in usage
+    assert "gateway_token" not in usage and "/connect/" not in usage  # the token never goes in the address
     assert "<" not in usage and ">" not in usage  # real addresses, no placeholders
     p.click(".reveal [data-copy-label='the token']")
     p.click("[data-reveal-done]")
@@ -428,7 +429,7 @@ def test_a_limited_token_that_may_open_sessions_gets_the_hub_address(admin_grid,
     token = p.text_content("#reveal-token")
     usage = p.text_content(".usage")
     assert "GATEWAY_CLIENT_TOKEN=" + token in usage
-    assert "ws://grid-hub.example:4500/connect?gateway_token=" + token in usage
+    assert "ws://grid-hub.example:4500/connect" in usage and "x-gateway-token: " + token in usage and "gateway_token" not in usage
     assert p.input_value(".reveal [data-hub-input]") == "ws://grid-hub.example:4500"
     p.wait_for_selector("#token-rows tr:has-text('Nightly checks')")
     assert row(p, "Nightly checks").locator(".tok-scope").text_content() == "May only open browser sessions and get MFA codes"

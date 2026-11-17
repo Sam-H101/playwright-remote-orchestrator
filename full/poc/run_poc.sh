@@ -18,9 +18,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 token=$(docker exec playwright_hub printenv GATEWAY_CLIENT_TOKEN | tr -d '\r\n')
 [ -n "$token" ] || { echo "could not read the hub's client token"; exit 2; }
-endpoint="ws://hub:4500/connect?gateway_token=${token}"
-[ -n "$node" ] && endpoint="${endpoint}&node=${node}"
-# Passed by name (-e NAME), so the values stay off the docker command line.
+endpoint="ws://hub:4500/connect"
+[ -n "$node" ] && endpoint="${endpoint}?node=${node}"
+# Passed by name (-e NAME), so the values stay off the docker command line. The check sends the token in
+# the x-gateway-token header (conftest.py); the hub refuses it in the URL.
 export GATEWAY_CLIENT_TOKEN="$token"
 export POC_TOTP_SEED="${POC_TOTP_SEED:-$(sed -n 's/^POC_TOTP_SEED=//p' "$repo/.env" 2>/dev/null | tail -n 1 | tr -d '\r')}"
 export POC_SIGNIN_NAME="${POC_SIGNIN_NAME:-poc-idp-session-manual}"
