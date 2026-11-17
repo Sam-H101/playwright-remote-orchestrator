@@ -133,7 +133,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
 
   attach:
-    name: attach to v${{ needs.build.outputs.version }}
+    name: attach to the release
     # For a vX.Y.Z release (called from release.yml, or a dispatch with a tag and dry_run off): the
     # release exists already, so the binaries are added to it, replacing any from an earlier attempt.
     if: inputs.tag != '' && inputs.dry_run != true
