@@ -37,13 +37,19 @@ A release takes master as it is when its run starts, so merges that land while a
 
 ## The Windows runner's binaries {#windows-runner}
 
-The Windows runner's binaries are released by hand: push a `pwrunner/vX.Y.Z` tag, and `.github/workflows/runner-go.yml` builds and attaches them. That tag publishes the images too, so give it the next free version number. The automatic releases count on from it.
+Every release carries the Windows runner's binaries: after tagging, `release.yml` calls `.github/workflows/runner-go.yml`, which builds that tag and attaches them. To add them to a release made without them, run it by hand with the tag and `dry_run` off:
+
+```powershell
+gh workflow run runner-go.yml -f tag=v2.0.11 -f dry_run=false
+```
+
+A `pwrunner/vX.Y.Z` tag pushed by hand still makes a release of its own with the binaries and publishes the images, so give it the next free version number. The automatic releases count on from it.
 
 ```powershell
 git tag pwrunner/v1.3.0 ; git push origin pwrunner/v1.3.0
 ```
 
-The release holds the embedded amd64 and arm64 exes, the slim exe, the two Linux builds, `pwrunner-runtime-<v>-windows-amd64.zip` (for `install --offline-dir`) and `SHA256SUMS.txt`. `gh workflow run runner-go.yml -f dry_run=true` builds the same set without releasing (artefacts on the run). The builds are not code-signed yet; operators verify the download against `SHA256SUMS.txt`.
+Each release holds the embedded amd64 and arm64 exes, the slim exe, the two Linux builds, `pwrunner-runtime-<v>-windows-amd64.zip` (for `install --offline-dir`) and `SHA256SUMS.txt`. `gh workflow run runner-go.yml -f dry_run=true` builds the same set without releasing (artefacts on the run). The builds are not code-signed yet; operators verify the download against `SHA256SUMS.txt`.
 
 Building `pwrunner` locally (Go 1.26 or newer), from `runner/`:
 
