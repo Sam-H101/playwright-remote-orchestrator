@@ -428,8 +428,8 @@ export function createInspector({ onClose }) {
     }
     part("facts", html`
       <dt>Address</dt><dd>${copyable(connectUrl(app.hub()), "the connect address")}</dd>
-      <dt>Token</dt><dd><span class="mono">?gateway_token=</span> or an <span class="mono">x-gateway-token</span> header: GATEWAY_CLIENT_TOKEN,
-        or a client token from <a href="#/access">Access</a></dd>
+      <dt>Token</dt><dd>An <span class="mono">x-gateway-token</span> header (or <span class="mono">Authorization: Bearer</span>), never in the address:
+        GATEWAY_CLIENT_TOKEN, or a client token from <a href="#/access">Access</a></dd>
       <dt>Browsers now</dt><dd>${offered.length ? html`<ul class="plain-list">${offered}</ul>` : html`<span class="dim">No node is online.</span>`}</dd>
       <dt>Playwright</dt><dd>${r.versions.length ? html`${r.versions.map((v, i) => html`${i ? " · " : ""}<span class="mono">${v.version}</span>${r.versions.length > 1
         ? html` <span class="dim">(${plural(v.nodes, "node")})</span>` : ""}`)}<span class="dim"> · a check is only sent to a node with the same major.minor as its client</span>`

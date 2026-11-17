@@ -9,6 +9,7 @@ const { createHub } = require('../hub');
 const { createAgent } = require('../agent');
 const { MemoryRegistry } = require('../lib/registry');
 const { silent } = require('../lib/log');
+const P = require('../lib/protocol');
 
 const FAKE_CLI = path.join(__dirname, 'fixtures', 'fake-playwright', 'cli.js');
 const FAST = {
@@ -86,8 +87,17 @@ async function startAgent(hubUrl, overrides = {}, timings = {}) {
 
 const allHealthy = (agent) => agent.registered && agent.slots.every((s) => s.healthy);
 
-// Resolves with the open socket, or rejects with { status, body } for a plain HTTP answer.
-function connect(url, headers = {}) {
+// Resolves with the open socket, or rejects with { status, body } for a plain HTTP answer. A gateway_token
+// written into the URL is sent as the x-gateway-token header, the way clients must send it, unless
+// `inUrl` is set (the hub refuses it there without GATEWAY_ALLOW_QUERY_TOKEN).
+function connect(url, headers = {}, { inUrl = false } = {}) {
+  const at = url.indexOf('?');
+  const token = at < 0 ? null : P.queryParam(url.slice(at + 1), 'gateway_token');
+  if (!inUrl && token !== null) {
+    headers = { 'x-gateway-token': token, ...headers };
+    const rest = P.stripQueryParam(url.slice(at + 1), 'gateway_token');
+    url = url.slice(0, at) + (rest ? `?${rest}` : '');
+  }
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url, { headers });
     ws.on('unexpected-response', (req, res) => {

@@ -507,7 +507,31 @@ test('lastUsedAt is written at most once per interval per token', async () => {
   assert.equal(count(clientRow.id), 4);
 });
 
-test('managed client tokens work in the header and the query, are stripped, and revocation stops only new sessions', async () => {
+test('a client token in the URL is refused, even a good one, unless GATEWAY_ALLOW_QUERY_TOKEN is set', async () => {
+  const registry = new MemoryRegistry();
+  const clientToken = mint('client');
+  registry.addToken(clientToken, { kind: 'client' });
+  const { url } = await h.startHub({}, registry);
+  const agent = await h.startAgent(url, { name: 'query-node' });
+  await h.waitFor(() => h.allHealthy(agent), { what: 'ready' });
+
+  const inUrl = { inUrl: true };
+  const refused = (err) => err.status === 401 && /in the URL/.test(err.body) && /x-gateway-token/.test(err.body) && !err.body.includes(clientToken);
+  await assert.rejects(h.connect(`${url}/connect?node=query-node&gateway_token=${clientToken}`, {}, inUrl), refused);
+  await assert.rejects(h.connect(`${url}/connect?gateway%5Ftoken=${clientToken}`, {}, inUrl), refused);
+  // Also with the header: the token in the URL is out there already.
+  await assert.rejects(h.connect(`${url}/connect?gateway_token=${clientToken}`, { 'x-gateway-token': clientToken }, inUrl), refused);
+
+  const { url: lenient } = await h.startHub({ allowQueryToken: true }, registry);
+  const other = await h.startAgent(lenient, { name: 'query-node-2' });
+  await h.waitFor(() => h.allHealthy(other), { what: 'ready' });
+  const ws = await h.connect(`${lenient}/connect?node=query-node-2&a=1&gateway_token=${clientToken}`, {}, inUrl);
+  ws.send('info');
+  const info = JSON.parse((await h.nextMessage(ws)).data);
+  assert.equal(info.url, '/?a=1', 'the token is stripped from what run-server sees');
+});
+
+test('managed client tokens work in either header, are stripped, and revocation stops only new sessions', async () => {
   const registry = new MemoryRegistry();
   const clientToken = mint('client');
   const clientRow = registry.addToken(clientToken, { kind: 'client' });
@@ -519,10 +543,11 @@ test('managed client tokens work in the header and the query, are stripped, and 
   const agent = await h.startAgent(url, { name: 'client-node', token: agentToken });
   await h.waitFor(() => h.allHealthy(agent), { what: 'ready' });
 
-  const viaQuery = await h.connect(`${url}/connect?node=client-node&a=1&gateway_token=${clientToken}`);
-  viaQuery.send('info');
-  let info = JSON.parse((await h.nextMessage(viaQuery)).data);
+  const viaBearer = await h.connect(`${url}/connect?node=client-node&a=1`, { authorization: `Bearer ${clientToken}` });
+  viaBearer.send('info');
+  let info = JSON.parse((await h.nextMessage(viaBearer)).data);
   assert.equal(info.url, '/?a=1');
+  assert.equal(info.headers.authorization, undefined);
   const viaHeader = await h.connect(`${url}/connect?node=client-node`, { 'x-gateway-token': clientToken });
   viaHeader.send('info');
   info = JSON.parse((await h.nextMessage(viaHeader)).data);
@@ -537,8 +562,8 @@ test('managed client tokens work in the header and the query, are stripped, and 
   clientRow.revokedAt = iso(0);
   await h.sleep(200);
   await assert.rejects(h.connect(`${url}/connect?node=client-node`, { 'x-gateway-token': clientToken }), (err) => err.status === 401 && /is revoked/.test(err.body));
-  viaQuery.send('still open');
-  assert.equal((await h.nextMessage(viaQuery)).data.toString(), 'still open');
+  viaBearer.send('still open');
+  assert.equal((await h.nextMessage(viaBearer)).data.toString(), 'still open');
 });
 
 test('token lookups are cached: one query per burst, positives for TOKEN_CACHE_S, negatives for less', async () => {

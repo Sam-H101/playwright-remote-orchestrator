@@ -12,7 +12,9 @@ Every test connects to the same address, the hub, and the hub picks the runner.
     const { chromium } = require('playwright');
 
     const HUB = 'ws://<orchestrator-host>:4500';
-    const browser = await chromium.connect(`${HUB}/connect?gateway_token=${process.env.GATEWAY_CLIENT_TOKEN}`);
+    const browser = await chromium.connect(`${HUB}/connect`, {
+      headers: { 'x-gateway-token': process.env.GATEWAY_CLIENT_TOKEN },
+    });
     ```
 
 === "Python"
@@ -23,12 +25,12 @@ Every test connects to the same address, the hub, and the hub picks the runner.
 
     HUB = "ws://<orchestrator-host>:4500"
     with sync_playwright() as p:
-        browser = p.firefox.connect(f"{HUB}/connect?gateway_token={os.environ['GATEWAY_CLIENT_TOKEN']}")
+        browser = p.firefox.connect(f"{HUB}/connect", headers={"x-gateway-token": os.environ["GATEWAY_CLIENT_TOKEN"]})
     ```
 
 - The same URL works for `chromium`, `firefox` and `webkit`: launch the browser you want and the hub sends you to a node that has it ([Browser](concepts/routing.md#browser)).
-- The token can go in an `x-gateway-token` header instead (`connect(url, headers={"x-gateway-token": token})`), which keeps it out of the URL.
-- Add `&node=<name>` to keep the client on one node ([One node](concepts/routing.md#one-node)).
+- The client token goes in the `x-gateway-token` header (or `Authorization: Bearer <token>`), never in the URL: the hub refuses `?gateway_token=` with 401, since a token in a URL ends up in logs, proxies and shell history. A hub can let it in for a while with `GATEWAY_ALLOW_QUERY_TOKEN=1` ([Configuration](reference/configuration.md#hub)) while old checks are moved over; replace any token that has been in a URL.
+- Add `?node=<name>` to keep the client on one node ([One node](concepts/routing.md#one-node)).
 - Your client's Playwright must be on the same major.minor version as the runners ([Version](concepts/routing.md#version)).
 - If you pass a `timeout` to `connect`, make it longer than `GATEWAY_QUEUE_TIMEOUT_S` plus `GATEWAY_CONNECT_ATTEMPTS` x `OPEN_TIMEOUT_S` (the example check uses 180 s), or the client gives up while the hub is still finding it a slot ([Waiting](concepts/routing.md#waiting)).
 - The Grid UI's inspector shows the hub's `/connect` address as Playwright JS or Python, PowerShell or bash, ready to copy ([Hub address](grid-ui/index.md#hub-address)).
@@ -39,7 +41,7 @@ Give each pipeline the narrowest client token that works: a token whose [token s
 
 A check is a pytest file. Look at `full/example/example.py`: it opens status.docusign.com (now redirected to health.docusign.com) and fails if any of the eSignature environments NA1-NA4 isn't `available`. Change `PRODUCT` / `MONITORED_ENVIRONMENTS` at the top to watch other sites.
 
-- Connect with `playwright.chromium.connect(os.environ["PW_WS_ENDPOINT"])` (or `firefox`, `webkit`). `main.py` sets it to `<GATEWAY_URL>/connect?gateway_token=<GATEWAY_CLIENT_TOKEN>`, plus `&node=<GATEWAY_NODE>` if that is set, and the hub picks a free slot for that browser.
+- Connect with `playwright.chromium.connect(os.environ["PW_WS_ENDPOINT"], headers={"x-gateway-token": os.environ["GATEWAY_CLIENT_TOKEN"]})` (or `firefox`, `webkit`). `main.py` sets `PW_WS_ENDPOINT` to `<GATEWAY_URL>/connect`, plus `?node=<GATEWAY_NODE>` if that is set, and puts the client token in the check's `GATEWAY_CLIENT_TOKEN` (also when it comes from `database.yaml`); the hub picks a free slot for that browser.
 - Never build a slot address: `/connect/<node>/<slot>` is refused (503). `host` and `port` are no longer set.
 - If the connect itself fails, raise `Exception("hub_Failure")` when the hub answered or could not be reached, else `Exception("connect_Failure")`. Either way `main.py` logs that the check got no browser, and why. Any other failure is the site under test.
 - Without `PW_WS_ENDPOINT` the example launches a local Chromium, so `pytest full/example/example.py` works on a dev machine.

@@ -31,8 +31,14 @@ def log_dir():
 
 
 def endpoint():
-    # main.py sets it to <GATEWAY_URL>/connect?gateway_token=...; the hub picks the slot.
+    # main.py sets it to <GATEWAY_URL>/connect (with ?node= to stay on one node); the hub picks the slot.
     return os.environ.get("PW_WS_ENDPOINT")
+
+
+def hub_headers():
+    # The client token goes in a header: the hub refuses one in the URL.
+    token = os.environ.get("GATEWAY_CLIENT_TOKEN")
+    return {"x-gateway-token": token} if token else {}
 
 
 def is_hub_error(ws, error):
@@ -44,7 +50,7 @@ def open_browser(playwright: Playwright):
     if not ws:
         return playwright.chromium.launch()
     try:
-        return playwright.chromium.connect(ws, timeout=CONNECT_TIMEOUT_MS)
+        return playwright.chromium.connect(ws, timeout=CONNECT_TIMEOUT_MS, headers=hub_headers())
     except Exception as ex:
         # main.py logs why the check got no browser. The markers are constants because pytest
         # prints this function's source, which must not hold both.

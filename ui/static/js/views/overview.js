@@ -279,7 +279,7 @@ export function createOverview(section) {
           : html`Give it an agent token in <code class="mono">GATEWAY_AGENT_TOKEN</code>. The README has the install steps for each platform.`}</div>
           <div class="snippet"><code class="mono" id="first-run-agent">${agent}</code>
           <button type="button" class="icon-btn tiny" data-copy="${agent}" data-copy-label="the command" aria-label="Copy the agent command">${icon("i-copy")}</button></div></li>
-        <li class="step"><div class="step-label">Then point every check at the hub, with a client token in <code class="mono">gateway_token</code>. The hub picks a free
+        <li class="step"><div class="step-label">Then point every check at the hub, with a client token in an <code class="mono">x-gateway-token</code> header. The hub picks a free
           slot that offers the browser the check launches; <a href="#/connect" data-inspect="connect" data-id="grid">Connect a check</a> has snippets.</div>
           <div class="snippet"><code class="mono" id="first-run-connect">${connectUrl(app.hub())}</code>
           <button type="button" class="icon-btn tiny" data-copy="${connectUrl(app.hub())}" data-copy-label="the connect address" aria-label="Copy the connect address">${icon("i-copy")}</button></div></li>

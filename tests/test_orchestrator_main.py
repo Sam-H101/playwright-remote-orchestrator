@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main  # noqa: E402
 from src import database  # noqa: E402
 
-ENDPOINT = "ws://hub:4500/connect?gateway_token=s3cret&node=runner-a"
+ENDPOINT = "ws://hub:4500/connect?node=runner-a"
 
 CONNECT_FAILURE_OUTPUT = """
 >           raise Exception(HUB_FAILURE if is_hub_error(ws, ex) else CONNECT_FAILURE) from ex
@@ -104,6 +104,8 @@ def test_check_env_does_not_mutate_os_environ():
 
 @pytest.mark.parametrize("endpoint, shown", [
     (ENDPOINT, "ws://hub:4500/connect?node=runner-a"),
+    # a GATEWAY_URL that carries a token anyway
+    ("ws://hub:4500/connect?gateway_token=s3cret&node=runner-a", "ws://hub:4500/connect?node=runner-a"),
     ("ws://hub:4500/connect?gateway_token=s3cr%26t", "ws://hub:4500/connect"),
     ("wss://grid.example.com/connect", "wss://grid.example.com/connect"),
 ])
@@ -115,6 +117,9 @@ def test_redact_hides_only_the_token(endpoint, shown):
     (401, "Unauthorized", "missing or bad gateway token",
      "the hub answered 401: missing or bad gateway token (check GATEWAY_CLIENT_TOKEN"),
     (401, "Unauthorized", "gateway token is revoked", "gateway token is revoked (check GATEWAY_CLIENT_TOKEN"),
+    (401, "Unauthorized", "gateway token in the URL (?gateway_token=) refused: send it in the x-gateway-token header "
+     "(connect(url, headers={\"x-gateway-token\": token})), and treat the token as exposed",
+     "(the check puts the token in its connect URL; send GATEWAY_CLIENT_TOKEN in the x-gateway-token header"),
     (403, "Forbidden", "gateway token is not allowed to open browser sessions (its scope leaves that out)",
      "GATEWAY_CLIENT_TOKEN's scope"),
     (404, "Not Found", "no node or static host named zz is known to the hub", "(check GATEWAY_NODE: "),
@@ -316,7 +321,8 @@ def run_main(monkeypatch, tmp_path, env, yaml_text="hosts: []\n"):
     config_path.write_text(yaml_text)
     monkeypatch.setenv("ORCHESTRATOR_CONFIG", str(config_path))
     for name in ("GATEWAY_URL", "GATEWAY_CLIENT_TOKEN", "GATEWAY_NODE"):
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")  # so that main setting it is undone after the test too
+        monkeypatch.delenv(name)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     seen = fake_check(monkeypatch, (0, "1 passed"))
@@ -339,19 +345,28 @@ def test_main_passes_the_hubs_connect_url(monkeypatch, tmp_path):
     code, env, log = run_main(monkeypatch, tmp_path, {"GATEWAY_URL": "ws://10.0.0.5:4500/",
                                                       "GATEWAY_CLIENT_TOKEN": "pwgc_s3cr&t"})
     assert code == 0
-    assert env["PW_WS_ENDPOINT"] == "ws://10.0.0.5:4500/connect?gateway_token=pwgc_s3cr%26t"
+    assert env["PW_WS_ENDPOINT"] == "ws://10.0.0.5:4500/connect"
+    assert env["GATEWAY_CLIENT_TOKEN"] == "pwgc_s3cr&t"  # the check sends it in its x-gateway-token header
     assert "running example.py through ws://10.0.0.5:4500/connect\n" in log
     assert "s3cr" not in log
 
 
 def test_main_adds_the_configured_node(monkeypatch, tmp_path):
     code, env, _ = run_main(monkeypatch, tmp_path, {"GATEWAY_CLIENT_TOKEN": "t", "GATEWAY_NODE": "Runner-A"})
-    assert env["PW_WS_ENDPOINT"] == "ws://hub:4500/connect?gateway_token=t&node=Runner-A"
+    assert env["PW_WS_ENDPOINT"] == "ws://hub:4500/connect?node=Runner-A"
 
 
 def test_main_reads_the_gateway_section(monkeypatch, tmp_path):
     code, env, _ = run_main(monkeypatch, tmp_path, {}, "gateway:\n  url: wss://grid.lab\n  node: win-01\n")
     assert env["PW_WS_ENDPOINT"] == "wss://grid.lab/connect?node=win-01"
+    assert "GATEWAY_CLIENT_TOKEN" not in env
+
+
+def test_main_hands_the_checks_a_token_from_the_gateway_section(monkeypatch, tmp_path):
+    code, env, log = run_main(monkeypatch, tmp_path, {}, "gateway:\n  client_token: from-yaml\n")
+    assert env["PW_WS_ENDPOINT"] == "ws://hub:4500/connect"
+    assert env["GATEWAY_CLIENT_TOKEN"] == "from-yaml"
+    assert "from-yaml" not in log
 
 
 def test_main_warns_without_a_client_token(monkeypatch, tmp_path):

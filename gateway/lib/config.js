@@ -32,6 +32,9 @@ function hubConfig(env = process.env) {
     // letting tokenless agents / clients in after every managed token of the kind is revoked.
     allowOpenAgents: bool(env.GATEWAY_ALLOW_OPEN_AGENTS, 'GATEWAY_ALLOW_OPEN_AGENTS'),
     allowOpenClients: bool(env.GATEWAY_ALLOW_OPEN_CLIENTS, 'GATEWAY_ALLOW_OPEN_CLIENTS'),
+    // A client token in /connect's URL (?gateway_token=) ends up in logs, proxies and shell history, so
+    // it is refused; this lets checks that still send it that way in while they are moved to the header.
+    allowQueryToken: bool(env.GATEWAY_ALLOW_QUERY_TOKEN, 'GATEWAY_ALLOW_QUERY_TOKEN'),
     db,
     mysql: {
       host: env.DB_HOST || 'mysql',

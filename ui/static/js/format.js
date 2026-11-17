@@ -174,29 +174,26 @@ export function hubBase(value) {
 const psq = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 
 // Copy-paste snippets that connect a check to the grid, each one that runs as it is. They read the
-// client token from the environment and never embed it. The JS one is an ES module (top-level await
-// needs one); the shell ones only set PW_WS_ENDPOINT, which a check like full/example/example.py reads.
+// client token from the environment and send it in an x-gateway-token header, never in the address
+// (the hub turns that away). The JS one is an ES module (top-level await needs one); the shell ones
+// only set PW_WS_ENDPOINT, which a check like full/example/example.py reads with GATEWAY_CLIENT_TOKEN.
 export function connectSnippets(hub, node) {
   const base = hubBase(hub);
-  const path = "/connect?" + (node ? "node=" + encodeURIComponent(node) + "&" : "") + "gateway_token=";
+  const path = "/connect" + (node ? "?node=" + encodeURIComponent(node) : "");
   const endpointNote = "# For a check that connects to PW_WS_ENDPOINT, like full/example/example.py (main.py sets it\n" +
-    "# for the checks it runs). Then run the check, e.g.: pytest full/example/example.py\n";
+    "# for the checks it runs). It sends GATEWAY_CLIENT_TOKEN from its environment as an x-gateway-token header.\n" +
+    "# Then run the check, e.g.: pytest full/example/example.py\n";
   return {
     js: "// connect.mjs: an ES module, so run it as node connect.mjs\nimport { chromium } from 'playwright';\n\n" +
       "const HUB = " + JSON.stringify(base).replace(/"/g, "'") + ";\n" +
-      "const browser = await chromium.connect(`${HUB}" + path + "${process.env.GATEWAY_CLIENT_TOKEN}`);\n" +
+      "const browser = await chromium.connect(`${HUB}" + path + "`, { headers: { 'x-gateway-token': process.env.GATEWAY_CLIENT_TOKEN } });\n" +
       "const page = await browser.newPage();\nawait page.goto('https://example.com');\nconsole.log(await page.title());\nawait browser.close();",
     python: "import os\nfrom playwright.sync_api import sync_playwright\n\nHUB = " + JSON.stringify(base) + "\n" +
-      "with sync_playwright() as p:\n    browser = p.chromium.connect(f\"{HUB}" + path + "{os.environ['GATEWAY_CLIENT_TOKEN']}\")\n" +
+      "with sync_playwright() as p:\n    browser = p.chromium.connect(f\"{HUB}" + path + "\", headers={\"x-gateway-token\": os.environ[\"GATEWAY_CLIENT_TOKEN\"]})\n" +
       "    page = browser.new_page()\n    page.goto(\"https://example.com\")\n    print(page.title())\n    browser.close()",
-    powershell: endpointNote + "$env:PW_WS_ENDPOINT = " + psq(base + path) + " + $env:GATEWAY_CLIENT_TOKEN",
-    bash: endpointNote + "export PW_WS_ENDPOINT=\"" + base + path + "$GATEWAY_CLIENT_TOKEN\"",
+    powershell: endpointNote + "$env:PW_WS_ENDPOINT = " + psq(base + path),
+    bash: endpointNote + "export PW_WS_ENDPOINT=\"" + base + path + "\"",
   };
-}
-
-// The connect URL for one node, ready for the client token to be appended (copied from a node's menu).
-export function connectUrlForToken(hub, node) {
-  return connectUrl(hub, node) + (node ? "&" : "?") + "gateway_token=";
 }
 
 // A finished run's length for a column: "approx." when only its end is known, "≈ 45.0 s" when its end

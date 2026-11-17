@@ -32,6 +32,8 @@ CONNECT_TIMEOUT = re.compile(r"browserType\.connect: Timeout (\d+)ms exceeded", 
 # What to do about the hub's answer: (status, pattern in its message or None, hint). The first match wins.
 HINTS = [
     (400, re.compile(r"^node "), "check GATEWAY_NODE"),
+    (401, re.compile(r"in the URL"), "the check puts the token in its connect URL; send GATEWAY_CLIENT_TOKEN in the "
+                                     "x-gateway-token header instead, and replace the token, which the URL exposed"),
     (401, None, "check GATEWAY_CLIENT_TOKEN: it is missing, wrong, revoked or expired"),
     (403, None, "GATEWAY_CLIENT_TOKEN's scope leaves out opening browser sessions: use a token whose scope "
                 "includes it"),
@@ -234,11 +236,15 @@ def main(argv=None):
 
     gateway = cfg.get_gateway_config()
     try:
-        endpoint = config.client_endpoint(**gateway)
+        endpoint = config.client_endpoint(gateway["url"], node=gateway["node"])
     except ValueError as e:
         checklog.error('check not run: %s', e)
         return 1
-    if not gateway["client_token"]:
+    if gateway["client_token"]:
+        # The check sends it in the x-gateway-token header (never in PW_WS_ENDPOINT), and reads it from its
+        # environment, which is a copy of this one; it may have come from database.yaml instead.
+        os.environ["GATEWAY_CLIENT_TOKEN"] = gateway["client_token"]
+    else:
         checklog.warning('GATEWAY_CLIENT_TOKEN is not set: the hub refuses the check unless it accepts '
                          'clients without a token')
 

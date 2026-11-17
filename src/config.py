@@ -9,10 +9,11 @@ DEFAULT_GATEWAY_URL = "ws://hub:4500"
 NODE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
-def client_endpoint(url, client_token=None, node=None):
+def client_endpoint(url, node=None):
     """ the hub's /connect URL. The hub picks a free slot for the browser the check launches, on
-    `node` if one is given; there is no way to name a slot. A token whose scope leaves out opening
-    sessions is refused by the hub with HTTP 403. """
+    `node` if one is given; there is no way to name a slot. The client token is not in it: the check
+    sends GATEWAY_CLIENT_TOKEN in the x-gateway-token header (the hub refuses one in the URL). A token
+    whose scope leaves out opening sessions is refused by the hub with HTTP 403. """
     if node and not NODE_NAME.match(node):
         raise ValueError("GATEWAY_NODE must be a node name ([A-Za-z0-9._-], up to 128 characters), got {!r}"
                          .format(node))
@@ -25,8 +26,7 @@ def client_endpoint(url, client_token=None, node=None):
     # A GATEWAY_URL copied from a client snippet may already end in /connect.
     if base.endswith("/connect"):
         base = base[:-len("/connect")]
-    query = [(key, value) for key, value in (("gateway_token", client_token), ("node", node)) if value]
-    return base + "/connect" + ("?" + urlencode(query, quote_via=quote, safe="") if query else "")
+    return base + "/connect" + ("?" + urlencode([("node", node)], quote_via=quote, safe="") if node else "")
 
 
 class config:
