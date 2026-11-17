@@ -33,7 +33,7 @@ None of these need docker (the Go tests need Go 1.26 or newer).
 | Workflow | Runs |
 | --- | --- |
 | `python-tests.yml` | The Grid UI's tests inside the Grid UI image built from the commit, and the orchestrator's on the checks image's Python and packages, with MySQL (`mysql:8.4` service) and the browser tests switched on. Each step fails if pytest skipped anything |
-| `runner-go.yml` | The Go runner's build and tests; on a `pwrunner/v*` tag, the release binaries |
+| `runner-go.yml` | The Go runner's build and tests; for every release (called from `release.yml`) and on a `pwrunner/v*` tag, the release binaries |
 | `docker-images.yml` | Builds every image; on pull requests and master runs a check through the hub on a runner, in every browser, with the images just built (`.github/scripts/e2e.sh`) |
 | `windows-backend-installer.yml` | The Windows install test above |
 | `release.yml` | The next version and the release; runs `.github/scripts/action-pins.sh` on each pull request into master |

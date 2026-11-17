@@ -19,8 +19,10 @@ name: Release
 # moved on). :latest only moves to the newest release, and :X.Y to the newest of that X.Y, so
 # re-running an older release can't take them back.
 #
-# The runner binaries are still released by pushing a pwrunner/vX.Y.Z tag (runner-go.yml). Both
-# kinds of release share one line of numbers (.github/scripts/next-version.sh).
+# Each release also gets the runner binaries (pwrunner exes, Linux builds, the offline runtime zip and
+# SHA256SUMS.txt): runner-go.yml, called from here, builds the tag and attaches them. A pwrunner/vX.Y.Z
+# tag pushed by hand still makes a release of its own; both kinds share one line of numbers
+# (.github/scripts/next-version.sh).
 
 on:
   push:
@@ -153,3 +155,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+
+  binaries:
+    name: runner binaries
+    needs: [version, release]
+    if: needs.release.outputs.publish == 'true'
+    uses: ./.github/workflows/runner-go.yml
+    with:
+      tag: v${{ needs.version.outputs.version }}
+    permissions:
+      contents: write # gh release upload
